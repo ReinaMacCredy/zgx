@@ -3392,9 +3392,25 @@ impl Ui {
                     .iter()
                     .any(|root| scene.is_within(*root, overlay));
             if !in_own_surface && scene.layout_visible(overlay) && scene.effects(overlay).opacity > 0. {
-                let bounds = scene.bounds(overlay);
-                if bounds.width > 0. && bounds.height > 0. {
-                    covers.push((overlay, bounds));
+                if self.input.is_layer(overlay) {
+                    // A layer is the window's size whatever it holds, and has no backdrop.
+                    let mut pending = scene.children(overlay).to_vec();
+                    while let Some(node) = pending.pop() {
+                        let kids = scene.children(node);
+                        if kids.is_empty() {
+                            let bounds = scene.bounds(node);
+                            if bounds.width > 0. && bounds.height > 0. {
+                                covers.push((overlay, bounds));
+                            }
+                        } else {
+                            pending.extend_from_slice(kids);
+                        }
+                    }
+                } else {
+                    let bounds = scene.bounds(overlay);
+                    if bounds.width > 0. && bounds.height > 0. {
+                        covers.push((overlay, bounds));
+                    }
                 }
             }
         }

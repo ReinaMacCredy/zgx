@@ -120,4 +120,22 @@ fn a_node_is_covered_while_the_window_last_showed_an_overlay_over_it() {
     ui.on_popup_snapshot(|_, _, _| None);
     ui.prepare_frame();
     assert!(!ui.covered(page), "in a surface of its own");
+
+    // A layer is the window's size whatever it holds: only what it holds covers.
+    let shell = |held: bool| {
+        let mut ui = Ui::new(400., 300.);
+        let open = ui.signal(true);
+        let layer = modal("Notices", open).layer();
+        let layer = if held { layer.child(div().w(50.).h(50.).bg(rgb(0x334455))) } else { layer };
+        let view = ui.mount(
+            column()
+                .child(div().id("page").w(400.).h(300.))
+                .child(layer),
+        );
+        ui.prepare_frame();
+        let page = view.find("page").unwrap();
+        ui.covered(page)
+    };
+    assert!(!shell(false), "an empty layer");
+    assert!(shell(true), "what a layer holds");
 }
