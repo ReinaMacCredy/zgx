@@ -1544,6 +1544,8 @@ pub(crate) struct UiStorage {
     popups: RefCell<Vec<(NodeId, Signal<bool>)>>,
     /// Portals' owners and overlays, in the order they mounted (`Ui::portals`).
     portals: RefCell<Vec<(NodeId, NodeId)>>,
+    /// The overlays the frame last prepared has in the window (`Ui::covered`).
+    covers: RefCell<Vec<(NodeId, Rect)>>,
     /// The context menu opened last: the node it took the focus from, and
     /// whether it shows. An editor it took the focus from keeps its
     /// selection drawn while it does.
@@ -1846,6 +1848,7 @@ impl Ui {
             popup_flips: runtime.signal(Vec::new()),
             popups: RefCell::new(Vec::new()),
             portals: RefCell::new(Vec::new()),
+            covers: RefCell::new(Vec::new()),
             context_menu: RefCell::new(None),
             popup_soon: RefCell::new(None),
             popup_soon_sent: Cell::new(false),
@@ -3370,7 +3373,46 @@ impl Ui {
         }
         // Whether the host draws the caret, now that it is laid out.
         crate::caret_blink::settle(self);
+        self.note_covers();
         Ok(())
+    }
+    fn note_covers(&self) {
+        let portals = self.storage.portals.borrow();
+        let mut covers = self.storage.covers.borrow_mut();
+        if portals.is_empty() && covers.is_empty() {
+            return;
+        }
+        covers.clear();
+        let surfaces = self.storage.popup_snapshotter.borrow().is_some();
+        let scene = self.scene.borrow();
+        for (_, overlay) in portals.iter().copied() {
+            let in_own_surface = surfaces
+                && scene
+                    .popups()
+                    .iter()
+                    .any(|root| scene.is_within(*root, overlay));
+            if !in_own_surface && scene.layout_visible(overlay) && scene.effects(overlay).opacity > 0. {
+                let bounds = scene.bounds(overlay);
+                if bounds.width > 0. && bounds.height > 0. {
+                    covers.push((overlay, bounds));
+                }
+            }
+        }
+    }
+    /// Whether the window, as last shown, has an overlay (a modal, say) over
+    /// `node`, so that a picture of it (`Ui::snapshot`) would have that in it.
+    /// Goes by the frame last prepared, so one closed since still counts until
+    /// the next. A popup in a surface of its own is no part of the window's
+    /// picture; one the window draws is.
+    pub fn covered(&self, node: NodeId) -> bool {
+        let scene = self.scene.borrow();
+        if !scene.contains(node) {
+            return false;
+        }
+        let bounds = scene.bounds(node);
+        self.storage.covers.borrow().iter().any(|(overlay, over)| {
+            !scene.is_within(node, *overlay) && over.intersects(bounds)
+        })
     }
     /// Keep `padding` clear inside scroll view `viewport` (its root) when
     /// something scrolls into view there (focus, find, `scroll_into_view`),

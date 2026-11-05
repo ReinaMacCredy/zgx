@@ -105,6 +105,8 @@ local function router(spec)
     local self = {}
     self.route = new_state(route_at(spec.initial or "/", 2))
     local behind, ahead = {}, {}
+    -- The last move: "navigate", "replace", "back" or "forward".
+    self.last_move = "navigate"
     local depth = new_state({ 0, 0 })
     local function moved()
         depth:set({ #behind, #ahead })
@@ -116,6 +118,7 @@ local function router(spec)
         return depth:get()[2] > 0
     end)
     local function go(next, replace)
+        self.last_move = if replace then "replace" else "navigate"
         if replace then
             self.route:set(next)
             return
@@ -144,6 +147,7 @@ local function router(spec)
         if #behind == 0 then
             return
         end
+        self.last_move = "back"
         ui.batch(function()
             table.insert(ahead, self.route:peek())
             self.route:set(table.remove(behind))
@@ -154,9 +158,25 @@ local function router(spec)
         if #ahead == 0 then
             return
         end
+        self.last_move = "forward"
         ui.batch(function()
             table.insert(behind, self.route:peek())
             self.route:set(table.remove(ahead))
+            moved()
+        end)
+    end
+    -- The history made `paths`, standing at `paths[at]`: where it already
+    -- stands (a place since gone left out, say). It goes nowhere.
+    function self.set_history(paths, at)
+        ui.batch(function()
+            table.clear(behind)
+            table.clear(ahead)
+            for i = 1, at - 1 do
+                table.insert(behind, route_at(paths[i], 2))
+            end
+            for i = #paths, at + 1, -1 do
+                table.insert(ahead, route_at(paths[i], 2))
+            end
             moved()
         end)
     end

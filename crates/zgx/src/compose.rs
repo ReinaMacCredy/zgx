@@ -7676,6 +7676,21 @@ impl NodeHandle {
     pub fn snapshot(&self, max_width: u32) -> Option<std::sync::Arc<crate::image::ImageData>> {
         self.ui.upgrade()?.snapshot(self.node, max_width)
     }
+    /// Whether the window, as last shown, has an overlay over the node
+    /// (see `Ui::covered`).
+    pub fn covered(&self) -> bool {
+        self.ui.upgrade().is_some_and(|ui| ui.covered(self.node))
+    }
+    /// Whether a focus scope the node is outside is open: a modal, or a menu
+    /// or popover, has the keyboard.
+    pub fn overlaid(&self) -> bool {
+        self.ui.upgrade().is_some_and(|ui| {
+            let scene = ui.scene.borrow();
+            ui.input
+                .focus_scope()
+                .is_some_and(|scope| !scene.is_within(self.node, scope))
+        })
+    }
     /// Keep `resource` until the node is removed, then drop it.
     pub fn retain(&self, resource: impl Any) {
         if let Some(mut ui) = self.ui.upgrade()

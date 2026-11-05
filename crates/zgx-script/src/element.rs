@@ -1477,6 +1477,12 @@ impl UserData for ElementUd {
             }
             Ok(Some(env.host_image(&name, image)))
         });
+        methods.add_method("covered", |_, e, ()| {
+            Ok(e.0.handle.get().is_some_and(|handle| handle.covered()))
+        });
+        methods.add_method("overlaid", |_, e, ()| {
+            Ok(e.0.handle.get().is_some_and(|handle| handle.overlaid()))
+        });
         methods.add_method("has_class", |_, e, class: String| {
             Ok(e.0.classes.iter().any(|c| **c == *class))
         });
