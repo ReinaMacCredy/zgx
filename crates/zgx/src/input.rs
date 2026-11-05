@@ -1748,6 +1748,10 @@ impl InputDispatcher {
             s.layers.push(root);
         }
     }
+    /// Whether `root` is a non-modal layer (`set_layer`).
+    pub fn is_layer(&self, root: NodeId) -> bool {
+        self.state.borrow().layers.contains(&root)
+    }
     /// Keep `trigger` live while `root`'s scope is active, though outside it
     /// (a popover's trigger row in its parent's panel, which toggles it), or
     /// with `None`, no longer.
