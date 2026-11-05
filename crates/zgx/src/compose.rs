@@ -1447,6 +1447,25 @@ impl View {
             cx.stop_propagation();
         })
     }
+    /// Follow a trackpad's two-finger swipe over this view step by step
+    /// ([`crate::input::SwipeStep`]) instead of having the platform track it:
+    /// where a swipe starts is as for `on_navigate`, once the fingers have
+    /// moved a little and clearly across. Three fingers still reach
+    /// `on_navigate`, which goes with this.
+    pub fn on_swipe(self, mut callback: impl FnMut(crate::input::SwipeStep) + 'static) -> Self {
+        self.on_mount(|handle| {
+            if let Some(ui) = handle.ui.upgrade() {
+                let scene = ui.scene.borrow();
+                ui.input.take_navigation(handle.node, &scene);
+                ui.input.follow_swipes(handle.node, &scene);
+            }
+        })
+        .on_action(move |step: &crate::input::SwipeStep, cx| {
+            callback(*step);
+            cx.prevent_default();
+            cx.stop_propagation();
+        })
+    }
     /// Hear every event the document is given while this view is mounted,
     /// before it goes where it goes, and one that goes nowhere (a key with
     /// nothing focused): `Ui::on_document_event`.

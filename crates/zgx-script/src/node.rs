@@ -779,6 +779,9 @@ pub(crate) struct RareEvents {
     /// platform's gesture for it takes over the node (a trackpad's swipe
     /// between pages, macOS); the nearest node with one takes it.
     pub navigate: Option<Handler>,
+    /// `fn({ phase, dx, dy })`: a trackpad's two-finger swipe over the node,
+    /// step by step, tracked by the script rather than the platform.
+    pub swipe: Option<Handler>,
     /// `fn(files, { x, y, local_x, local_y })`: files dropped on it from
     /// outside the window (Finder, Explorer, a file manager), each a
     /// `File`; the innermost node with one takes them.
@@ -3530,6 +3533,7 @@ fn set_handler(
         "on_aux_click" => &mut events.rare.get_or_insert_default().aux_click,
         "on_double_click" => &mut events.rare.get_or_insert_default().double_click,
         "on_navigate" => &mut events.rare.get_or_insert_default().navigate,
+        "on_swipe" => &mut events.rare.get_or_insert_default().swipe,
         "on_file_drop" => &mut events.rare.get_or_insert_default().file_drop,
         "on_file_hover" => &mut events.rare.get_or_insert_default().file_hover,
         "on_hover" => &mut events.hover,

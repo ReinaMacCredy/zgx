@@ -776,6 +776,13 @@ pub fn tap_modifiers(ui: &mut Ui, modifiers: Modifiers) {
     ui.runtime.flush();
     zgx::input::set_held_modifiers(&ui.runtime, Modifiers::default());
 }
+/// Hold modifier keys down, or let them all go (none), as a window reports
+/// them; no key event goes with it. For what waits on a modifier's release (a
+/// switcher that opens on Ctrl+Tab and commits as Control comes up).
+pub fn hold_modifiers(ui: &mut Ui, modifiers: Modifiers) {
+    zgx::input::set_held_modifiers(&ui.runtime, modifiers);
+    ui.runtime.flush();
+}
 /// Press and release `key` with `modifiers`, wherever focus is.
 pub fn press(ui: &mut Ui, key: Key, modifiers: Modifiers) {
     ui.dispatch(InputEvent::KeyDown {
@@ -788,11 +795,15 @@ pub fn press(ui: &mut Ui, key: Key, modifiers: Modifiers) {
 /// Scroll the viewport under `node`'s middle by `dy` points (down is
 /// positive).
 pub fn scroll(ui: &mut Ui, node: NodeId, dy: f32) {
+    scroll_across(ui, node, 0., dy);
+}
+/// Scroll under `node`'s middle by `dx` and `dy` points.
+pub fn scroll_across(ui: &mut Ui, node: NodeId, dx: f32, dy: f32) {
     let b = ui.scene.borrow().bounds(node);
     ui.dispatch(InputEvent::Scroll {
         x: b.x + b.width / 2.,
         y: b.y + b.height / 2.,
-        delta_x: 0.,
+        delta_x: dx,
         delta_y: dy,
     });
 }

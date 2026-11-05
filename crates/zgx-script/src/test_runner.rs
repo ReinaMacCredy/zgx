@@ -465,13 +465,58 @@ impl UserData for Mounted {
             app.settle();
             Ok(())
         });
-        methods.add_method("scroll", |_, m, (target, dy): (String, f32)| {
+        methods.add_method(
+            "scroll",
+            |_, m, (target, dy, dx): (String, f32, Option<f32>)| {
+                let mut app = m.app()?;
+                let node = Self::node(&mut app, &target)?;
+                crate::driver::scroll_across(&mut app.ui, node, dx.unwrap_or(0.), dy);
+                app.settle();
+                Ok(())
+            },
+        );
+        // Modifier keys held down until `release` (`ui.modifiers` follows):
+        // what a key's `app:key` alone never moves.
+        methods.add_method("hold", |_, m, keys: String| {
             let mut app = m.app()?;
-            let node = Self::node(&mut app, &target)?;
-            crate::driver::scroll(&mut app.ui, node, dy);
+            let modifiers = crate::driver::parse_modifiers(&keys).ok_or_else(|| {
+                mlua::Error::runtime(format!("`{keys}` isn't modifier keys"))
+            })?;
+            crate::driver::hold_modifiers(&mut app.ui, modifiers);
             app.settle();
             Ok(())
         });
+        methods.add_method("release", |_, m, ()| {
+            let mut app = m.app()?;
+            crate::driver::hold_modifiers(&mut app.ui, Default::default());
+            app.settle();
+            Ok(())
+        });
+        // A trackpad's gesture's phase ("began", "ended", "momentum_began",
+        // "momentum_ended"), as a window reports it: `on`, whether a swipe
+        // between pages can start, as the system's setting has it. `scroll`
+        // gives the motion between.
+        methods.add_method(
+            "gesture",
+            |_, m, (phase, on): (String, Option<bool>)| {
+                use zgx::input::{InputEvent, ScrollGesture};
+                let mut app = m.app()?;
+                let phase = match phase.as_str() {
+                    "began" => ScrollGesture::Began,
+                    "ended" => ScrollGesture::Ended,
+                    "momentum_began" => ScrollGesture::MomentumBegan,
+                    "momentum_ended" => ScrollGesture::MomentumEnded,
+                    other => {
+                        return Err(mlua::Error::runtime(format!("no gesture phase `{other}`")));
+                    }
+                };
+                app.ui.set_elastic_scrolling(true);
+                app.ui.set_navigation_swipes(on.unwrap_or(true));
+                app.ui.dispatch(InputEvent::ScrollGesture(phase));
+                app.settle();
+                Ok(())
+            },
+        );
         methods.add_method("command", |_, m, id: String| {
             let app = m.app()?;
             if !app.host.run_command(&id) {

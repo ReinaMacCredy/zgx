@@ -5246,6 +5246,9 @@ fn with_rare(
     if let Some(handler) = &rare.navigate {
         view = with_navigate(view, handler.clone(), vm, low);
     }
+    if let Some(handler) = &rare.swipe {
+        view = with_swipe(view, handler.clone(), vm, low);
+    }
     if let Some(handler) = &rare.double_click {
         view = with_double_click(view, handler.clone(), vm, low, handle.clone());
     }
@@ -5463,6 +5466,31 @@ fn with_navigate(view: View, handler: Handler, vm: &Rc<Vm>, low: &Rc<Lowering>) 
         };
         let table = vm.lua.create_table().and_then(|t| {
             t.set("direction", direction)?;
+            Ok(t)
+        });
+        if let Ok(t) = table {
+            run(&handler, &vm, &actions, t);
+        }
+    })
+}
+
+/// `on_swipe`: as `on_navigate`, but the script follows the swipe step by
+/// step (`View::on_swipe`).
+#[inline(never)]
+fn with_swipe(view: View, handler: Handler, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
+    let (vm, actions) = (vm.clone(), low.actions.clone());
+    view.on_swipe(move |step| {
+        use zgx::input::SwipeStep;
+        let (phase, dx, dy) = match step {
+            SwipeStep::Began => ("began", 0., 0.),
+            SwipeStep::Moved { dx, dy } => ("moved", dx, dy),
+            SwipeStep::Ended => ("ended", 0., 0.),
+            SwipeStep::Cancelled => ("cancelled", 0., 0.),
+        };
+        let table = vm.lua.create_table().and_then(|t| {
+            t.set("phase", phase)?;
+            t.set("dx", dx)?;
+            t.set("dy", dy)?;
             Ok(t)
         });
         if let Ok(t) = table {

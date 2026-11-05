@@ -1454,7 +1454,8 @@ impl UserData for ElementUd {
         // `max_width` pixels wide (480 if not given): the `src` of an image
         // showing it, replaced on each call; nil if it is not laid out, or
         // the host takes none. Native views in it show as what is under them.
-        methods.add_method("snapshot", |lua, e, max_width: Option<u32>| {
+        // `name`: keep several, each replaced only by its own.
+        methods.add_method("snapshot", |lua, e, (max_width, name): (Option<u32>, Option<String>)| {
             let Some(handle) = e.0.handle.get() else {
                 return Ok(None);
             };
@@ -1462,7 +1463,11 @@ impl UserData for ElementUd {
                 return Ok(None);
             };
             let env = crate::node::env(lua)?;
-            let name = format!("zgx.element:{:x}", Rc::as_ptr(&e.0) as usize);
+            let name = format!(
+                "zgx.element:{:x}:{}",
+                Rc::as_ptr(&e.0) as usize,
+                name.unwrap_or_default()
+            );
             // Kept while its node is: a picture of what is gone goes too.
             if !env.assets.is_hosted(&name) {
                 handle.retain(crate::lower::HostedPicture(

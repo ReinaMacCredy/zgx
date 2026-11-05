@@ -1141,9 +1141,10 @@ declare extern type Element with
 	function replace_selection(self, text: string): boolean
 	-- A picture of it as the window last showed it, at most `max_width`
 	-- pixels wide (480 if not given): the `src` of an image showing it,
-	-- replaced on each call. Nil if it is not laid out or the host takes
+	-- replaced on each call (each `name`'s on its own, for pictures of it
+	-- at different times). Nil if it is not laid out or the host takes
 	-- none; native views in it show as what is under them.
-	function snapshot(self, max_width: number?): string?
+	function snapshot(self, max_width: number?, name: string?): string?
 	-- Clear keyboard focus if it is on the element or inside it.
 	function blur(self): ()
 end
@@ -1685,6 +1686,9 @@ export type PinchEvent = {
 -- A step back or forward the platform's gesture for it takes: a trackpad's
 -- swipe between pages (macOS).
 export type NavigateEvent = { direction: "back" | "forward" }
+-- A trackpad's two-finger swipe, step by step (`on_swipe`): `dx` and `dy` as a
+-- scroll's, in points, while it's `moved`.
+export type SwipeEvent = { phase: "began" | "moved" | "ended" | "cancelled", dx: number, dy: number }
 -- What a drag carries to other apps (`drag_export`): text, a link, files
 -- (absolute paths).
 export type DragExport = { text: string?, url: string?, files: { string }? }
@@ -2309,6 +2313,9 @@ export type NodeProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: (((e: NavigateEvent) -> ...unknown) | Action)?,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: ((e: SwipeEvent) -> ...unknown)?,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: ((files: { File }, e: PointerEvent) -> ...unknown)?,
@@ -2705,6 +2712,9 @@ export type Props = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -2990,6 +3000,7 @@ export type Props_on_release = (((e: PointerEvent) -> ...unknown) | Action)?
 export type Props_on_aux_click = (((e: AuxClickEvent) -> ...unknown) | Action)?
 export type Props_on_double_click = (((e: PointerEvent) -> ...unknown) | Action)?
 export type Props_on_navigate = (((e: NavigateEvent) -> ...unknown) | Action)?
+export type Props_on_swipe = ((e: SwipeEvent) -> ...unknown)?
 export type Props_on_file_drop = ((files: { File }, e: PointerEvent) -> ...unknown)?
 export type Props_on_file_hover = ((over: boolean) -> ...unknown)?
 export type Props_on_hover = (((inside: boolean) -> ...unknown) | Action)?
@@ -3339,6 +3350,9 @@ export type ContainerProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -3750,6 +3764,9 @@ export type ScrollProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -4177,6 +4194,9 @@ export type TextProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -4572,6 +4592,9 @@ export type MarkdownViewProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -5037,6 +5060,9 @@ export type RichProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -5426,6 +5452,9 @@ export type ImageProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -5832,6 +5861,9 @@ export type SvgProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -6345,6 +6377,9 @@ export type Scene3DProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -6757,6 +6792,9 @@ export type CanvasProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -7178,6 +7216,9 @@ export type CheckboxProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -7577,6 +7618,9 @@ export type InputProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -8077,6 +8121,9 @@ export type ProgressProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -8467,6 +8514,9 @@ export type SliderProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -8875,6 +8925,9 @@ export type SegmentedProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -9276,6 +9329,9 @@ export type StepperProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -9678,6 +9734,9 @@ export type DisclosureProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -10092,6 +10151,9 @@ export type AccordionProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -10479,6 +10541,9 @@ export type SectionProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -10892,6 +10957,9 @@ export type SeparatorProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -11287,6 +11355,9 @@ export type TabsProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -11704,6 +11775,9 @@ export type TreeProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -12117,6 +12191,9 @@ export type DataGridProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -12526,6 +12603,9 @@ export type CalendarProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -12928,6 +13008,9 @@ export type DatePickerProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -13328,6 +13411,9 @@ export type TimeFieldProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -13727,6 +13813,9 @@ export type ComboboxProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -14134,6 +14223,9 @@ export type CommandPaletteProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -14529,6 +14621,9 @@ export type SelectProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -14931,6 +15026,9 @@ export type SplitProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -15351,6 +15449,9 @@ export type ListProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -15831,6 +15932,9 @@ export type LayerProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -16241,6 +16345,9 @@ export type ModalProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -16669,6 +16776,9 @@ export type PopoverProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -17103,6 +17213,9 @@ export type MenuItemProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -17501,6 +17614,9 @@ export type SubmenuProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -17914,6 +18030,9 @@ export type WebViewProps = {
 	on_aux_click: Props_on_aux_click,
 	-- The primary button clicked twice on one spot, as the DOM's `dblclick`.
 	on_double_click: Props_on_double_click,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -18332,6 +18451,9 @@ export type TerminalProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -18722,6 +18844,9 @@ export type SlotProps = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -19161,6 +19286,9 @@ export type EachOptions = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -19566,6 +19694,9 @@ export type PresenceOptions = {
 	-- Back or forward on the platform's gesture over it (a trackpad's swipe
 	-- between pages, where nothing under the fingers scrolls that way).
 	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,

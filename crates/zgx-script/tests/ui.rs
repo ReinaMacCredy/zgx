@@ -1497,6 +1497,35 @@ fn a_swipe_between_pages_reaches_the_nearest_on_navigate() {
 }
 
 #[test]
+fn on_swipe_hears_a_two_finger_swipe_step_by_step() {
+    use zgx::input::{InputEvent, ScrollGesture};
+    let mut h = Harness::inline(
+        r##"local seen = ui.state("seen", "")
+        return ui.column { w = 300, h = 200,
+            on_swipe = function(e) seen:set(`{seen:peek()}{e.phase}:{e.dx};`) end,
+            ui.text { "{seen}", id = "seen" } }"##,
+    );
+    h.frames(1);
+    let at = h.bounds("seen");
+    let (x, y) = (at.x + 5., at.y + 5.);
+    h.ui.set_elastic_scrolling(true);
+    h.ui.set_navigation_swipes(true);
+    h.ui.dispatch(InputEvent::ScrollGesture(ScrollGesture::Began));
+    for delta_x in [-20., -30.] {
+        h.ui.dispatch(InputEvent::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y: 0.,
+        });
+    }
+    h.ui.dispatch(InputEvent::ScrollGesture(ScrollGesture::Ended));
+    assert!(!h.ui.take_navigation_swipe(), "the script tracks it");
+    h.frames(1);
+    assert_eq!(h.text("seen"), "began:0;moved:-20;moved:-30;ended:0;");
+}
+
+#[test]
 fn a_middle_click_reaches_the_innermost_on_aux_click() {
     use zgx::input::PointerButton;
     let mut h = Harness::inline(
