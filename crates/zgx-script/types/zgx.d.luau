@@ -926,6 +926,10 @@ export type Router = {
 	route: State<Route>,
 	can_back: State<boolean>,
 	can_forward: State<boolean>,
+	-- The last move: "navigate", "replace", "back" or "forward".
+	last_move: string,
+	-- The history made `paths`, standing at `paths[at]`: where it already stands.
+	set_history: (paths: { string }, at: number) -> (),
 	-- Go to a route by its name and params.
 	navigate: Navigate,
 	-- The same, in place of the route now (nothing added behind).
@@ -1133,6 +1137,11 @@ declare extern type Element with
 	-- at different times). Nil if it is not laid out or the host takes
 	-- none; native views in it show as what is under them.
 	function snapshot(self, max_width: number?, name: string?): string?
+	-- Whether the window, as last shown, has an overlay over it (a picture of
+	-- it would have that in it).
+	function covered(self): boolean
+	-- Whether a modal, menu or popover it is outside has the keyboard.
+	function overlaid(self): boolean
 	-- Clear keyboard focus if it is on the element or inside it.
 	function blur(self): ()
 end

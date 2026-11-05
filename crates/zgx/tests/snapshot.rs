@@ -80,3 +80,44 @@ fn a_popups_node_is_pictured_from_its_own_surface() {
     assert_eq!(ui.snapshot(anchor, 50).unwrap().width(), 1);
     assert_eq!(asked.borrow().len(), 1);
 }
+
+/// What the window last showed has a modal over the node: until a frame shows
+/// it gone. What's outside the modal's box, and the modal's own, aren't covered;
+/// a popup in a surface of its own is no part of the window's picture.
+#[test]
+fn a_node_is_covered_while_the_window_last_showed_an_overlay_over_it() {
+    let mut ui = Ui::new(400., 300.);
+    let open = ui.signal(false);
+    let view = ui.mount(
+        column()
+            .child(div().id("page").w(400.).h(300.).bg(rgb(0x334455)))
+            .child(modal("Over it", open.clone()).child(div().id("in-modal").w(100.).h(50.))),
+    );
+    ui.prepare_frame();
+    let page = view.find("page").unwrap();
+    assert!(!ui.covered(page), "nothing over it");
+    open.set(true);
+    ui.prepare_frame();
+    assert!(ui.covered(page), "a modal over it");
+    let inside = view.find("in-modal").unwrap();
+    assert!(!ui.covered(inside), "not by the modal it is in");
+    open.set(false);
+    assert!(ui.covered(page), "what the window last showed still has it");
+    ui.prepare_frame();
+    assert!(!ui.covered(page), "shut, in the frame since");
+
+    let mut ui = Ui::new(400., 300.);
+    ui.set_popup_screens(vec![Rect::new(0., 0., 1000., 800.)]);
+    let open = ui.signal(true);
+    let view = ui.mount(
+        column()
+            .child(popover("Near", open.clone(), div().id("anchor").w(40.).h(20.)).child(div().w(300.).h(200.)))
+            .child(div().id("page").w(400.).h(280.)),
+    );
+    ui.prepare_frame();
+    let page = view.find("page").unwrap();
+    assert!(ui.covered(page), "with no surfaces of its own, the window draws it");
+    ui.on_popup_snapshot(|_, _, _| None);
+    ui.prepare_frame();
+    assert!(!ui.covered(page), "in a surface of its own");
+}

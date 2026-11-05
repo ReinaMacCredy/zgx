@@ -203,3 +203,41 @@ fn a_modal_route_opens_with_its_route_and_closing_goes_back() {
     assert!(h.wait_until(|h| !h.shown("in-modal")), "Escape closes it");
     assert_eq!(h.text("where"), "home / -", "on_close went back");
 }
+
+#[test]
+fn a_history_set_goes_nowhere_and_says_how_it_last_moved() {
+    let mut h = Harness::inline(
+        r##"local router = ui.router { routes = { home = "/", thread = "/thread/:id" } }
+        local result = ui.state("result", "")
+        local function say()
+            result:set(`{router.last_move} {router.route:peek().path} {tostring(router.can_back:peek())} {tostring(router.can_forward:peek())}`)
+        end
+        local function button(id, run)
+            return ui.button { id = id, w = 40, h = 20, id, on_click = function() run() say() end }
+        end
+        return ui.column {
+            ui.text { id = "result", "{result}" },
+            button("to-1", function() router.open("/thread/1") end),
+            button("to-2", function() router.open("/thread/2") end),
+            button("back", router.back),
+            button("forward", router.forward),
+            button("drop-1", function() router.set_history({ "/", "/thread/2" }, 2) end),
+            button("only", function() router.set_history({ "/thread/2" }, 1) end),
+        }"##,
+    );
+    h.click("to-1");
+    h.click("to-2");
+    assert_eq!(h.text("result"), "navigate /thread/2 true false");
+    h.click("back");
+    assert_eq!(h.text("result"), "back /thread/1 true true");
+    h.click("forward");
+    assert_eq!(h.text("result"), "forward /thread/2 true false");
+    h.click("drop-1");
+    assert_eq!(h.text("result"), "forward /thread/2 true false");
+    h.click("back");
+    assert_eq!(h.text("result"), "back / false true", "past the place left out");
+    h.click("forward");
+    assert_eq!(h.text("result"), "forward /thread/2 true false");
+    h.click("only");
+    assert_eq!(h.text("result"), "forward /thread/2 false false");
+}
