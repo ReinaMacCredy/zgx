@@ -11494,6 +11494,10 @@ impl Scene {
             let layered = std::iter::once(id)
                 .chain(self.ancestors(id))
                 .any(|node| self.is_layer(node));
+            let jumped = self
+                .world_clip(id)
+                .is_some_and(|clip| dx.abs() >= clip.width || dy.abs() >= clip.height);
+            let again = again || jumped;
             if again && self.transformed + self.filtered.get() > 0 {
                 // Its clip, wherever transformed or blurred ancestors show it.
                 let (_, clip, placement) = self.placed(id);
