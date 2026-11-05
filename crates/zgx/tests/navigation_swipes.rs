@@ -198,3 +198,91 @@ fn navigating_reaches_the_nearest_view_that_navigates_under_the_point() {
         "nothing there navigates"
     );
 }
+
+/// A 300-wide page that follows swipes itself, holding a 200-wide row that
+/// scrolls across 600 of content, above a plain box, as `mount`.
+fn mount_following(ui: &mut Ui) -> (Signal<f32>, Rc<RefCell<Vec<zgx::input::SwipeStep>>>) {
+    ui.set_elastic_scrolling(true);
+    ui.set_navigation_swipes(true);
+    let offset = ui.signal(0.);
+    let steps = Rc::new(RefCell::new(Vec::new()));
+    let log = steps.clone();
+    let _view = ui.mount(
+        column()
+            .w(300.)
+            .h(200.)
+            .child(
+                scroll_x(offset.clone())
+                    .id("row")
+                    .w(200.)
+                    .h(100.)
+                    .child(div().w(600.).h(100.)),
+            )
+            .child(div().w(300.).h(100.))
+            .on_swipe(move |step| log.borrow_mut().push(step)),
+    );
+    ui.prepare_frame();
+    (offset, steps)
+}
+
+#[test]
+fn a_view_that_follows_swipes_hears_each_step_and_the_platform_tracks_nothing() {
+    use zgx::input::SwipeStep::{Began, Ended, Moved};
+    let mut ui = Ui::new(400., 300.);
+    let (offset, steps) = mount_following(&mut ui);
+    phase(&mut ui, ScrollGesture::Began);
+    // Under the slop nothing's decided; past it, what's gone so far at once.
+    scroll(&mut ui, 150., 150., -3., 0.);
+    assert!(steps.borrow().is_empty(), "undecided");
+    scroll(&mut ui, 150., 150., -6., 1.);
+    assert_eq!(*steps.borrow(), [Began, Moved { dx: -9., dy: 1. }]);
+    assert!(!ui.take_navigation_swipe(), "not the platform's");
+    // The rest is the swipe's wherever the fingers go, the row untouched.
+    scroll(&mut ui, 100., 50., -30., 0.);
+    assert_eq!(steps.borrow().last(), Some(&Moved { dx: -30., dy: 0. }));
+    assert_eq!(offset.get(), 0.);
+    phase(&mut ui, ScrollGesture::Ended);
+    assert_eq!(steps.borrow().last(), Some(&Ended));
+    // Its momentum goes nowhere.
+    let heard = steps.borrow().len();
+    phase(&mut ui, ScrollGesture::MomentumBegan);
+    scroll(&mut ui, 100., 50., 50., 0.);
+    phase(&mut ui, ScrollGesture::MomentumEnded);
+    assert_eq!(steps.borrow().len(), heard);
+    assert_eq!(offset.get(), 0.);
+}
+
+#[test]
+fn what_scrolls_across_keeps_the_gesture_and_so_does_a_downward_one() {
+    let mut ui = Ui::new(400., 300.);
+    let (offset, steps) = mount_following(&mut ui);
+    // Toward its end, over the row: the row's.
+    phase(&mut ui, ScrollGesture::Began);
+    scroll(&mut ui, 100., 50., 30., 0.);
+    scroll(&mut ui, 100., 50., 30., 0.);
+    assert_eq!(offset.get(), 60.);
+    assert!(steps.borrow().is_empty());
+    phase(&mut ui, ScrollGesture::Ended);
+    // Mostly down: content, however it goes on.
+    phase(&mut ui, ScrollGesture::Began);
+    scroll(&mut ui, 150., 150., 2., 20.);
+    scroll(&mut ui, 150., 150., -60., 0.);
+    assert!(steps.borrow().is_empty());
+    phase(&mut ui, ScrollGesture::Ended);
+    // Swipes off, as the system's setting can have them: nothing.
+    ui.set_navigation_swipes(false);
+    phase(&mut ui, ScrollGesture::Began);
+    scroll(&mut ui, 150., 150., -60., 0.);
+    assert!(steps.borrow().is_empty());
+}
+
+#[test]
+fn a_new_touch_cancels_a_swipe_that_never_ended() {
+    use zgx::input::SwipeStep::Cancelled;
+    let mut ui = Ui::new(400., 300.);
+    let (_offset, steps) = mount_following(&mut ui);
+    phase(&mut ui, ScrollGesture::Began);
+    scroll(&mut ui, 150., 150., -20., 0.);
+    phase(&mut ui, ScrollGesture::Began);
+    assert_eq!(steps.borrow().last(), Some(&Cancelled));
+}

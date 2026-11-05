@@ -562,8 +562,9 @@ const HELP: &str = "commands (one JSON object a line, `cmd` and its fields):
   right-click target|x,y                         click the context button there (a context menu opens)
   drag    target|x,y to                          drag with the primary button; `to` is a target or x,y
   type    target text                            click it, then type text
-  key     keys                                   e.g. \"Enter\", \"cmd+k\", \"alt+ArrowDown\"
-  scroll  target dy                              scroll the viewport under it
+  key     keys                                   e.g. \"Enter\", \"cmd+k\", \"alt+ArrowDown\"; \"hold ctrl\"
+                                                 and \"release\" hold modifiers until let go
+  scroll  target dy [dx]                         scroll the viewport under it
   snapshot target [width=4096]                   its pixels as the window last drew them: a PNG, user-only
   record  [stop]                                 record the window's wheel input; stop answers the tape
   replay  target tape [repeat=1] [every]         play a tape back through the window's input path: its
@@ -866,6 +867,17 @@ impl Session {
             })(),
             "key" => (|| {
                 let keys = text("keys").ok_or("key takes `keys` (\"Enter\", \"cmd+k\")")?;
+                // Held until let go, for what waits on a modifier's release.
+                if keys == "release" {
+                    driver::hold_modifiers(&mut ui, Default::default());
+                    return Ok(("released the modifiers".to_string(), Value::Nil));
+                }
+                if let Some(held) = keys.strip_prefix("hold ") {
+                    let modifiers = driver::parse_modifiers(held)
+                        .ok_or_else(|| format!("`{held}` isn't modifier keys"))?;
+                    driver::hold_modifiers(&mut ui, modifiers);
+                    return Ok((format!("holding {held}"), Value::Nil));
+                }
                 // Modifiers alone (`alt`): held, then let go.
                 if let Some(modifiers) = driver::parse_modifiers(&keys) {
                     driver::tap_modifiers(&mut ui, modifiers);
@@ -900,7 +912,12 @@ impl Session {
             })(),
             "scroll" => (|| {
                 let node = reachable(&ui)?;
-                driver::scroll(&mut ui, node, number("dy").unwrap_or(100.) as f32);
+                driver::scroll_across(
+                    &mut ui,
+                    node,
+                    number("dx").unwrap_or(0.) as f32,
+                    number("dy").unwrap_or(100.) as f32,
+                );
                 Ok((format!("scrolled @{}", driver::number(node)), Value::Nil))
             })(),
             "command" => (|| {

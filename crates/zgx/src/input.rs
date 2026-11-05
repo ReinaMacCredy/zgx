@@ -139,6 +139,28 @@ pub enum ScrollGesture {
     /// Momentum scrolling ended.
     MomentumEnded,
 }
+/// How a trackpad's two-finger swipe across a view that follows one goes,
+/// step by step (`View::on_swipe`): the view tracks it itself and decides
+/// what it comes to, rather than the platform tracking it and reporting one
+/// [`Navigation`] at its end. `Moved` is in the window's points, as a scroll's
+/// delta is (fingers to the right scroll left: `dx` negative).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SwipeStep {
+    /// The gesture became a swipe.
+    Began,
+    /// The fingers moved. Still (no motion) when the platform has cancelled
+    /// the gesture and is to say no more.
+    Moved {
+        /// Across, in points.
+        dx: f32,
+        /// Down, in points.
+        dy: f32,
+    },
+    /// The fingers lifted.
+    Ended,
+    /// A new touch began with this one unfinished.
+    Cancelled,
+}
 /// A step back or forward through where an app has been, as a browser's
 /// Back and Forward go: a trackpad's swipe between pages (macOS) reaches
 /// the view under it as this action, in an [`InputEvent::Action`]
@@ -652,6 +674,8 @@ struct State {
     unfocused_keys: Vec<NodeId>,
     /// Views that take a step back or forward (`take_navigation`).
     navigators: Vec<NodeId>,
+    /// Those of them that follow a swipe step by step (`follow_swipes`).
+    swipe_followers: Vec<NodeId>,
     entries: crate::scene::NodeMap<Vec<Entry>>,
     options: crate::scene::NodeMap<NodeInput>,
     /// Boxes the pointer passes through while nothing they hold is displayed
@@ -842,6 +866,27 @@ impl InputDispatcher {
             && std::iter::once(target)
                 .chain(scene.ancestors(target))
                 .any(|node| state.navigators.contains(&node))
+    }
+    /// `node` follows a swipe over it step by step ([`SwipeStep`]): the
+    /// platform doesn't track it (`View::on_swipe`).
+    pub fn follow_swipes(&self, node: NodeId, scene: &Scene) {
+        let mut state = self.state.borrow_mut();
+        state
+            .swipe_followers
+            .retain(|n| *n != node && scene.contains(*n));
+        state.swipe_followers.push(node);
+    }
+    /// The view around `target` that follows swipes, if it's the nearest
+    /// that navigates. Reads only.
+    pub(crate) fn swipe_follower(&self, scene: &Scene, target: NodeId) -> Option<NodeId> {
+        let state = self.state.borrow();
+        if state.swipe_followers.is_empty() {
+            return None;
+        }
+        std::iter::once(target)
+            .chain(scene.ancestors(target))
+            .find(|node| state.navigators.contains(node))
+            .filter(|node| state.swipe_followers.contains(node))
     }
     /// Step back or forward from what is under `x`, `y`, as a swipe there
     /// does: the view under it hears `navigation`, and the views around it
@@ -2389,7 +2434,7 @@ impl InputDispatcher {
             focus_changed: old != self.focused(),
         }
     }
-    fn hit_target(&self, scene: &Scene, x: f32, y: f32) -> Option<NodeId> {
+    pub(crate) fn hit_target(&self, scene: &Scene, x: f32, y: f32) -> Option<NodeId> {
         let mut fallback = None;
         'hits: for hit in scene.hit_test_all(x, y) {
             let mut node = Some(hit);

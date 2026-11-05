@@ -26,8 +26,17 @@ declare extern type TestApp with
 	-- Press keys where focus is: "Enter", "Escape", "cmd+k", "alt+ArrowDown"
 	-- (cmd is Command on macOS, Control elsewhere).
 	function key(self, keys: string): ()
-	-- Scroll the viewport under the target by dy points (down is positive).
-	function scroll(self, target: string, dy: number): ()
+	-- Scroll the viewport under the target by dy points (down is positive),
+	-- and across by dx.
+	function scroll(self, target: string, dy: number, dx: number?): ()
+	-- Hold modifier keys ("ctrl", "cmd+shift") until `release`: `ui.modifiers`
+	-- follows, which `key` alone never moves.
+	function hold(self, keys: string): ()
+	function release(self): ()
+	-- A trackpad gesture's phase ("began", "ended", "momentum_began",
+	-- "momentum_ended"), with `scroll` between: `swipes`, whether a swipe
+	-- between pages can start (true if not given).
+	function gesture(self, phase: string, swipes: boolean?): ()
 	-- Run a `ui.command` by its id, as its menu item or shortcut does.
 	function command(self, id: string): ()
 	-- The window's new size, laid out.

@@ -8,7 +8,7 @@
 //! gesture's phases (`InputEvent::ScrollGesture`); a mouse wheel's notches,
 //! and scrolling an app does, never stretch. Off, nothing here runs.
 use crate::{
-    input::{DispatchResult, InputEvent, ScrollGesture},
+    input::{DispatchResult, InputEvent, ScrollGesture, SwipeStep},
     reactive::Signal,
     scene::NodeId,
     widgets::Ui,
@@ -136,7 +136,20 @@ pub(crate) struct State {
     swiping: bool,
     /// A swipe the host has yet to hear of (`Ui::take_navigation_swipe`).
     pub(crate) asked: bool,
+    /// The view following this swipe step by step, while the fingers are
+    /// down (`View::on_swipe`).
+    following: Option<NodeId>,
+    /// How far the fingers have gone while it's undecided whether they swipe
+    /// (`SWIPE_SLOP`).
+    touch: (f32, f32),
+    /// What's under the fingers scrolls across: they don't swipe.
+    claimed: bool,
 }
+
+/// How far the fingers go before a gesture over a view that follows swipes
+/// is decided, and how much more across than down it must be to be a swipe.
+const SWIPE_SLOP: f32 = 8.;
+const SWIPE_RATIO: f32 = 1.5;
 
 /// `root`'s scroll view stretches: its translation adds `shown`.
 pub(crate) fn register(
@@ -220,6 +233,17 @@ fn active(ui: &Ui) -> Option<Rc<Elastic>> {
 /// end lets spring back.
 pub(crate) fn gesture(ui: &Ui, phase: ScrollGesture) {
     let now = Instant::now();
+    // The swipe being followed ends with the fingers, or as new ones touch.
+    if matches!(phase, ScrollGesture::Began | ScrollGesture::Ended) {
+        let following = ui.elastic_state().borrow_mut().following.take();
+        if let Some(view) = following {
+            let step = match phase {
+                ScrollGesture::Began => SwipeStep::Cancelled,
+                _ => SwipeStep::Ended,
+            };
+            swipe_step(ui, view, step);
+        }
+    }
     let release = {
         let mut state = ui.elastic_state().borrow_mut();
         match phase {
@@ -229,6 +253,8 @@ pub(crate) fn gesture(ui: &Ui, phase: ScrollGesture) {
                 state.bounced = false;
                 state.first = true;
                 state.swiping = false;
+                state.touch = (0., 0.);
+                state.claimed = false;
                 // A swipe a gesture's last scroll asked for, too late to track.
                 state.asked = false;
                 false
@@ -275,9 +301,24 @@ pub(crate) fn before_scroll(ui: &Ui, event: InputEvent) -> Option<InputEvent> {
         return Some(event);
     };
     // A swipe between pages' gesture scrolls nothing.
-    if ui.elastic_state().borrow().swiping {
+    let (swiping, following) = {
+        let state = ui.elastic_state().borrow();
+        (state.swiping, state.following)
+    };
+    if swiping {
+        if let Some(view) = following {
+            swipe_step(
+                ui,
+                view,
+                SwipeStep::Moved {
+                    dx: delta_x,
+                    dy: delta_y,
+                },
+            );
+        }
         return None;
     }
+    undecided_scroll(ui, x, y, delta_x);
     let Some(view) = active(ui).filter(|view| view.stretched() && view.spring.get().is_none())
     else {
         return Some(event);
@@ -316,6 +357,9 @@ pub(crate) fn after_scroll(ui: &Ui, event: &InputEvent, result: &DispatchResult)
     else {
         return;
     };
+    if follow_swipe(ui, delta_x, delta_y, result) {
+        return;
+    }
     let (fingers, momentum, first) = {
         let mut state = ui.elastic_state().borrow_mut();
         (
@@ -422,6 +466,127 @@ fn swipe(ui: &Ui, target: Option<NodeId>) -> bool {
         state.asked = true;
     }
     navigates
+}
+
+/// Tell the view following a swipe how it goes.
+fn swipe_step(ui: &Ui, view: NodeId, step: SwipeStep) {
+    if ui.scene.borrow().contains(view) {
+        ui.input.dispatch_to(
+            &ui.scene,
+            view,
+            InputEvent::Action(crate::actions::Action::new(step)),
+        );
+    }
+}
+
+/// Before a scroll while its gesture is undecided: a view under the fingers
+/// that can scroll across that way has it, and it won't swipe.
+fn undecided_scroll(ui: &Ui, x: f32, y: f32, delta_x: f32) {
+    {
+        let state = ui.elastic_state().borrow();
+        if !(state.first && state.fingers && state.swipes) || delta_x == 0. {
+            return;
+        }
+    }
+    let scene = ui.scene.borrow();
+    let Some(target) = ui.input.hit_target(&scene, x, y) else {
+        return;
+    };
+    let room = {
+        let state = ui.elastic_state().borrow();
+        std::iter::once(target)
+            .chain(scene.ancestors(target))
+            .filter_map(|node| {
+                state
+                    .views
+                    .iter()
+                    .find(|(root, _)| *root == node)
+                    .and_then(|(_, view)| view.upgrade())
+            })
+            .filter(|view| view.horizontal)
+            .any(|view| {
+                let at = view.offset.with_untracked(|o| *o);
+                (delta_x < 0. && at > 0.) || (delta_x > 0. && at < view.limit())
+            })
+    };
+    if room {
+        ui.elastic_state().borrow_mut().claimed = true;
+    }
+}
+
+/// After a scroll while its gesture is undecided, over a view that follows
+/// swipes: the fingers have moved far enough clearly across, where nothing
+/// under them takes that, and it's a swipe the view hears from here on. True
+/// if that's what's become of this scroll: nothing else is to come of it.
+fn follow_swipe(ui: &Ui, delta_x: f32, delta_y: f32, result: &DispatchResult) -> bool {
+    let (decide, touch) = {
+        let mut state = ui.elastic_state().borrow_mut();
+        if !(state.first && state.fingers && state.swipes) {
+            return false;
+        }
+        let Some(target) = result.target else {
+            return false;
+        };
+        if ui.input.swipe_follower(&ui.scene.borrow(), target).is_none() {
+            return false;
+        }
+        state.touch.0 += delta_x;
+        state.touch.1 += delta_y;
+        // What the view under it took and isn't explained by scrolling down.
+        let vertical = delta_y != 0. && {
+            let scene = ui.scene.borrow();
+            std::iter::once(target)
+                .chain(scene.ancestors(target))
+                .filter_map(|node| {
+                    state
+                        .views
+                        .iter()
+                        .find(|(root, _)| *root == node)
+                        .and_then(|(_, view)| view.upgrade())
+                })
+                .any(|view| !view.horizontal && view.limit() > 0.)
+        };
+        if result.default_prevented && !vertical {
+            state.claimed = true;
+        }
+        if state.claimed {
+            state.first = false;
+            return false;
+        }
+        let touch = state.touch;
+        (touch.0.abs() + touch.1.abs() >= SWIPE_SLOP, touch)
+    };
+    if !decide {
+        return true;
+    }
+    ui.elastic_state().borrow_mut().first = false;
+    if touch.0.abs() <= SWIPE_RATIO * touch.1.abs() {
+        return false;
+    }
+    let view = {
+        let scene = ui.scene.borrow();
+        result
+            .target
+            .and_then(|target| ui.input.swipe_follower(&scene, target))
+    };
+    let Some(view) = view else {
+        return false;
+    };
+    {
+        let mut state = ui.elastic_state().borrow_mut();
+        state.swiping = true;
+        state.following = Some(view);
+    }
+    swipe_step(ui, view, SwipeStep::Began);
+    swipe_step(
+        ui,
+        view,
+        SwipeStep::Moved {
+            dx: touch.0,
+            dy: touch.1,
+        },
+    );
+    true
 }
 
 /// When the stretched view next steps back. Nothing stretched, nothing.
