@@ -21,6 +21,12 @@ const MAX_DELAY: Duration = Duration::from_millis(20);
 /// Wheel notches close this fraction of the remaining distance per second, in
 /// the exponent: about 95% within 100 ms.
 const WHEEL_RATE: f32 = 30.;
+/// Notches this close are a wheel spinning. Closing a share of what's left
+/// makes speed follow the distance left, which each notch tops up, so a spin
+/// would pump at the notches' own rate: in one, each notch's distance is
+/// handed over evenly until the next is due. Further apart they're steps of
+/// their own, each starting at once.
+const WHEEL_SPIN: Duration = Duration::from_millis(70);
 
 /// `ZGX_SCROLL_RESAMPLE=0` applies wheel input on arrival instead.
 pub(crate) fn enabled() -> bool {
@@ -40,6 +46,11 @@ pub(crate) struct ScrollResampler {
     /// Wheel distance not yet applied, and when it last advanced.
     wheel: (f32, f32),
     wheel_at: Option<Instant>,
+    /// Of that, what a spin hasn't handed over yet, how much of it a second,
+    /// and when the last notch came.
+    wheel_held: (f32, f32),
+    wheel_rate: (f32, f32),
+    wheel_notch: Option<Instant>,
     /// When the latest input arrived.
     last_input: Option<Instant>,
     /// Pointer position of the latest input; motion is delivered there.
@@ -90,6 +101,27 @@ impl ScrollResampler {
         }
         self.wheel.0 += delta.0;
         self.wheel.1 += delta.1;
+        let gap = self
+            .wheel_notch
+            .replace(now)
+            .map(|last| now.duration_since(last))
+            .filter(|gap| *gap < WHEEL_SPIN && !gap.is_zero());
+        for (held, rate, delta) in [
+            (&mut self.wheel_held.0, &mut self.wheel_rate.0, delta.0),
+            (&mut self.wheel_held.1, &mut self.wheel_rate.1, delta.1),
+        ] {
+            match gap {
+                // (Turning back ends a spin: what was held goes on as a step.)
+                Some(gap) if delta != 0. && delta.signum() == wheel_direction(*held, delta) => {
+                    *held += delta;
+                    *rate = held.abs() / gap.as_secs_f32();
+                }
+                _ => {
+                    *held = 0.;
+                    *rate = 0.;
+                }
+            }
+        }
     }
     /// Deliver everything at once (no display refreshes are coming).
     pub fn flush(&mut self) -> Option<(f32, f32)> {
@@ -101,6 +133,9 @@ impl ScrollResampler {
         self.points.clear();
         self.wheel = (0., 0.);
         self.wheel_at = None;
+        self.wheel_held = (0., 0.);
+        self.wheel_rate = (0., 0.);
+        self.wheel_notch = None;
         (delta != (0., 0.)).then_some(delta)
     }
     /// The motion to apply at a display refresh processed at `now`.
@@ -125,22 +160,37 @@ impl ScrollResampler {
         if let Some(at) = self.wheel_at.replace(now) {
             let elapsed = now.duration_since(at).as_secs_f32();
             let share = 1. - (-WHEEL_RATE * elapsed).exp();
-            for (remaining, out) in [
-                (&mut self.wheel.0, &mut delta.0),
-                (&mut self.wheel.1, &mut delta.1),
+            for (remaining, held, rate, out) in [
+                (
+                    &mut self.wheel.0,
+                    &mut self.wheel_held.0,
+                    &self.wheel_rate.0,
+                    &mut delta.0,
+                ),
+                (
+                    &mut self.wheel.1,
+                    &mut self.wheel_held.1,
+                    &self.wheel_rate.1,
+                    &mut delta.1,
+                ),
             ] {
+                let release = (rate * elapsed).min(held.abs()).copysign(*held);
+                *held -= release;
                 // Whole pixels: content stays on the pixel grid, and the
                 // offset sums exactly even tens of thousands of pixels down,
                 // where an f32 holds fractions of a pixel only roughly.
                 let step = if remaining.abs() <= 1. {
                     *remaining
                 } else {
-                    let step = (*remaining * share).round();
+                    let step = ((*remaining - *held) * share).round();
                     let step = if step == 0. { remaining.signum() } else { step };
                     step.clamp(-remaining.abs(), remaining.abs())
                 };
                 *remaining -= step;
                 *out += step;
+                if *remaining == 0. {
+                    *held = 0.;
+                }
             }
             if self.wheel == (0., 0.) {
                 self.wheel_at = None;
@@ -179,6 +229,16 @@ impl ScrollResampler {
     }
 }
 
+/// The direction a wheel's going: what it holds, or else `delta` (nothing held
+/// yet is no turn).
+fn wheel_direction(held: f32, delta: f32) -> f32 {
+    if held != 0. {
+        held.signum()
+    } else {
+        delta.signum()
+    }
+}
+
 /// Move from `applied` towards `target` without passing `received` or
 /// reversing the direction of travel.
 fn advance(applied: f32, target: f32, received: f32) -> f32 {
@@ -194,9 +254,103 @@ mod tests {
     use super::*;
     const MS: Duration = Duration::from_millis(1);
 
-    /// 120 Hz input sampled by a 120 Hz display half a period out of phase:
-    /// applying events on arrival alternates 0/2-event frames; resampled
-    /// frames each advance by one event's worth.
+    /// What notches (ms from a start, points) make of each refresh at 120 Hz;
+    /// all of it landed, in whole points.
+    fn wheel_steps(notches: &[(u64, f32)], refreshes: u32) -> Vec<f32> {
+        let start = Instant::now();
+        let mut resampler = ScrollResampler::default();
+        let mut next = notches.iter().peekable();
+        let mut steps = Vec::new();
+        for i in 1..refreshes {
+            let now = start + Duration::from_micros(8333) * i;
+            while let Some((at, points)) = next.peek() {
+                let at = start + Duration::from_millis(*at);
+                if at > now {
+                    break;
+                }
+                resampler.push_wheel(at, (0., *points));
+                next.next();
+            }
+            steps.push(resampler.sample(now).unwrap_or_default().1);
+        }
+        assert!(!resampler.pending(), "{steps:?}");
+        assert!(steps.iter().all(|step| step.fract() == 0.), "{steps:?}");
+        steps
+    }
+
+    /// However fast the spin: past its start, steps stay near their mean.
+    #[test]
+    fn a_wheel_spun_steadily_at_any_rate_moves_steadily() {
+        for gap in [25, 40, 60] {
+            let count = 1600 / gap;
+            let notches: Vec<_> = (0..count).map(|i| (i * gap, 42.)).collect();
+            let steps = wheel_steps(&notches, 400);
+            let steady = &steps[30..(1600 / 9) as usize];
+            let mean = steady.iter().sum::<f32>() / steady.len() as f32;
+            for step in steady {
+                assert!(
+                    (step / mean - 1.).abs() <= 0.2,
+                    "every {gap} ms, {step} around {mean}: {steady:?}"
+                );
+            }
+        }
+    }
+
+    /// A notch on its own moves at once, as fast as it ever did, and a spin's
+    /// first notch too: smoothing a spin costs no start.
+    #[test]
+    fn a_lone_notch_and_a_spins_first_start_at_once() {
+        let lone = wheel_steps(&[(0, 42.)], 60);
+        let spin: Vec<_> = (0..20).map(|i| (i * 40, 42.)).collect();
+        let spin = wheel_steps(&spin, 200);
+        for steps in [&lone, &spin] {
+            // A fifth of its distance in the first refresh.
+            assert!(steps[0] >= 8., "{steps:?}");
+        }
+        assert!(lone[0] > lone[3], "{lone:?}");
+        // Landed within about 100 ms.
+        assert!(
+            lone.iter().rposition(|step| *step != 0.).unwrap() < 14,
+            "{lone:?}"
+        );
+    }
+
+    /// A spin stops soon after its last notch: within what's held of that
+    /// notch and an ease.
+    #[test]
+    fn a_spin_stops_soon_after_its_last_notch() {
+        for gap in [25, 40, 60] {
+            let notches: Vec<_> = (0..12).map(|i| (i * gap, 42.)).collect();
+            let steps = wheel_steps(&notches, 200);
+            let last = (steps.iter().rposition(|step| *step != 0.).unwrap() + 1) as f32 * 8.333;
+            let after = last - (11 * gap) as f32;
+            assert!(
+                after <= 160.,
+                "every {gap} ms, moved {after} ms after the last"
+            );
+        }
+    }
+
+    /// Notches apart are steps of their own: none is held back for the next.
+    #[test]
+    fn notches_further_apart_than_a_spin_each_start_at_once() {
+        let steps = wheel_steps(&[(0, 42.), (100, 42.), (200, 42.)], 80);
+        let after = |ms: f32| steps[(ms / 8.333) as usize + 1];
+        for ms in [100., 200.] {
+            assert!(after(ms) >= 7., "{ms}: {steps:?}");
+        }
+    }
+
+    /// Turning the wheel back takes the content back at once, and it lands on
+    /// the sum of what the wheel said.
+    #[test]
+    fn a_wheel_turned_back_goes_back_at_once() {
+        let steps = wheel_steps(&[(0, 42.), (40, 42.), (80, 42.), (110, -84.)], 80);
+        assert_eq!(steps.iter().sum::<f32>(), 42.);
+        let back = steps.iter().position(|step| *step < 0.).unwrap();
+        assert!(back as f32 * 8.333 <= 130., "{steps:?}");
+    }
+
     #[test]
     fn out_of_phase_input_advances_evenly() {
         let start = Instant::now();
