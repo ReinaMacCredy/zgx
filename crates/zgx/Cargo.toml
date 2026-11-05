@@ -70,6 +70,10 @@ objc2-core-foundation = "0.3.2"
 objc2-core-video = "0.3.2"
 
 [[test]]
+name = "scene_jump_damage"
+path = "tests/scene_jump_damage.rs"
+
+[[test]]
 name = "compose"
 path = "tests/compose/main.rs"
 
