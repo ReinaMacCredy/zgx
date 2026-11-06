@@ -792,6 +792,21 @@ pub fn press(ui: &mut Ui, key: Key, modifiers: Modifiers) {
     });
     ui.dispatch(InputEvent::KeyUp { key, modifiers });
 }
+/// `text` typed at the keyboard's focus, a key at a time, as a window hears
+/// a keyboard: each press, then its text unless the press was taken.
+pub fn type_keys(ui: &mut Ui, text: &str) {
+    for c in text.chars() {
+        let key = Key::Character(c.to_lowercase().collect());
+        let modifiers = Modifiers { shift: c.is_uppercase(), ..Default::default() };
+        let taken = ui
+            .dispatch(InputEvent::KeyDown { key: key.clone(), modifiers, repeat: false })
+            .default_prevented;
+        if !taken {
+            ui.dispatch(InputEvent::Text(c.to_string()));
+        }
+        ui.dispatch(InputEvent::KeyUp { key, modifiers });
+    }
+}
 /// Scroll the viewport under `node`'s middle by `dy` points (down is
 /// positive).
 pub fn scroll(ui: &mut Ui, node: NodeId, dy: f32) {
