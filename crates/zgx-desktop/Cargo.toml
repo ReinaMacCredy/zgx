@@ -160,6 +160,11 @@ zgx-script = { path = "../zgx-script", version = "0.1.10", optional = true }
 name = "menu_services"
 harness = false
 
+# On the main thread, where AppKit's windows are made and animate.
+[[test]]
+name = "zoom_steps"
+harness = false
+
 [dev-dependencies]
 # The components the Linux probe's example shows (`components_probe`).
 zgx-components = { path = "../zgx-components" }
