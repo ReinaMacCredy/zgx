@@ -1737,7 +1737,13 @@ pub(crate) fn occluded(window: &winit::window::Window) -> Option<bool> {
     }
 }
 
-pub(crate) fn double_click(window: &winit::window::Window) {
+/// AppKit animates a zoom inside the call and winit holds `Resized` back during its handler: run there, the last frame stretches.
+#[cfg(target_os = "macos")]
+pub(crate) fn zoom_outside_handler(zoom: impl FnOnce() + Send + 'static) {
+    dispatch2::DispatchQueue::main().exec_async(zoom);
+}
+
+pub(crate) fn double_click(window: &std::sync::Arc<winit::window::Window>) {
     #[cfg(target_os = "macos")]
     mac::double_click(window);
     #[cfg(not(target_os = "macos"))]
@@ -2486,8 +2492,8 @@ mod mac {
     }
 
     /// The system's title bar double click (Desktop & Dock settings).
-    pub(super) fn double_click(window: &winit::window::Window) {
-        let Some(window) = ns_window(window) else {
+    pub(super) fn double_click(handle: &std::sync::Arc<winit::window::Window>) {
+        let Some(window) = ns_window(handle) else {
             return;
         };
         // SAFETY: NSUserDefaults' `standardUserDefaults` (unretained, the
@@ -2515,7 +2521,14 @@ mod mac {
             "Minimize" => window.miniaturize(None),
             "None" => {}
             // "Maximize" (zoom), "Fill" and anything newer: zoom.
-            _ => window.zoom(None),
+            _ => {
+                let handle = handle.clone();
+                super::zoom_outside_handler(move || {
+                    if let Some(window) = ns_window(&handle) {
+                        window.zoom(None);
+                    }
+                });
+            }
         }
     }
 

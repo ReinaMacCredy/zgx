@@ -4091,7 +4091,17 @@ impl Host {
                     .ui
                     .set_presented(self.state.visible && !value && !self.native_occluded);
             }
-            WindowCommand::Maximized(value) => window.set_maximized(value),
+            WindowCommand::Maximized(value) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let window = window.clone();
+                    crate::window_chrome::zoom_outside_handler(move || {
+                        window.set_maximized(value);
+                    });
+                }
+                #[cfg(not(target_os = "macos"))]
+                window.set_maximized(value);
+            }
             WindowCommand::Visible(value) => {
                 if !value {
                     self.context.ui.cancel_interactions();
