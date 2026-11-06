@@ -1029,3 +1029,31 @@ return ui.column { ui.text { id = "seen", "{seen}" } }
     let wrong = ask(&app, &session, r#"{"cmd":"key","keys":"altt"}"#);
     assert!(!wrong.field("ok").is_some_and(Value::truthy));
 }
+
+/// `type` with no target types as a keyboard does: a press that a parent's
+/// `on_key` focuses a field from lands its text there; one it takes doesn't.
+#[test]
+fn type_without_a_target_is_a_keyboard_at_the_focus() {
+    const KEYS: &str = r##"
+local name = ui.state("name", "")
+local field = ui.ref()
+return ui.column {
+    focusable = true,
+    id = "root",
+    on_key = function(e)
+        if e.key == "q" then
+            return true
+        end
+        if not e.editing then
+            field:peek():focus()
+        end
+        return false
+    end,
+    ui.input { ref = field, id = "name", label = "Name", value = name, w = 120 },
+}
+"##;
+    let app = TestApp::new(|runtime| ScriptHost::inline(runtime, "app", KEYS));
+    let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
+    text(&ask(&app, &session, r#"{"cmd":"type","text":"aqB"}"#));
+    assert!(text(&ask(&app, &session, r#"{"cmd":"state"}"#)).contains(r#"name = "aB""#));
+}

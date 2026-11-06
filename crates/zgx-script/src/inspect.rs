@@ -859,8 +859,15 @@ impl Session {
                 ))
             })(),
             "type" => (|| {
-                let (node, b) = reach(&ui)?;
                 let typed = text("text").ok_or("type takes a `text`")?;
+                // No target: as a keyboard, at whatever holds the keys, each
+                // key's press first and its text only if no one took the
+                // press, as a window hears them.
+                if text("target").is_none() {
+                    driver::type_keys(&mut ui, &typed);
+                    return Ok(("typed at the keyboard's focus".to_string(), Value::Nil));
+                }
+                let (node, b) = reach(&ui)?;
                 driver::click_at(&mut ui, b);
                 ui.dispatch(zgx::input::InputEvent::Text(typed));
                 Ok((format!("typed into @{}", driver::number(node)), Value::Nil))
