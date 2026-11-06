@@ -891,7 +891,19 @@ impl Session {
                     return Ok((format!("pressed {keys} alone"), Value::Nil));
                 }
                 let (key, modifiers) = driver::parse_keys(&keys)?;
-                driver::press(&mut ui, key, modifiers);
+                let paste = matches!(&key, zgx::input::Key::Character(c) if c.eq_ignore_ascii_case("v"))
+                    && (if cfg!(target_os = "macos") { modifiers.meta } else { modifiers.control })
+                    && !modifiers.alt
+                    && !modifiers.shift;
+                let taken = driver::press_taken(&mut ui, key, modifiers);
+                // What the window does with a paste no handler took.
+                if paste
+                    && !taken
+                    && let Some(editor) = ui.focused_editor()
+                {
+                    let text = self.0.host.0.platform.borrow().as_ref().and_then(|p| p.0.clipboard_text());
+                    ui.paste_into(&editor, text.as_deref());
+                }
                 Ok((format!("pressed {keys}"), Value::Nil))
             })(),
             "snapshot" => (|| {

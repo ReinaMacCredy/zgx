@@ -1438,6 +1438,22 @@ impl UserData for ElementUd {
             let (anchor, focus) = editor.selection();
             Ok((Some(anchor), Some(focus)))
         });
+        // Where its caret is, in the window's points: `{ x, y, w, h }`, nil for
+        // what isn't an editor. For what's placed at the caret, read as the
+        // text settles.
+        methods.add_method("caret_rect", |lua, e, ()| {
+            settle(lua);
+            let Some(editor) = e.0.handle.get().and_then(NodeHandle::editor) else {
+                return Ok(None);
+            };
+            let at = editor.input_method_area();
+            let rect = lua.create_table()?;
+            rect.set("x", at.x)?;
+            rect.set("y", at.y)?;
+            rect.set("w", at.width)?;
+            rect.set("h", at.height)?;
+            Ok(Some(rect))
+        });
         // The selection replaced by `text`, as typing it would (one step of
         // undo): a search's Replace, a snippet.
         methods.add_method("replace_selection", |lua, e, text: String| {

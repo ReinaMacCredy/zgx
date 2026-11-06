@@ -1057,3 +1057,26 @@ return ui.column {
     text(&ask(&app, &session, r#"{"cmd":"type","text":"aqB"}"#));
     assert!(text(&ask(&app, &session, r#"{"cmd":"state"}"#)).contains(r#"name = "aB""#));
 }
+
+/// `key` for the paste stroke does what the window does with one no handler
+/// took: the focused editor's paste, through its hook.
+#[test]
+fn the_paste_stroke_reaches_the_focused_editor() {
+    const PASTE: &str = r##"
+local name = ui.state("name", "")
+local heard = ui.state("heard", 0)
+return ui.input {
+    id = "name", label = "Name", value = name, w = 120,
+    on_paste = function(e)
+        heard:set(heard:peek() + 1)
+        return false
+    end,
+}
+"##;
+    let app = TestApp::new(|runtime| ScriptHost::inline(runtime, "app", PASTE));
+    let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
+    text(&ask(&app, &session, r##"{"cmd":"click","target":"#name"}"##));
+    let stroke = if cfg!(target_os = "macos") { "cmd+v" } else { "ctrl+v" };
+    text(&ask(&app, &session, &format!(r#"{{"cmd":"key","keys":"{stroke}"}}"#)));
+    assert!(text(&ask(&app, &session, r#"{"cmd":"state"}"#)).contains("heard = 1"));
+}

@@ -785,12 +785,19 @@ pub fn hold_modifiers(ui: &mut Ui, modifiers: Modifiers) {
 }
 /// Press and release `key` with `modifiers`, wherever focus is.
 pub fn press(ui: &mut Ui, key: Key, modifiers: Modifiers) {
-    ui.dispatch(InputEvent::KeyDown {
-        key: key.clone(),
-        modifiers,
-        repeat: false,
-    });
+    press_taken(ui, key, modifiers);
+}
+/// [`press`], and whether a handler took the press.
+pub fn press_taken(ui: &mut Ui, key: Key, modifiers: Modifiers) -> bool {
+    let taken = ui
+        .dispatch(InputEvent::KeyDown {
+            key: key.clone(),
+            modifiers,
+            repeat: false,
+        })
+        .default_prevented;
     ui.dispatch(InputEvent::KeyUp { key, modifiers });
+    taken
 }
 /// `text` typed at the keyboard's focus, a key at a time, as a window hears
 /// a keyboard: each press, then its text unless the press was taken.
