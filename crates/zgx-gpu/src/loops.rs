@@ -12,7 +12,12 @@
 //! painted over it, in the window's own frames. Anywhere else the loop is
 //! refused, and goes on tick by tick from where it has reached. A new look
 //! or scale draws the sheet again.
-use crate::layer_present::{Buffer, LoopShown};
+//!
+//! What a layer shows is worked out whole from the scene at each frame
+//! (`sync_loops`), whatever that frame's damage walked: where the node is,
+//! and whether it shows at all. A layer sits over the frames, out of reach of
+//! their clips, so nothing but this keeps it with the content around it.
+use crate::layer_present::{Buffer, LoopShown, LoopState};
 use crate::{GpuRenderer, Region};
 use std::rc::Rc;
 use zgx::scene::{BakedLoop, NodeId, NodeKind, PaintItem, Rect, Scene};
@@ -46,9 +51,77 @@ pub(crate) struct LoopSheet {
     /// Its place now, in points, and the opacity of what holds it.
     frame: (f32, f32),
     opacity: f32,
+    /// Whether its node shows now (`Scene::visible_bounds`): clipped away,
+    /// transparent or hidden, its layer hides with it.
+    showing: bool,
     /// The bounds it was last seen at: a sheet is drawn again for a new
     /// fraction only once they hold still, not through a slide.
     seen: Rect,
+}
+/// What the last frame did, for a line about a layer that disagrees
+/// (`say_disagreement`).
+#[derive(Default)]
+pub(crate) struct LoopWatch {
+    /// The scene's mode, its window and what it asked of the frame.
+    blur: bool,
+    viewport: (f32, f32),
+    damage: usize,
+    /// A frame patched in place, rather than walked.
+    patched: bool,
+    rendered: Option<std::time::Instant>,
+    /// A frame drawn since the last flush placed the layers already.
+    placed: bool,
+    /// When the state said last changed, and when the layers' shown places
+    /// were last read (a read makes a copy of the layer: 4 times a second).
+    changed: Option<std::time::Instant>,
+    read: Option<std::time::Instant>,
+    /// Found where the scene isn't to hand (a frame's presenting): said at
+    /// the next `sync_loops`.
+    pending: Vec<(u64, &'static str, LoopState)>,
+    /// How the last frame went, for those lines.
+    presented: &'static str,
+    /// Each ring and kind said once; a session's lines are few.
+    said: Vec<(u64, &'static str)>,
+    /// How many disagreements were found, said or not.
+    found: u32,
+}
+impl LoopWatch {
+    pub(crate) fn set_damage(&mut self, rects: usize) {
+        self.damage = rects;
+    }
+}
+/// A loop's state as last given its layer (`sync_loops`).
+#[derive(PartialEq)]
+pub(crate) struct LoopSaid {
+    key: u64,
+    surface: u32,
+    frame: (f32, f32),
+    opacity: f32,
+    showing: bool,
+    point: f64,
+}
+impl LoopSaid {
+    /// How a layer isn't what this told it, if it isn't.
+    fn differs(&self, scale: f32, shown: &LoopState, on_screen: bool) -> Option<&'static str> {
+        let want = (
+            (self.frame.0 * scale).round() as f64 / self.point,
+            (self.frame.1 * scale).round() as f64 / self.point,
+        );
+        let off = |at: (f64, f64)| (at.0 - want.0).abs() > 0.01 || (at.1 - want.1).abs() > 0.01;
+        if on_screen {
+            let far = |at: (f64, f64)| (at.0 - want.0).abs() > 1. || (at.1 - want.1).abs() > 1.;
+            return (self.showing && shown.on_screen.is_some_and(far)).then_some("on-screen");
+        }
+        if shown.hidden != !self.showing {
+            Some("shown")
+        } else if self.showing && off(shown.at) {
+            Some("place")
+        } else if (shown.opacity - self.opacity).abs() > 0.001 {
+            Some("opacity")
+        } else {
+            None
+        }
+    }
 }
 /// What a layer shows over the window's frame: read back with it, so a
 /// capture of the frame shows what the window does (`ShownFrame::read`).
@@ -183,6 +256,7 @@ impl LoopSheet {
                 height as f64 / point,
             ),
             opacity: self.opacity,
+            hidden: !self.showing,
             rects,
             times,
             duration,
@@ -200,6 +274,7 @@ impl GpuRenderer {
         let mut over: Vec<OverFrame> = self
             .loop_sheets
             .iter()
+            .filter(|sheet| sheet.showing)
             .map(|sheet| OverFrame::Loop {
                 buffer: sheet.buffer.clone(),
                 at: (
@@ -267,9 +342,9 @@ impl GpuRenderer {
                 .as_ref()
                 .is_some_and(|present| present.layer.is_some())
     }
-    /// `items` less the looping ones a layer plays, those layers placed,
-    /// their sheets drawn if new. A frame's `items` may leave out what its
-    /// damage doesn't reach: such a loop's layer stays as it is.
+    /// `items` less the looping ones a layer plays, their sheets drawn if
+    /// new. A frame's `items` may leave out what its damage doesn't reach, or
+    /// what no longer shows: `sync_loops` places every layer all the same.
     pub(crate) fn place_loops<'a>(
         &mut self,
         scene: &Scene,
@@ -306,7 +381,6 @@ impl GpuRenderer {
                 *node == sheet.node && Rc::ptr_eq(loop_, &sheet.baked) && !loop_.refused()
             })
         });
-        let mut changed = Vec::new();
         for (item, loop_) in placed {
             let bounds = item.bounds;
             let (x, y) = (bounds.x * scale, bounds.y * scale);
@@ -317,7 +391,6 @@ impl GpuRenderer {
             } else {
                 1.
             };
-            let key = item.id.number() as u64;
             let params = scene.shader_uniforms(item.id).params;
             let at = self.loop_sheets.iter().position(|s| s.node == item.id);
             let stale = at.is_some_and(|at| {
@@ -334,30 +407,105 @@ impl GpuRenderer {
                     continue;
                 };
                 self.loop_sheets.push(sheet);
-                changed.push(key);
             }
-            let Some(sheet) = self.loop_sheets.iter_mut().find(|s| s.key() == key) else {
+            let Some(sheet) = self.loop_sheets.iter_mut().find(|s| s.node == item.id) else {
                 continue;
             };
             sheet.seen = bounds;
-            let frame = (
-                (x - sheet.fraction.0) / scale,
-                (y - sheet.fraction.1) / scale,
+            sheet.opacity = opacity;
+        }
+        items
+    }
+    /// Every loop's layer as the scene has it now, for the frame on its way:
+    /// where its node is and whether it shows, whichever path drew the frame
+    /// and whatever it walked. The whole state each time, so what a frame
+    /// drawn twice or skipped asks for can't be lost, and nothing a layer
+    /// shows depends on an earlier frame having said so. Each layer is read
+    /// back, not trusted: one that isn't what it was told is told again.
+    pub(crate) fn sync_loops(&mut self, scene: &Scene) {
+        if self.loop_sheets.is_empty()
+            && self
+                .layer_present
+                .as_ref()
+                .and_then(|present| present.layer.as_ref())
+                .is_none_or(|layer| !layer.has_loops())
+        {
+            return;
+        }
+        // (Frames that return early never reached `place_loops`.)
+        let baked = scene.baked_loops();
+        self.loop_sheets.retain(|sheet| {
+            baked.iter().any(|(node, loop_)| {
+                *node == sheet.node && Rc::ptr_eq(loop_, &sheet.baked) && !loop_.refused()
+            })
+        });
+        let (scale, zoom) = (self.scale, self.zoom);
+        self.loop_watch.placed = true;
+        self.loop_watch.blur = scene.has_backdrop_blur();
+        self.loop_watch.viewport = (self.width as f32 / scale, self.height as f32 / scale);
+        self.loop_watch.patched = self.patched;
+        for (key, kind, shown) in std::mem::take(&mut self.loop_watch.pending) {
+            self.say_disagreement(scene, key, kind, &shown);
+        }
+        let layer = self
+            .layer_present
+            .as_ref()
+            .and_then(|present| present.layer.as_ref());
+        let queued = layer.is_some_and(|layer| layer.loops_queued());
+        let mut changed = self.loops_said.len() != self.loop_sheets.len();
+        let mut behind = Vec::new();
+        for (at, sheet) in self.loop_sheets.iter_mut().enumerate() {
+            let bounds = scene.bounds(sheet.node);
+            sheet.frame = (
+                (bounds.x * scale - sheet.fraction.0) / scale,
+                (bounds.y * scale - sheet.fraction.1) / scale,
             );
-            if sheet.frame != frame || sheet.opacity != opacity {
-                sheet.frame = frame;
-                sheet.opacity = opacity;
-                if !changed.contains(&key) {
-                    changed.push(key);
+            sheet.showing =
+                scene.layout_visible(sheet.node) && scene.visible_bounds(sheet.node).is_some();
+            let said = LoopSaid {
+                key: sheet.key(),
+                surface: sheet.buffer.surface.id(),
+                frame: sheet.frame,
+                opacity: sheet.opacity,
+                showing: sheet.showing,
+                point: f64::from(scale) / zoom,
+            };
+            match self.loops_said.get_mut(at) {
+                Some(was) if *was == said => {
+                    // What it was told and has had the chance to take: is it?
+                    if !queued
+                        && let Some(layer) = layer
+                        && let Some(shown) = layer.loop_state(said.key, false)
+                        && let Some(kind) = said.differs(scale, &shown, false)
+                    {
+                        behind.push((said.key, kind, shown));
+                        changed = true;
+                    }
                 }
+                Some(was) => {
+                    *was = said;
+                    changed = true;
+                }
+                None => self.loops_said.push(said),
             }
         }
+        for (key, kind, shown) in behind {
+            self.say_disagreement(scene, key, kind, &shown);
+        }
+        self.loop_watch.rendered = Some(std::time::Instant::now());
+        // The same state as the last said, which stands (`set_loops`, queued
+        // or applied), and each layer as it was told: most frames of a stream
+        // move no ring.
+        if !changed {
+            return;
+        }
+        self.loop_watch.changed = self.loop_watch.rendered;
+        self.loops_said.truncate(self.loop_sheets.len());
         let alive = self.loop_sheets.iter().map(LoopSheet::key).collect();
         let shown = self
             .loop_sheets
             .iter()
-            .filter(|sheet| changed.contains(&sheet.key()))
-            .map(|sheet| sheet.shown(scale, self.zoom))
+            .map(|sheet| sheet.shown(scale, zoom))
             .collect();
         if let Some(layer) = self
             .layer_present
@@ -366,7 +514,126 @@ impl GpuRenderer {
         {
             layer.set_loops(alive, shown);
         }
-        items
+    }
+    /// After every flush of the scene, whether or not it drew a frame: a
+    /// flush that drew nothing (no damage) still moves layers to where the
+    /// scene has them, there being no frame for them to wait for. A frame
+    /// drawn this flush placed them already.
+    pub fn loops_after_flush(&mut self, scene: &Scene) {
+        if std::mem::take(&mut self.loop_watch.placed) {
+            return;
+        }
+        self.sync_loops(scene);
+        self.loop_watch.placed = false;
+        if self.frame_pending() {
+            return;
+        }
+        if let Some(layer) = self
+            .layer_present
+            .as_mut()
+            .and_then(|present| present.layer.as_mut())
+        {
+            layer.flush_loops();
+        }
+    }
+    /// A frame failed (a panic in it, an error): what the window shows is no
+    /// longer what the scene has, so no ring shows over it until a frame
+    /// does. The next `sync_loops` shows them again, from the scene.
+    pub fn hide_loops(&mut self) {
+        for said in &mut self.loops_said {
+            said.showing = false;
+        }
+        for sheet in &mut self.loop_sheets {
+            sheet.showing = false;
+        }
+        if let Some(layer) = self
+            .layer_present
+            .as_mut()
+            .and_then(|present| present.layer.as_mut())
+        {
+            layer.hide_loops();
+        }
+    }
+    /// Where Core Animation shows each layer, a little after it last changed:
+    /// a line in the log if that isn't where it was told (`sync_loops` reads
+    /// the layers themselves). Nothing else changes.
+    pub(crate) fn check_loops(&mut self, presented: &'static str) {
+        self.loop_watch.presented = presented;
+        self.loop_watch.placed = false;
+        if self.loops_said.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .loop_watch
+            .changed
+            .is_none_or(|at| now.duration_since(at).as_millis() < 500)
+            || self
+                .loop_watch
+                .read
+                .is_some_and(|at| now.duration_since(at).as_millis() < 250)
+        {
+            return;
+        }
+        self.loop_watch.read = Some(now);
+        let Some(layer) = self
+            .layer_present
+            .as_ref()
+            .and_then(|present| present.layer.as_ref())
+        else {
+            return;
+        };
+        for said in &self.loops_said {
+            if let Some(shown) = layer.loop_state(said.key, true)
+                && let Some(kind) = said.differs(self.scale, &shown, true)
+            {
+                self.loop_watch.pending.push((said.key, kind, shown));
+            }
+        }
+    }
+    /// One line in the log, once for each ring and kind, at most 32 in all.
+    fn say_disagreement(&mut self, scene: &Scene, key: u64, kind: &'static str, shown: &LoopState) {
+        self.loop_watch.found += 1;
+        let watch = &mut self.loop_watch;
+        if watch.said.len() >= 32 || watch.said.contains(&(key, kind)) {
+            return;
+        }
+        watch.said.push((key, kind));
+        let sheet = self.loop_sheets.iter().find(|sheet| sheet.key() == key);
+        // The row it sits in: the first box around it a good deal wider.
+        let row = sheet.and_then(|sheet| {
+            let wide = sheet.size.0 * 4.;
+            std::iter::successors(scene.parent(sheet.node), |at| scene.parent(*at))
+                .map(|at| scene.bounds(at))
+                .find(|bounds| bounds.width >= wide)
+        });
+        let told = self.loops_said.iter().find(|said| said.key == key);
+        let watch = &self.loop_watch;
+        eprintln!(
+            "zgx: a looping layer disagrees ({kind}): node {key} layer at {:?} hidden {} on screen {:?} \
+             opacity {}, told {:?} showing {:?}, row {row:?}; {}, window {:?} scale {} zoom {}, \
+             frame {} rects {} patched {} {}, {} ms since the last placing",
+            shown.at,
+            shown.hidden,
+            shown.on_screen,
+            shown.opacity,
+            told.map(|said| said.frame),
+            told.map(|said| said.showing),
+            if watch.blur { "frosted" } else { "opaque" },
+            watch.viewport,
+            self.scale,
+            self.zoom,
+            self.layer_frame,
+            watch.damage,
+            watch.patched,
+            watch.presented,
+            watch.rendered.map_or(0, |at| at.elapsed().as_millis()),
+        );
+    }
+    /// Test hook: disagreements found.
+    #[doc(hidden)]
+    pub fn debug_loop_disagreements(&self) -> u32 {
+        self.loop_watch.found
     }
     /// Loops among a layer's `items` show frozen there: they go on tick by
     /// tick (`loop_sheets` leaves them when next placed).
@@ -418,6 +685,7 @@ impl GpuRenderer {
                 rows: twin.rows,
                 frame: (f32::NAN, f32::NAN),
                 opacity: 1.,
+                showing: true,
                 seen: Rect::default(),
             });
         }
@@ -494,6 +762,7 @@ impl GpuRenderer {
             rows,
             frame: (f32::NAN, f32::NAN),
             opacity: 1.,
+            showing: true,
             seen: Rect::default(),
         })
     }

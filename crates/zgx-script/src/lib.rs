@@ -108,7 +108,10 @@ pub fn window_size_value(width: f32, height: f32) -> Value {
     windows::size(width, height)
 }
 pub use rules::GuardKind;
-pub use value::{ElementHandle, PathKey, Shared, Store, Value, tables_converted, values_converted};
+pub use value::{
+    ElementHandle, Folded, PathKey, Shared, Store, Unfold, Value, tables_converted,
+    values_converted,
+};
 pub use windows::{Window, WindowExtras};
 
 use mlua::Lua;
@@ -3989,6 +3992,17 @@ impl ScriptHost {
         };
         lua.set_memory_limit(memory).map_err(fail)?;
         lua.set_app_data(MemoryLimit(memory));
+        // The collector's goal for what a cycle may leave: 125% of the heap in
+        // use, where Luau's default lets it double. It can't see what a script's
+        // objects hold in Rust (a node's userdata, far more than its own bytes),
+        // so a heap that doubles keeps rows long gone: about 40 MB more of the
+        // script heap in a long session, and what those rows hold beside it.
+        // SAFETY: the collector's own setting, on a state nothing runs in yet.
+        let _ = unsafe {
+            lua.exec_raw::<()>((), |state| {
+                mlua::ffi::lua_gc(state, mlua::ffi::LUA_GCSETGOAL, GC_GOAL);
+            })
+        };
         let deadline: Rc<Cell<Option<Deadline>>> = Rc::default();
         let interrupt = interrupt::install(&lua, deadline.clone(), memory);
         let watch = interrupt.watch();
@@ -4325,11 +4339,17 @@ fn collect_fully(lua: &mlua::Lua) {
         held = now;
     }
 }
+/// `LUA_GCSETGOAL`, in percent (see where it's set).
+const GC_GOAL: std::ffi::c_int = 125;
 /// What the host gives back as it goes idle: its scripts' garbage, then the
 /// pictures no node shows (the image cache keeps up to its budget of them
 /// while the app is in use, so a page shown again is instant).
 fn trim_idle(inner: &Inner) {
     value::forget_streamed_edits();
+    let loaded = inner.current.borrow().clone();
+    for vm in loaded.iter().flat_map(|loaded| loaded._vms.iter()) {
+        markdown::rest(&vm.lua);
+    }
     collect_garbage(inner);
     mlua::release_free_pages();
     inner.assets.trim();

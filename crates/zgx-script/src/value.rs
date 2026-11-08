@@ -44,6 +44,56 @@ pub enum Value {
     /// An image a script keeps (a `Bitmap`: `ui.bitmap`'s, or the
     /// clipboard's): equal only to itself, and `null` as JSON.
     Image(std::sync::Arc<zgx::image::ImageData>),
+    /// A table kept small until it's read (`Value::folded`): to a script, the
+    /// table it opens to.
+    Folded(Rc<Folded>),
+}
+
+/// What a folded value opens to, made as it's read. The host keeps what makes
+/// it however it likes: a long list's row out of view need hold no more than
+/// that.
+pub trait Unfold {
+    /// The whole value: the same each time.
+    fn unfold(&self) -> Value;
+}
+
+/// A table's fields, as `Value::Map` holds them.
+type Fields = [(Rc<str>, Value)];
+
+/// A value kept small until it's read (`Value::Folded`).
+pub struct Folded {
+    /// Its `id` field, which a list reads for each of its rows.
+    id: Value,
+    source: Box<dyn Unfold>,
+    /// What it last opened to, while something holds that: a script's table
+    /// of it, through the conversion cache, so reads while that stands find
+    /// one table.
+    open: RefCell<Option<std::rc::Weak<Fields>>>,
+    /// What it opened to for the host's `field`, which hands out a reference.
+    kept: std::cell::OnceCell<Value>,
+}
+impl std::fmt::Debug for Folded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Folded")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+impl Folded {
+    /// The value it opens to, opened again only if nothing holds the last.
+    fn opened(&self) -> Value {
+        if let Some(kept) = self.kept.get() {
+            return kept.clone();
+        }
+        if let Some(fields) = self.open.borrow().as_ref().and_then(std::rc::Weak::upgrade) {
+            return Value::Map(fields);
+        }
+        let value = self.source.unfold();
+        if let Value::Map(fields) = &value {
+            *self.open.borrow_mut() = Some(Rc::downgrade(fields));
+        }
+        value
+    }
 }
 
 /// A value's room in a list or map, for `Value::weight`.
@@ -155,6 +205,8 @@ impl PartialEq for Value {
             }
             (Value::Element(a), Value::Element(b)) => a == b,
             (Value::Image(a), Value::Image(b)) => std::sync::Arc::ptr_eq(a, b),
+            // (Opening them to compare would undo keeping them small.)
+            (Value::Folded(a), Value::Folded(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -199,6 +251,7 @@ impl Value {
                         .map(|(k, v)| (k.to_string(), convert(v)))
                         .collect(),
                 ),
+                Value::Folded(folded) => convert(&folded.opened()),
             }
         }
         convert(self).to_string()
@@ -221,6 +274,7 @@ impl Value {
             Value::Element(_) => 64,
             // Its pixels: a pasted 4K screenshot is 33 MB.
             Value::Image(image) => 64 + image.bytes(),
+            Value::Folded(_) => 64,
             Value::Nil | Value::Bool(_) | Value::Num(_) => 0,
         }
     }
@@ -365,6 +419,17 @@ impl Value {
         }
         Value::Map(kept.into())
     }
+    /// A table kept as `source` until it's read: to scripts, what `source`
+    /// opens to, its table going when no script holds it. `id` is its `id`
+    /// field, read without opening it (a list's key). Equal only to itself.
+    pub fn folded(id: Rc<str>, source: impl Unfold + 'static) -> Value {
+        Value::Folded(Rc::new(Folded {
+            id: Value::Str(id),
+            source: Box::new(source),
+            open: RefCell::default(),
+            kept: std::cell::OnceCell::new(),
+        }))
+    }
     /// Whether Luau counts it as true: anything but `nil` and `false`.
     pub fn truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
@@ -388,6 +453,9 @@ impl Value {
     pub fn field(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Map(fields) => find_key(fields, key).ok().map(|i| &fields[i].1),
+            Value::Folded(folded) if key == "id" => Some(&folded.id),
+            // (Opened for good: scripts read these, and hosts their own rows.)
+            Value::Folded(folded) => folded.kept.get_or_init(|| folded.opened()).field(key),
             _ => None,
         }
     }
@@ -560,7 +628,7 @@ impl Value {
             Value::Num(_) => "a number",
             Value::Str(_) | Value::Text(_) => "a string",
             Value::List(_) => "a list",
-            Value::Map(_) => "a table",
+            Value::Map(_) | Value::Folded(_) => "a table",
             Value::Element(_) => "an element",
             Value::Image(_) => "an image",
         }
@@ -570,6 +638,7 @@ impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Nil | Value::Element(_) | Value::Image(_) => Ok(()),
+            Value::Folded(folded) => write!(f, "{}", folded.opened()),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Num(n) if n.fract() == 0. && n.abs() < 1e15 => write!(f, "{}", *n as i64),
             Value::Num(n) => write!(f, "{n}"),
@@ -1088,6 +1157,7 @@ pub(crate) fn to_lua(value: &Value, lua: &Lua, frozen: bool) -> mlua::Result<mlu
         Value::Image(image) => lua
             .create_userdata(crate::node::BitmapUd(image.clone()))
             .map(mlua::Value::UserData),
+        Value::Folded(folded) => to_lua(&folded.opened(), lua, frozen),
     }
 }
 /// Push `text` as a string, its chunks copied straight in.
@@ -1456,7 +1526,6 @@ pub(crate) fn install_cache(lua: &Lua) {
             recent: Default::default(),
             next_recent: std::cell::Cell::new(0),
             recent_large: Default::default(),
-            next_recent_large: std::cell::Cell::new(0),
         });
     }
 }
@@ -1494,9 +1563,19 @@ struct Converted {
     next_recent: std::cell::Cell<usize>,
     /// The last few large tables a script read, as `recent`: read again and
     /// again and held by none between, each is converted once all the same.
-    recent_large: std::cell::RefCell<Vec<(usize, Value, Table)>>,
-    next_recent_large: std::cell::Cell<usize>,
+    /// Long lists apart from the rest, which a list's rows would crowd out, and
+    /// each a whole conversion to read again.
+    recent_large: [Recent; 2],
 }
+/// Tables kept from their last conversions, and where the next one goes once
+/// they're full.
+#[derive(Default)]
+struct Recent {
+    tables: std::cell::RefCell<Vec<(usize, Value, Table)>>,
+    next: std::cell::Cell<usize>,
+}
+/// What counts as a long list, in `Converted::recent_large`.
+const LONG_LIST: usize = 64;
 /// Sweeps wait until the cache holds this much (`weight`) at least.
 const SWEPT_FROM: usize = 1 << 12;
 /// The values a cached value's table holds, its small parts counted all the
@@ -1537,27 +1616,39 @@ fn id_key(id: usize) -> mlua::Value {
 /// As script data, read-only, its large parts shared with every other
 /// conversion of them.
 pub(crate) fn shared_lua(value: &Value, lua: &Lua) -> mlua::Result<mlua::Value> {
+    if let Value::Folded(folded) = value {
+        return shared_lua(&folded.opened(), lua);
+    }
     if !large(value) {
         return recent_lua(value, lua);
     }
     let converted = shared_part(value, lua)?;
-    if let (mlua::Value::Table(table), Some(cache)) = (&converted, lua.app_data_ref::<Converted>())
-    {
-        let id = identity(value);
-        let mut recent = cache.recent_large.borrow_mut();
-        if !recent.iter().any(|(at, ..)| *at == id) {
-            // Held with its value, so its address is not another's meanwhile.
-            let entry = (id, value.clone(), table.clone());
-            if recent.len() < RECENT_LARGE {
-                recent.push(entry);
-            } else {
-                let at = cache.next_recent_large.get();
-                recent[at] = entry;
-                cache.next_recent_large.set((at + 1) % RECENT_LARGE);
-            }
-        }
+    if let mlua::Value::Table(table) = &converted {
+        keep_large(lua, value, table);
     }
     Ok(converted)
+}
+/// `table`, `value`'s, among the large tables kept for the reads to come
+/// (`Converted::recent_large`).
+fn keep_large(lua: &Lua, value: &Value, table: &Table) {
+    let Some(cache) = lua.app_data_ref::<Converted>() else {
+        return;
+    };
+    let id = identity(value);
+    let kept = &cache.recent_large[usize::from(value.list().len() >= LONG_LIST)];
+    let mut recent = kept.tables.borrow_mut();
+    if recent.iter().any(|(at, ..)| *at == id) {
+        return;
+    }
+    // Held with its value, so its address is not another's meanwhile.
+    let entry = (id, value.clone(), table.clone());
+    if recent.len() < RECENT_LARGE {
+        recent.push(entry);
+    } else {
+        let at = kept.next.get();
+        recent[at] = entry;
+        kept.next.set((at + 1) % RECENT_LARGE);
+    }
 }
 /// Small tables kept from their last conversions (`Converted::recent`).
 const RECENT: usize = 32;
@@ -1598,6 +1689,9 @@ fn recent_lua(value: &Value, lua: &Lua) -> mlua::Result<mlua::Value> {
 /// list keeps its table, so a computed returning some of the rows (a
 /// filter) gives back tables that are their values again, without a walk.
 fn shared_part(value: &Value, lua: &Lua) -> mlua::Result<mlua::Value> {
+    if let Value::Folded(folded) = value {
+        return shared_part(&folded.opened(), lua);
+    }
     if !matches!(value, Value::List(_) | Value::Map(_)) {
         return to_lua(value, lua, true);
     }
@@ -1651,10 +1745,11 @@ fn shared_part(value: &Value, lua: &Lua) -> mlua::Result<mlua::Value> {
     Ok(mlua::Value::Table(table))
 }
 /// Whether `value` holds an element or an image: userdata, which only
-/// mlua makes (`raw_shared` pushes neither).
+/// mlua makes (`raw_shared` pushes neither), or a folded value, opened where
+/// it's reached.
 fn has_element(value: &Value) -> bool {
     match value {
-        Value::Element(_) | Value::Image(_) => true,
+        Value::Element(_) | Value::Image(_) | Value::Folded(_) => true,
         Value::List(items) => items.iter().any(has_element),
         Value::Map(fields) => fields.iter().any(|(_, v)| has_element(v)),
         _ => false,
@@ -1694,7 +1789,10 @@ fn raw_shared(lua: &Lua, value: &Value) -> mlua::Result<Table> {
         // SAFETY: as this function's.
         unsafe {
             match value {
-                Value::Nil | Value::Element(_) | Value::Image(_) => ffi::lua_pushnil(state),
+                // (`has_element` keeps a folded value from here.)
+                Value::Nil | Value::Element(_) | Value::Image(_) | Value::Folded(_) => {
+                    ffi::lua_pushnil(state)
+                }
                 Value::Bool(b) => ffi::lua_pushboolean(state, c_int::from(*b)),
                 Value::Num(n) => ffi::lua_pushnumber(state, *n),
                 Value::Str(s) => {
@@ -1866,8 +1964,16 @@ pub(crate) fn sweep_idle(lua: &Lua) {
     let Some(cache) = lua.app_data_ref::<Converted>() else {
         return;
     };
-    cache.recent_large.borrow_mut().clear();
-    cache.next_recent_large.set(0);
+    let [others, lists] = &cache.recent_large;
+    others.tables.borrow_mut().clear();
+    others.next.set(0);
+    // (A list a state still has stays, its table read at each wake: those let go
+    // are held here and by `held` alone.)
+    lists
+        .tables
+        .borrow_mut()
+        .retain(|(_, value, _)| matches!(value, Value::List(items) if Rc::strong_count(items) > 2));
+    lists.next.set(0);
     cache.bases.borrow_mut().clear();
     drop(cache);
     let _ = sweep_when(lua, true);
@@ -2042,7 +2148,9 @@ pub(crate) fn remember(lua: &Lua, table: &Table, value: &Value) -> mlua::Result<
     };
     let copy: Table = clone.call(table)?;
     copy.set_readonly(true);
-    file(lua, value, &copy)
+    file(lua, value, &copy)?;
+    keep_large(lua, value, &copy);
+    Ok(())
 }
 /// How many values a VM's conversion cache holds.
 pub(crate) fn converted_len(lua: &Lua) -> usize {

@@ -3964,6 +3964,10 @@ pub struct GpuRenderer {
     #[cfg(target_os = "macos")]
     loop_sheets: Vec<loops::LoopSheet>,
     #[cfg(target_os = "macos")]
+    loops_said: Vec<loops::LoopSaid>,
+    #[cfg(target_os = "macos")]
+    loop_watch: loops::LoopWatch,
+    #[cfg(target_os = "macos")]
     loop_time: Option<f32>,
     /// Pipelines for frames encoded with Metal directly (`render_direct`);
     /// `None` inside if they could not be built.
@@ -4484,6 +4488,10 @@ impl GpuRenderer {
             #[cfg(target_os = "macos")]
             loop_sheets: Vec::new(),
             #[cfg(target_os = "macos")]
+            loops_said: Vec::new(),
+            #[cfg(target_os = "macos")]
+            loop_watch: Default::default(),
+            #[cfg(target_os = "macos")]
             loop_time: None,
             #[cfg(windows)]
             layer_present: own_chain.map(|chain| {
@@ -4727,6 +4735,8 @@ impl GpuRenderer {
         self.kept = None;
         self.reset_atlas(INITIAL_ATLAS);
         self.atlas_recycled_at = self.frame;
+        // No frame comes to let the old one go: the device, polled, does.
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
     /// What its caches hold now.
     pub fn debug_cache_stats(&self) -> DebugCacheStats {
@@ -5033,6 +5043,7 @@ impl GpuRenderer {
     pub fn render(&mut self, scene: &Scene, damage: &[Rect]) -> Result<GpuStats, GpuError> {
         #[cfg(target_os = "macos")]
         {
+            self.loop_watch.set_damage(damage.len());
             self.idle = false;
             if let Some(views) = &mut self.views {
                 views.owed = false;
@@ -5152,7 +5163,13 @@ impl GpuRenderer {
                     let size = (self.atlas_size * 2).max(self.atlas_grew_to);
                     self.reset_atlas(size.min(MAX_ATLAS))
                 }
-                result => return result,
+                result => {
+                    #[cfg(target_os = "macos")]
+                    if result.is_ok() {
+                        self.sync_loops(scene);
+                    }
+                    return result;
+                }
             }
         }
     }
@@ -13045,6 +13062,16 @@ impl GpuRenderer {
             {
                 layer.flush_loops();
             }
+            #[cfg(target_os = "macos")]
+            self.check_loops(match &status {
+                Ok(PresentationStatus::Presented) => "presented",
+                Ok(_) => "not presented",
+                Err(_) => "present failed",
+            });
+            #[cfg(target_os = "macos")]
+            if status.is_err() {
+                self.hide_loops();
+            }
             status
         };
         // The frame is done once shown (see `render`).
@@ -13203,11 +13230,29 @@ impl GpuRenderer {
         // Word shapes kept for the next frame, and the table they peaked in
         // (streaming fills it): the next frame shapes what it needs again.
         self.fonts.borrow_mut().shape_run_cache = Default::default();
+        self.text_cache
+            .borrow_mut()
+            .rest(self.shapes.values().filter_map(|shaped| shaped.prepared));
+        self.svgs.rest();
         #[cfg(target_os = "macos")]
         {
             self.narrow_drawables();
             self.release_drawables();
             self.idle = true;
+            self.renew_queue();
+        }
+    }
+    /// Metal's queue let go of, the driver's memory for it given back
+    /// (`Queue::renew`), with all this renderer gave it finished and let go of
+    /// (a command buffer holds its queue).
+    #[cfg(target_os = "macos")]
+    fn renew_queue(&mut self) {
+        self.finish_direct();
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        // SAFETY: Only the queue's handle goes; wgpu's work on it has been waited
+        // for, and nothing is being encoded (`renew` looks).
+        if let Some(queue) = unsafe { self.queue.as_hal::<wgpu::hal::api::Metal>() } {
+            queue.renew();
         }
     }
     /// Drop the fill and layer shaders no one holds but this renderer (a

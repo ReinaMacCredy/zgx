@@ -1161,7 +1161,7 @@ static RENDER_WHEN_COVERED: std::sync::LazyLock<bool> = std::sync::LazyLock::new
 const TRIM_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
 /// A window idle this long past that gives back a glyph atlas it grew: what
 /// it costs is a slow first frame, for someone who has been away a while.
-const ATLAS_TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+const ATLAS_TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
 /// A window's frame is saved this long after it last moved or resized
 /// (`frame_autosave`, Linux): once for a drag, not for each of its steps.
 #[cfg(target_os = "linux")]
@@ -2672,6 +2672,12 @@ impl Host {
                     }
                     crate::contain::report_issues(&self.context.ui.runtime);
                     if let Some(stats) = rendered {
+                        // A frame that failed shows no looping layer over
+                        // the one before it.
+                        #[cfg(target_os = "macos")]
+                        if stats.is_err() {
+                            renderer.hide_loops();
+                        }
                         let stats = stats?;
                         first_mark(&FIRST_RENDER, "first frame rendered");
                         self.native.render(&scene, damage)?;
@@ -2692,6 +2698,8 @@ impl Host {
                         self.presentation.damaged();
                     } else {
                         undrawn = true;
+                        #[cfg(target_os = "macos")]
+                        renderer.hide_loops();
                     }
                 }
                 self.force = undrawn;
@@ -2738,6 +2746,12 @@ impl Host {
                 .as_ref()
                 .is_some_and(|renderer| renderer.planes_owed())
                 .then(|| std::time::Instant::now() + PLANE_RETRY);
+        }
+        // Looping layers go where the scene has them after every flush, frame
+        // or none. (Not over a frame that failed: it hid them.)
+        #[cfg(target_os = "macos")]
+        if !undrawn && let Some(renderer) = &mut self.renderer {
+            renderer.loops_after_flush(&scene);
         }
         if self.presentation.ready(std::time::Instant::now()) && self.renderer.is_some() {
             if self.frame_paced && !self.present_ready {
@@ -5690,6 +5704,8 @@ impl Host {
                     }
                 }
                 self.native.trim();
+                self.context.ui.scene.borrow_mut().rest();
+                self.context.ui.semantics.borrow_mut().rest();
                 release_freed_heap();
             }
         }
