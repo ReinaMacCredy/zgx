@@ -1216,6 +1216,15 @@ define_class!(
                 return;
             }
             self.handle_key_down(event);
+            // Typing ends a selection (Ghostty clears it): the controller hears.
+            if self
+                .ivars()
+                .term
+                .upgrade()
+                .is_some_and(|term| term.state().with_untracked(|state| state.selection.is_some()))
+            {
+                self.report_selection();
+            }
         }
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
