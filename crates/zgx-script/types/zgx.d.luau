@@ -1564,6 +1564,10 @@ declare extern type WindowApi with
 	visible: State<boolean>
 	-- Whether the window is the active one (keys go to it), and whether it
 	-- shows (not hidden, minimized or covered): what arrives while either
+	-- Whether a mouse wheel's notches glide in (true, the default) or each
+	-- steps at once: an app's smooth scrolling setting, off under reduced
+	-- motion. Trackpads are continuous either way.
+	smooth_scrolling: State<boolean>
 	-- is false is worth a notification or a badge.
 	active: State<boolean>
 	shown: State<boolean>

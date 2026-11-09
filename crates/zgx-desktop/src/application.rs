@@ -4834,7 +4834,10 @@ impl Host {
                     if !zgx::zoom::wheel_notched(step.1, || self.dispatch_prevented(event))? {
                         self.context.ui.zoom_wheel(-dy / step.1);
                     }
-                } else if crate::scroll_resample::enabled() {
+                } else if crate::scroll_resample::enabled()
+                    && (self.context.ui.wheel_glides()
+                        || !matches!(delta, MouseScrollDelta::LineDelta(x, y) if !continuous_lines(x, y)))
+                {
                     // Applied on display refreshes; see `update`.
                     let now = std::time::Instant::now();
                     self.scroll.position = self.cursor;

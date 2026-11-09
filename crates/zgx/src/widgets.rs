@@ -1649,6 +1649,8 @@ pub(crate) struct UiStorage {
     last_pressed: Cell<Option<NodeId>>,
     /// Elastic scrolling (`Ui::set_elastic_scrolling`): off, never read.
     elastic: RefCell<crate::elastic::State>,
+    /// Wheel notches stepped at once (`Ui::set_wheel_glides(false)`).
+    wheel_jumps: Cell<bool>,
     /// Scrollbars hide until their view scrolls (`Ui::set_overlay_scrollbars`).
     overlay_scrollbars: Signal<bool>,
     /// Editors' caret width in points (`Ui::set_caret_width`).
@@ -1903,6 +1905,7 @@ impl Ui {
             list_rows: Default::default(),
             last_pressed: Cell::new(None),
             elastic: Default::default(),
+            wheel_jumps: Cell::new(false),
             scrollbar_fades: RefCell::new(Vec::new()),
             dispatching: Cell::new(false),
             wheel_in_window: Cell::new(false),
@@ -2943,6 +2946,17 @@ impl Ui {
     /// wheel never stretches. Off (the default), nothing of it runs.
     pub fn set_elastic_scrolling(&self, elastic: bool) {
         self.storage.elastic.borrow_mut().enabled = elastic;
+    }
+    /// Whether a mouse wheel's notches glide in over a few refreshes (on,
+    /// the default, where the host eases them) or each steps at once (an
+    /// app's "smooth scrolling" off, or reduced motion). Trackpads are
+    /// continuous either way.
+    pub fn set_wheel_glides(&self, glides: bool) {
+        self.storage.wheel_jumps.set(!glides);
+    }
+    /// See [`Ui::set_wheel_glides`].
+    pub fn wheel_glides(&self) -> bool {
+        !self.storage.wheel_jumps.get()
     }
     /// For devtools (`zgx inspect`): `id`'s scroll view's offset, how far
     /// it can scroll, and its elastic stretch (0 unless a trackpad pushed it

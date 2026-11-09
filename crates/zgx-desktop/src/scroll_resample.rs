@@ -6,7 +6,8 @@
 //! input is instead resampled: each refresh applies the motion up to one input
 //! interval before the refresh, interpolated between the events around it, so
 //! every frame advances evenly. Discrete wheel notches have no motion curve of
-//! their own; they ease towards their destination over a few refreshes.
+//! their own; they glide to their destination as Chrome's do
+//! ([`crate::wheel_glide`]).
 use std::{collections::VecDeque, time::Duration, time::Instant};
 
 /// A pause this long ends a stroke: whatever is still buffered is applied.
@@ -18,9 +19,6 @@ const LINGER: Duration = Duration::from_millis(120);
 /// Bounds for the sampling delay, which tracks the input interval.
 const MIN_DELAY: Duration = Duration::from_millis(4);
 const MAX_DELAY: Duration = Duration::from_millis(20);
-/// Wheel notches close this fraction of the remaining distance per second, in
-/// the exponent: about 95% within 100 ms.
-const WHEEL_RATE: f32 = 30.;
 
 /// `ZGX_SCROLL_RESAMPLE=0` applies wheel input on arrival instead.
 pub(crate) fn enabled() -> bool {
@@ -37,9 +35,8 @@ pub(crate) struct ScrollResampler {
     applied: (f32, f32),
     /// Smoothed spacing between continuous events.
     interval: Option<Duration>,
-    /// Wheel distance not yet applied, and when it last advanced.
-    wheel: (f32, f32),
-    wheel_at: Option<Instant>,
+    /// Wheel notches gliding in.
+    wheel: crate::wheel_glide::WheelGlide,
     /// When the latest input arrived.
     last_input: Option<Instant>,
     /// Pointer position of the latest input; motion is delivered there.
@@ -48,7 +45,7 @@ pub(crate) struct ScrollResampler {
 
 impl ScrollResampler {
     pub fn pending(&self) -> bool {
-        self.received != self.applied || self.wheel != (0., 0.)
+        self.received != self.applied || self.wheel.active()
     }
     /// A gesture is under way: refreshes should keep coming at full rate.
     pub fn active(&self, now: Instant) -> bool {
@@ -82,25 +79,20 @@ impl ScrollResampler {
         self.received.1 += delta.1;
         self.points.push_back((now, self.received));
     }
-    /// Queue a discrete wheel step to ease in over the next refreshes.
+    /// Queue a discrete wheel step to glide in over the next refreshes.
     pub fn push_wheel(&mut self, now: Instant, delta: (f32, f32)) {
         self.last_input = Some(now);
-        if self.wheel == (0., 0.) {
-            self.wheel_at = Some(now);
-        }
-        self.wheel.0 += delta.0;
-        self.wheel.1 += delta.1;
+        self.wheel.push(delta, now);
     }
     /// Deliver everything at once (no display refreshes are coming).
     pub fn flush(&mut self) -> Option<(f32, f32)> {
+        let wheel = self.wheel.finish();
         let delta = (
-            self.received.0 - self.applied.0 + self.wheel.0,
-            self.received.1 - self.applied.1 + self.wheel.1,
+            self.received.0 - self.applied.0 + wheel.0,
+            self.received.1 - self.applied.1 + wheel.1,
         );
         self.applied = self.received;
         self.points.clear();
-        self.wheel = (0., 0.);
-        self.wheel_at = None;
         (delta != (0., 0.)).then_some(delta)
     }
     /// The motion to apply at a display refresh processed at `now`.
@@ -122,30 +114,8 @@ impl ScrollResampler {
         while self.points.len() > 1 && self.points[1].0 <= horizon {
             self.points.pop_front();
         }
-        if let Some(at) = self.wheel_at.replace(now) {
-            let elapsed = now.duration_since(at).as_secs_f32();
-            let share = 1. - (-WHEEL_RATE * elapsed).exp();
-            for (remaining, out) in [
-                (&mut self.wheel.0, &mut delta.0),
-                (&mut self.wheel.1, &mut delta.1),
-            ] {
-                // Whole pixels: content stays on the pixel grid, and the
-                // offset sums exactly even tens of thousands of pixels down,
-                // where an f32 holds fractions of a pixel only roughly.
-                let step = if remaining.abs() <= 1. {
-                    *remaining
-                } else {
-                    let step = (*remaining * share).round();
-                    let step = if step == 0. { remaining.signum() } else { step };
-                    step.clamp(-remaining.abs(), remaining.abs())
-                };
-                *remaining -= step;
-                *out += step;
-            }
-            if self.wheel == (0., 0.) {
-                self.wheel_at = None;
-            }
-        }
+        let wheel = self.wheel.advance(now);
+        delta = (delta.0 + wheel.0, delta.1 + wheel.1);
         (delta != (0., 0.)).then_some(delta)
     }
     fn delay(&self) -> Duration {
@@ -230,22 +200,56 @@ mod tests {
         assert!(!resampler.pending());
     }
 
+    /// A notch glides as Chrome's (and gpui Zeron's) does: ease-in-out
+    /// over 200 ms, 24 refreshes at 120 Hz, in whole pixels.
     #[test]
-    fn wheel_notches_ease_in_and_finish() {
+    fn wheel_notches_glide_in_and_out_over_200_ms() {
         let start = Instant::now();
         let mut resampler = ScrollResampler::default();
-        resampler.push_wheel(start, (0., 84.));
+        resampler.push_wheel(start, (0., 40.));
         let mut total = 0.;
         let mut steps = Vec::new();
-        for i in 1..=30u32 {
+        let mut last = 0;
+        for i in 1..=40u32 {
             if let Some((_, dy)) = resampler.sample(start + Duration::from_micros(8333) * i) {
                 total += dy;
                 steps.push(dy);
+                last = i;
             }
         }
-        assert!((total - 84.).abs() < 1e-3);
-        assert!(steps[0] > steps[3], "{steps:?}");
+        assert!((total - 40.).abs() < 1e-3);
+        assert!((23..=25).contains(&last), "{last} refreshes: {steps:?}");
+        let peak = steps.iter().cloned().fold(0., f32::max);
+        assert!(
+            steps[0] < peak && *steps.last().unwrap() < peak,
+            "{steps:?}"
+        );
         assert!(steps.iter().all(|step| step.fract() == 0.), "{steps:?}");
+        assert!(!resampler.pending());
+    }
+
+    /// Notches in a spin keep the glide going, and the whole spin lands.
+    #[test]
+    fn a_spin_is_one_glide_that_lands() {
+        let start = Instant::now();
+        let mut resampler = ScrollResampler::default();
+        let mut total = 0.;
+        let mut idle = 0;
+        for i in 1..=80u32 {
+            let now = start + Duration::from_micros(8333) * i;
+            // (A notch arrives between refreshes.)
+            if i % 4 == 1 && i < 30 {
+                resampler.push_wheel(now - Duration::from_millis(4), (0., 40.));
+            }
+            match resampler.sample(now) {
+                Some((_, dy)) => total += dy,
+                // (Its first refreshes ease in under a pixel.)
+                None if total > 0. && i < 30 => idle += 1,
+                None => {}
+            }
+        }
+        assert_eq!(total, 320.);
+        assert_eq!(idle, 0, "a refresh stood still mid-spin");
         assert!(!resampler.pending());
     }
 
