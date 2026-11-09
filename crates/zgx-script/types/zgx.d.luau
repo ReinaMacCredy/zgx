@@ -1329,6 +1329,12 @@ declare extern type Web with
 	function exit_full_screen(self): ()
 	function zoom(self, zoom: number): ()
 	function run(self, js: string): ()
+	-- Each navigation, asked first: `false` refuses it. `kind`: "link",
+	-- "form", "back_forward", "reload", "form_resubmission" or "other".
+	function decide_navigation(
+		self,
+		decide: ((request: { url: string, main_frame: boolean, kind: string, source_url: string }) -> boolean?)?
+	): ()
 	-- The script's value as Luau data (JSON's shape, whatever the page
 	-- returns: `any`), or nil and the error.
 	function eval(self, js: string, reply: ((value: any, err: string?) -> ...unknown)?): ()
@@ -1558,16 +1564,16 @@ declare extern type WindowApi with
 	controls: State<WindowRect?>
 	zoom: State<number>
 	zoomable: State<boolean>
+	-- Whether a mouse wheel's notches glide in (true, the default) or each
+	-- steps at once: an app's smooth scrolling setting, off under reduced
+	-- motion. Trackpads are continuous either way.
+	smooth_scrolling: State<boolean>
 	-- Whether the app's window shows: false while zgx.json's `"visible":
 	-- false` keeps it hidden (laid out and drawn meanwhile); setting it true
 	-- shows the window whole, at once.
 	visible: State<boolean>
 	-- Whether the window is the active one (keys go to it), and whether it
 	-- shows (not hidden, minimized or covered): what arrives while either
-	-- Whether a mouse wheel's notches glide in (true, the default) or each
-	-- steps at once: an app's smooth scrolling setting, off under reduced
-	-- motion. Trackpads are continuous either way.
-	smooth_scrolling: State<boolean>
 	-- is false is worth a notification or a badge.
 	active: State<boolean>
 	shown: State<boolean>

@@ -269,6 +269,51 @@ impl UserData for WebUd {
         });
     }
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // `web:decide_navigation(fn)`: each navigation the page or the user
+        // starts is asked of `fn({ url, main_frame, kind, source_url })`
+        // first, `kind` "link", "form", "back_forward", "reload",
+        // "form_resubmission" or "other" (a script's); `false` refuses it.
+        // The latest run's replaces the last; nil takes it away.
+        methods.add_method("decide_navigation", |lua, w, decide: Option<Function>| {
+            let env = env(lua)?;
+            let guarded = matches!(*env.grants, crate::Grants::All);
+            let vm = env.vm.clone();
+            w.0.set_navigation_policy(move |request| {
+                if guarded && !crate::rules::navigation_allowed(&vm, request) {
+                    return false;
+                }
+                let (Some(decide), Some(vm)) = (&decide, vm.upgrade()) else {
+                    return true;
+                };
+                let asked = (|| -> mlua::Result<Option<bool>> {
+                    use zgx::web_view::NavigationKind;
+                    let table = vm.lua.create_table()?;
+                    table.set("url", request.url.as_str())?;
+                    table.set("main_frame", request.main_frame)?;
+                    table.set(
+                        "kind",
+                        match request.kind {
+                            NavigationKind::Link => "link",
+                            NavigationKind::FormSubmission => "form",
+                            NavigationKind::BackForward => "back_forward",
+                            NavigationKind::Reload => "reload",
+                            NavigationKind::FormResubmission => "form_resubmission",
+                            NavigationKind::Other => "other",
+                        },
+                    )?;
+                    table.set("source_url", request.source_url.as_str())?;
+                    vm.call::<Option<bool>>(decide, table)
+                })();
+                match asked {
+                    Ok(answer) => answer != Some(false),
+                    Err(error) => {
+                        vm.report(error);
+                        true
+                    }
+                }
+            });
+            Ok(())
+        });
         methods.add_method("load", |lua, w, url: String| {
             crate::rules::guard(lua, crate::GuardKind::Web, &url)?;
             w.0.load_url(url);
