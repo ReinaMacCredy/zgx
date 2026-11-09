@@ -117,6 +117,24 @@ fn a_password_reads_as_bullets_in_the_tree_and_to_assistive_technology() {
 }
 
 #[test]
+fn a_password_field_s_placeholder_reads_as_written_until_it_is_typed_in() {
+    let mut h = Harness::inline(
+        r##"return ui.column {
+            ui.input { id = "secret", label = "Secret", secure = true, placeholder = "tskey-auth-…", value = ui.state("secret", ""), w = 160 },
+        }"##,
+    );
+    h.frames(1);
+    let tree = h.tree();
+    assert!(tree.contains("tskey-auth-…"), "{tree}");
+    h.type_text(r#""Secret""#, "abc");
+    h.frames(1);
+    let tree = h.tree();
+    assert!(!tree.contains("tskey-auth"), "{tree}");
+    assert!(!tree.contains("abc"), "{tree}");
+    assert_eq!(h.error(), None);
+}
+
+#[test]
 fn targets_and_the_tree_reach_into_a_modal_and_a_popover_in_it() {
     let mut h = Harness::inline(
         r##"return ui.column { id = "scope",
