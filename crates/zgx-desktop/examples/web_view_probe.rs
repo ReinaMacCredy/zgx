@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 accelerated: !std::env::args().any(|arg| arg == "--unaccelerated"),
                 isolated: isolated.then(|| {
                     vec![zgx::web_view::UserScript {
-                        source: "document.addEventListener('DOMContentLoaded', () => window.zgx.postMessage({ world: 'app', page_global: typeof window.probePageGlobal, title: document.title }));".into(),
+                        source: "const channel = window.zgx; document.addEventListener('DOMContentLoaded', () => channel.postMessage({ world: 'app', page_global: typeof window.probePageGlobal, title: document.title }));".into(),
                         main_frame_only: true,
                     }]
                 }),

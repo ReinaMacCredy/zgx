@@ -1072,19 +1072,6 @@ impl MacWebView {
                 );
                 content.addUserScript(&script);
             }
-            if let (Some(world), Some(scripts)) = (&world, &options.isolated) {
-                for script in scripts {
-                    let script =
-                        WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
-                            mtm.alloc(),
-                            &NSString::from_str(&script.source),
-                            WKUserScriptInjectionTime::AtDocumentStart,
-                            script.main_frame_only,
-                            world,
-                        );
-                    content.addUserScript(&script);
-                }
-            }
             {
                 let content = configuration.userContentController();
                 content.addScriptMessageHandler_name(
@@ -1133,6 +1120,21 @@ impl MacWebView {
                     }
                 };
                 content.addUserScript(&script);
+            }
+            // After the channel's, so they find `window.zgx` from their start.
+            if let (Some(world), Some(scripts)) = (&world, &options.isolated) {
+                let content = configuration.userContentController();
+                for script in scripts {
+                    let script =
+                        WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+                            mtm.alloc(),
+                            &NSString::from_str(&script.source),
+                            WKUserScriptInjectionTime::AtDocumentStart,
+                            script.main_frame_only,
+                            world,
+                        );
+                    content.addUserScript(&script);
+                }
             }
             // SAFETY: WKWebView's designated initializer, on a fresh
             // allocation of zgx's subclass, which adds no state.
