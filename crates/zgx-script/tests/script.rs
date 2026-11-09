@@ -643,6 +643,58 @@ fn scripts_require_modules_and_reload_when_they_change() {
 }
 
 #[test]
+fn a_module_first_required_by_a_component_keeps_its_effects_after_that_component_goes() {
+    let dir = std::env::temp_dir().join(format!("zgx-require-owner-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(
+        dir.join("lib/double.luau"),
+        r#"local n = ui.state("n", 1)
+        local seen = ui.state("seen", 0)
+        ui.effect(function() seen:set(n:get() * 2) end)
+        return true"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.luau"),
+        r#"local shown = ui.state("shown", true)
+        local Lazy = ui.component(function()
+            require("lib/double")
+            return ui.text { "lazy", id = "lazy" }
+        end)
+        return ui.column { ui.show(function() return shown:get() end, Lazy {}) }"#,
+    )
+    .unwrap();
+    let path = dir.join("app.luau");
+    let mut h = common::Harness::new(|runtime| zgx_script::ScriptHost::new(runtime, path));
+    let seen = |h: &common::Harness| {
+        h.host
+            .states()
+            .into_iter()
+            .find(|(n, _)| n == "seen" || n.ends_with("::seen"))
+            .map(|(_, v)| v.to_json())
+    };
+    h.settle();
+    assert_eq!(seen(&h).as_deref(), Some("2"));
+    h.host.set_state("shown", Value::Bool(false)).unwrap();
+    h.settle();
+    assert!(
+        h.find("lazy").is_none(),
+        "the component that required it is gone"
+    );
+    h.host
+        .set_state("lib/double.luau::n", Value::Num(5.))
+        .unwrap();
+    h.settle();
+    assert_eq!(
+        seen(&h).as_deref(),
+        Some("10"),
+        "the module's effect still runs"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn shader_compile_errors_are_script_errors() {
     let runtime = zgx::reactive::Runtime::new();
     let host = ScriptHost::inline(
