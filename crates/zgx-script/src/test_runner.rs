@@ -465,6 +465,37 @@ impl UserData for Mounted {
             app.settle();
             Ok(())
         });
+        // A key held (`key_down`, `repeating` for the system's repeats) and
+        // let go (`key_up`), each with its physical key's `code` if given.
+        methods.add_method(
+            "key_down",
+            |_, m, (keys, opts): (String, Option<mlua::Table>)| {
+                let mut app = m.app()?;
+                let (key, modifiers) =
+                    crate::driver::parse_keys(&keys).map_err(mlua::Error::runtime)?;
+                let repeat = opts.as_ref().and_then(|o| o.get::<bool>("repeating").ok()).unwrap_or(false);
+                let code = opts.as_ref().and_then(|o| o.get::<String>("code").ok());
+                app.ui.input.set_key_code(code.map(Into::into));
+                app.ui.dispatch(zgx::input::InputEvent::KeyDown { key, modifiers, repeat });
+                app.ui.input.set_key_code(None);
+                app.settle();
+                Ok(())
+            },
+        );
+        methods.add_method(
+            "key_up",
+            |_, m, (keys, opts): (String, Option<mlua::Table>)| {
+                let mut app = m.app()?;
+                let (key, modifiers) =
+                    crate::driver::parse_keys(&keys).map_err(mlua::Error::runtime)?;
+                let code = opts.as_ref().and_then(|o| o.get::<String>("code").ok());
+                app.ui.input.set_key_code(code.map(Into::into));
+                app.ui.dispatch(zgx::input::InputEvent::KeyUp { key, modifiers });
+                app.ui.input.set_key_code(None);
+                app.settle();
+                Ok(())
+            },
+        );
         methods.add_method(
             "scroll",
             |_, m, (target, dy, dx): (String, f32, Option<f32>)| {

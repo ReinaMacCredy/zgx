@@ -2279,7 +2279,7 @@ export type NodeProps = {
 	on_pointer_move: (((e: PointerEvent) -> ...unknown) | Action)?,
 	-- Return true to consume the key.
 	on_key: (((e: KeyEvent) -> ...boolean?) | Action)?,
-	on_key_up: (((key: string) -> ...unknown) | Action)?,
+	on_key_up: (((key: string, code: string?) -> ...unknown) | Action)?,
 	on_focus: (Handler | Action)?,
 	on_blur: (Handler | Action)?,
 	-- Return true to take the gesture from the scroll views around it.

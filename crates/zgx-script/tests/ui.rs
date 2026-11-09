@@ -629,6 +629,37 @@ fn presses_count_their_clicks_and_keys_carry_their_physical_code() {
 }
 
 #[test]
+fn a_key_let_go_carries_its_physical_code() {
+    use zgx::input::{InputEvent, Key, Modifiers};
+    let mut h = Harness::inline(
+        r##"local seen = ui.state("seen", "")
+        return ui.column {
+            ui.div { id = "pad", w = 40, h = 40, focusable = true,
+                on_key_up = function(name, code) seen:set(seen:peek() .. name .. "/" .. (code or "?") .. " ") end },
+            ui.text { "{seen}", id = "seen" } }"##,
+    );
+    h.frames(2);
+    h.click("pad");
+    // ⌥M types µ: the code is still the M key's.
+    h.ui.input.set_key_code(Some("KeyM".into()));
+    let alt = Modifiers {
+        alt: true,
+        ..Default::default()
+    };
+    h.ui.dispatch(InputEvent::KeyUp {
+        key: Key::Character("µ".into()),
+        modifiers: alt,
+    });
+    h.ui.input.set_key_code(None);
+    h.ui.dispatch(InputEvent::KeyUp {
+        key: Key::Escape,
+        modifiers: Modifiers::default(),
+    });
+    h.frames(1);
+    assert_eq!(h.text("seen"), "µ/KeyM Escape/? ");
+}
+
+#[test]
 fn focus_styles_show_for_the_keyboard_not_a_click() {
     use zgx::input::{InputEvent, Key, Modifiers};
     let mut h = Harness::inline(

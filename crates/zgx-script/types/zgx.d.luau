@@ -2323,7 +2323,7 @@ export type NodeProps = {
 	on_pointer_move: (((e: PointerEvent) -> ...unknown) | Action)?,
 	-- Return true to consume the key.
 	on_key: (((e: KeyEvent) -> ...boolean?) | Action)?,
-	on_key_up: (((key: string) -> ...unknown) | Action)?,
+	on_key_up: (((key: string, code: string?) -> ...unknown) | Action)?,
 	on_focus: (Handler | Action)?,
 	on_blur: (Handler | Action)?,
 	-- Return true to take the gesture from the scroll views around it.
@@ -3003,7 +3003,7 @@ export type Props_on_file_hover = ((over: boolean) -> ...unknown)?
 export type Props_on_hover = (((inside: boolean) -> ...unknown) | Action)?
 export type Props_on_pointer_move = (((e: PointerEvent) -> ...unknown) | Action)?
 export type Props_on_key = (((e: KeyEvent) -> ...boolean?) | Action)?
-export type Props_on_key_up = (((key: string) -> ...unknown) | Action)?
+export type Props_on_key_up = (((key: string, code: string?) -> ...unknown) | Action)?
 export type Props_on_focus = (Handler | Action)?
 export type Props_on_blur = (Handler | Action)?
 export type Props_on_wheel = (((e: WheelEvent) -> ...boolean?) | Action)?

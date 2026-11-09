@@ -26,6 +26,10 @@ declare extern type TestApp with
 	-- Press keys where focus is: "Enter", "Escape", "cmd+k", "alt+ArrowDown"
 	-- (cmd is Command on macOS, Control elsewhere).
 	function key(self, keys: string): ()
+	-- A key held (`repeating`: the system's repeat of it) and let go, each
+	-- with its physical key's `code` ("KeyD") when given.
+	function key_down(self, keys: string, opts: { repeating: boolean?, code: string? }?): ()
+	function key_up(self, keys: string, opts: { code: string? }?): ()
 	-- Scroll the viewport under the target by dy points (down is positive),
 	-- and across by dx.
 	function scroll(self, target: string, dy: number, dx: number?): ()
