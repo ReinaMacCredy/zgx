@@ -707,6 +707,39 @@ fn keyed_web_pages_outlive_reloads_until_closed() {
 }
 
 #[test]
+fn a_page_asks_the_script_before_each_navigation_and_its_kind_is_told() {
+    use zgx::web_view::{NavigationKind, NavigationRequest};
+    let mut h = Harness::inline(
+        r##"local web = ui.web("n1", { profile = "ephemeral" })
+        local seen = ui.state("seen", "")
+        web:decide_navigation(function(r)
+            seen:set(`{r.kind} {r.url} {tostring(r.main_frame)} {r.source_url}`)
+            return r.kind ~= "other"
+        end)
+        return ui.column {
+            ui.webview { web = web, w = 200, h = 100 },
+            ui.text { id = "seen", "{seen}" },
+        }"##,
+    );
+    let web = page(&mut h);
+    let ask = |kind| NavigationRequest {
+        url: "https://example.com/".into(),
+        main_frame: true,
+        kind,
+        source_url: "about:blank".into(),
+    };
+    assert!(web.allows(&ask(NavigationKind::Link)));
+    h.settle();
+    assert_eq!(h.text("seen"), "link https://example.com/ true about:blank");
+    assert!(
+        !web.allows(&ask(NavigationKind::Other)),
+        "a script's is refused"
+    );
+    assert!(web.allows(&ask(NavigationKind::BackForward)));
+    assert_eq!(h.error(), None);
+}
+
+#[test]
 fn an_element_takes_focus_when_asked() {
     let mut h = Harness::inline(
         r##"local field = nil
