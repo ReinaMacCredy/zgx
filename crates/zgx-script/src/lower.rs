@@ -5175,7 +5175,8 @@ fn with_events(
             }
             InputEvent::KeyUp { key: k, .. } => {
                 if let Some(h) = &key_up {
-                    run(h, &vm, &actions, key_name(k));
+                    // The physical key too: a letter let go under ⌥ or another layout types another character.
+                    run(h, &vm, &actions, (key_name(k), event.key_code()));
                 }
             }
             InputEvent::Focus => {
