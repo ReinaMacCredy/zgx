@@ -1307,7 +1307,9 @@ fn require_module<const LENDING: bool>(
     // Its top level's registrations are its own, and so are the globals it
     // sets (the sandbox's one table: every chunk's).
     let globals_before = tracker.as_ref().map(|tracker| entered(tracker, &path, lua));
-    let evaluated = loaded.set_name(format!("@{chunk}")).eval::<mlua::Value>();
+    let evaluated = at_top_level(lua, || {
+        loaded.set_name(format!("@{chunk}")).eval::<mlua::Value>()
+    });
     if let (Some(tracker), Some(before)) = (&tracker, globals_before) {
         left(tracker, lua, before);
     }
@@ -1321,6 +1323,21 @@ fn require_module<const LENDING: bool>(
     };
     modules.borrow_mut().insert(path, Some(value.clone()));
     Ok(value)
+}
+
+/// A module's top level runs as the script's, whoever requires it first: what it makes outlives the component or effect that asked.
+fn at_top_level<R>(lua: &Lua, run: impl FnOnce() -> R) -> R {
+    let Some((runtime, scope)) = lua
+        .app_data_ref::<node::Env>()
+        .map(|env| (env.runtime.clone(), env.scope.replace(None)))
+    else {
+        return run();
+    };
+    let out = runtime.untracked(run);
+    if let Some(env) = lua.app_data_ref::<node::Env>() {
+        *env.scope.borrow_mut() = scope;
+    }
+    out
 }
 
 /// `path` as `require` keys the modules it ran: canonical (a temporary
