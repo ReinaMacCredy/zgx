@@ -91,6 +91,9 @@ pub struct TerminalState {
     pub columns: u16,
     /// Grid height in cells.
     pub rows: u16,
+    /// The text selected in it, once a drag (or Select All) made it; `None`
+    /// once nothing is.
+    pub selection: Option<String>,
 }
 
 /// A program's own report of its state (the Program Status Protocol, OSC

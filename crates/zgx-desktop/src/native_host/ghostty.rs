@@ -1105,6 +1105,7 @@ define_class!(
             self.button(event, g::GHOSTTY_MOUSE_RELEASE, g::GHOSTTY_MOUSE_LEFT);
             // SAFETY: `with_surface` passes a live surface; main thread.
             self.with_surface(|surface| unsafe { g::ghostty_surface_mouse_pressure(surface, 0, 0.) });
+            self.report_selection();
         }
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
@@ -1474,6 +1475,35 @@ impl TerminalView {
         {
             app.sendEvent(&current);
         }
+    }
+    /// Tell the controller what is selected now (`TerminalState::selection`).
+    fn report_selection(&self) {
+        let surface = self.ivars().surface.get();
+        // SAFETY: non-null, so live (`free` nulls it first); main thread.
+        // `ghostty_text_s` is plain C data, valid zeroed; filled when the
+        // read succeeds, its text copied before it is freed, once.
+        let selected = (!surface.is_null())
+            .then(|| unsafe {
+                let mut text: g::ghostty_text_s = std::mem::zeroed();
+                if !g::ghostty_surface_read_selection(surface, &mut text) {
+                    return None;
+                }
+                let selected = string(text.text);
+                g::ghostty_surface_free_text(surface, &mut text);
+                Some(selected)
+            })
+            .flatten()
+            .filter(|text| !text.is_empty());
+        let term = self.ivars().term.clone();
+        zgx::native_view::post(move || {
+            if let Some(term) = term.upgrade()
+                && term
+                    .state()
+                    .with_untracked(|state| state.selection != selected)
+            {
+                term.update_state(|state| state.selection = selected);
+            }
+        });
     }
     /// The selected text, for input methods and services asking for `range`.
     fn selection_text(&self, range: NSRange) -> Option<String> {
@@ -2257,6 +2287,7 @@ impl TerminalBackend for MacTerminal {
                         action.len(),
                     )
                 };
+                self.view.report_selection();
             }
             TerminalCommand::Close => self.free(),
             _ => {}

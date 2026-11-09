@@ -719,6 +719,31 @@ fn a_selection_is_the_primary_and_a_middle_click_pastes_it() {
         },
     );
     assert_eq!(selections.primary.borrow().as_deref(), Some("pick me"));
+    // The controller says it too, for an app to quote, and a click that
+    // drags nothing clears it.
+    assert_eq!(
+        term.state()
+            .with_untracked(|s| s.selection.clone())
+            .as_deref(),
+        Some("pick me")
+    );
+    press(
+        &mut app,
+        InputEvent::PointerDown {
+            x: 50.,
+            y,
+            button: PointerButton::Primary,
+        },
+    );
+    press(
+        &mut app,
+        InputEvent::PointerUp {
+            x: 50.,
+            y,
+            button: PointerButton::Primary,
+        },
+    );
+    assert_eq!(term.state().with_untracked(|s| s.selection.clone()), None);
     // A middle click pastes it to cat, which echoes it back.
     *selections.primary.borrow_mut() = Some("from elsewhere".into());
     press(
