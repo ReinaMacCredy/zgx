@@ -192,6 +192,7 @@ mod input_pane;
 mod linux_appearance;
 mod scoped_task;
 mod scroll_resample;
+mod wheel_glide;
 mod system_colors;
 mod touch;
 mod wheel_tape;

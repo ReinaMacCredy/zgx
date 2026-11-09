@@ -226,7 +226,7 @@ ui.window.zoom: State<number>
 ui.window.zoomable: State<boolean>
 ```
 
-The app's window zooms as a browser's page does: Cmd+= or Cmd++ zooms in, Cmd+- out and Cmd+0 back to 100% (Ctrl elsewhere), through Chrome's levels from 25% to 500%, and its content reflows in the smaller or larger viewport, text and paths drawn crisply. `ui.window.zoom` is the zoom (1 at 100%): it follows the keys and the View menu's items, and setting it zooms the window (`ui.window.zoom:set(1.25)`). `ui.window.zoomable:set(false)` turns the keys off; a `ui.command` with one of the keys keeps it either way. `zgx run` keeps both; a Rust host passes its window with `ScriptHost::window_zoom`.
+The app's window zooms as a browser's page does: Cmd+= or Cmd++ zooms in, Cmd+- out and Cmd+0 back to 100% (Ctrl elsewhere), through Chrome's levels from 25% to 500%, and its content reflows in the smaller or larger viewport, text and paths drawn crisply. `ui.window.zoom` is the zoom (1 at 100%): it follows the keys and the View menu's items, and setting it zooms the window (`ui.window.zoom:set(1.25)`). `ui.window.smooth_scrolling:set(false)` steps a mouse wheel's notches at once rather than gliding them in, as Chrome does, over 100 to 200 ms (trackpads stay continuous). `ui.window.zoomable:set(false)` turns the keys off; a `ui.command` with one of the keys keeps it either way. `zgx run` keeps both; a Rust host passes its window with `ScriptHost::window_zoom`.
 
 ### Visible
 

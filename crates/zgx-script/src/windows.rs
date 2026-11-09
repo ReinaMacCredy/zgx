@@ -531,6 +531,9 @@ pub(crate) const CONTROLS: &str = "zgx.window.controls";
 /// `ui.window.zoomable`, which a script reads and sets.
 pub(crate) const ZOOM: &str = "zgx.window.zoom";
 pub(crate) const ZOOMABLE: &str = "zgx.window.zoomable";
+/// Whether a mouse wheel's notches glide (`Ui::set_wheel_glides`), with
+/// the zoom: `ui.window.smooth_scrolling`, which a script reads and sets.
+pub(crate) const SMOOTH_SCROLLING: &str = "zgx.window.smooth_scrolling";
 /// The shared keys holding whether the app's window is the active one and
 /// whether it shows (`ScriptHost::window_state`): `ui.window.active` and
 /// `ui.window.shown`, which a script reads.
@@ -631,6 +634,7 @@ pub(crate) fn install(
                 _ if plugin => return Ok(mlua::Value::Nil),
                 Some("zoom") => Some(shared.state(ZOOM, Value::Num(1.))),
                 Some("zoomable") => Some(shared.state(ZOOMABLE, Value::Bool(true))),
+                Some("smooth_scrolling") => Some(shared.state(SMOOTH_SCROLLING, Value::Bool(true))),
                 Some("visible") => Some(shared.state(VISIBLE, Value::Bool(true))),
                 Some("active" | "shown" | "full_screen" | "full_screen_transition") => None,
                 _ => return Ok(mlua::Value::Nil),
