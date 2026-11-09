@@ -23,6 +23,10 @@ view.animate(true);     // a frame every refresh while it shows
 
 `crates/zgx-desktop/examples/viewport.rs` draws a lit cube that turns while animating or as it is dragged.
 
+## From a script
+
+A host shows its own view in a script's interface by name: `ScriptHost::gpu_view("scene", Some(view))`, and the script places it with `ui.gpu_view { view = "scene", w = "100%", h = 400 }`, a box like any other that the view fills. Setting another view under the name swaps it in place; `None` leaves the box empty. Input reaches the box's handlers (`on_press`, `on_wheel`, `on_pinch`…), which tell the host what to draw next.
+
 ## When a frame is drawn
 
 A frame is drawn when the box first shows, when it resizes or the window's scale changes, when the view is invalidated, and, while it animates (`GpuView::animate(true)`), once per display refresh it shows. Animation stops while the box is offscreen, clipped away, transparent or its window hidden. Nothing else draws one: UI changes over or around it show its last frame again, and an idle window with a still view does no work. Calls to `invalidate` between two draws make one frame. Don't invalidate from `render`: animate instead.

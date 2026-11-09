@@ -71,6 +71,10 @@ pub(crate) struct Assets {
     /// Images the host made (`ScriptHost::image`), as `host:<name>`
     /// sources: what shows one follows its version.
     hosted: std::cell::RefCell<HashMap<String, zgx::reactive::Signal<u64>>>,
+    /// GPU views the host made (`ScriptHost::gpu_view`), by name: what shows
+    /// one (`ui.gpu_view`) follows its version, kept in `hosted` as
+    /// `view:<name>`.
+    views: std::cell::RefCell<HashMap<String, zgx::gpu_view::GpuView>>,
 }
 /// A cached picture, its size, and when it was last shown.
 struct Cached<T> {
@@ -95,6 +99,7 @@ impl Default for Assets {
             failed: Default::default(),
             links: Default::default(),
             hosted: Default::default(),
+            views: Default::default(),
         }
     }
 }
@@ -295,6 +300,29 @@ impl Assets {
         }
         let version = self.hosted(&src, runtime);
         version.update(|v| *v = v.wrapping_add(1));
+    }
+    /// The host sets (or, with None, clears) GPU view `name`.
+    pub(crate) fn set_view(
+        &self,
+        name: &str,
+        view: Option<zgx::gpu_view::GpuView>,
+        runtime: &zgx::reactive::Runtime,
+    ) {
+        match view {
+            Some(view) => drop(self.views.borrow_mut().insert(name.to_owned(), view)),
+            None => drop(self.views.borrow_mut().remove(name)),
+        }
+        let version = self.hosted(&format!("view:{name}"), runtime);
+        version.update(|v| *v = v.wrapping_add(1));
+    }
+    /// GPU view `name`, if the host set it, followed as it sets another.
+    pub(crate) fn view(
+        &self,
+        name: &str,
+        runtime: &zgx::reactive::Runtime,
+    ) -> Option<zgx::gpu_view::GpuView> {
+        self.hosted(&format!("view:{name}"), runtime).get();
+        self.views.borrow().get(name).cloned()
     }
     /// Whether the host set image `host:<name>`.
     pub(crate) fn is_hosted(&self, name: &str) -> bool {
@@ -2884,6 +2912,27 @@ fn kind_view(
         }
         Kind::WebView(spec) => web_view_of(spec, vm, low),
         Kind::Terminal(term) => zgx::terminal::terminal(term),
+        Kind::GpuView { label, name } => {
+            let (assets, runtime, name, label) = (
+                low.assets.clone(),
+                low.runtime.clone(),
+                name.clone(),
+                label.clone(),
+            );
+            let current = assets.clone();
+            let (found, held) = (name.clone(), runtime.clone());
+            div().child(
+                switch(
+                    move || current.view(&found, &held).map(|view| view.id()),
+                    move |id, _| match id.and_then(|_| assets.view(&name, &runtime)) {
+                        Some(view) => gpu_view(label.clone(), &view).w_full().h_full(),
+                        None => div(),
+                    },
+                )
+                .w_full()
+                .h_full(),
+            )
+        }
         #[cfg(feature = "scene3d")]
         Kind::Scene3d(spec) => crate::scene3d::lower(spec, vm, &low.assets, need(&mut cx)),
         Kind::Canvas(draw, options) => {

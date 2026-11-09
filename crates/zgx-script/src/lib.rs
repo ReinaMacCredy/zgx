@@ -2238,6 +2238,12 @@ impl ScriptHost {
     pub fn image(&self, name: &str, image: Option<std::sync::Arc<zgx::image::ImageData>>) {
         self.0.assets.set_hosted(name, image, &self.0.runtime);
     }
+    /// A GPU view the app draws (a 3D scene of its own, a decoder's
+    /// output), shown by `ui.gpu_view { view = "<name>" }` at that node's
+    /// size: what shows it follows each replacement; `None` clears it.
+    pub fn gpu_view(&self, name: &str, view: Option<zgx::gpu_view::GpuView>) {
+        self.0.assets.set_view(name, view, &self.0.runtime);
+    }
     /// The transport for `ui.fetch` (and remote images): the app owns the
     /// HTTP stack, headers and credentials (a token minted per request), and
     /// answers each `Request` with a `Response`, or an error message that
