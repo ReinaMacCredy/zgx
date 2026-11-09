@@ -1465,12 +1465,12 @@ export type CommandOptions = {
 	-- a focused web page or terminal, which otherwise get each key first
 	-- (as a browser keeps ⌘T from its pages). Not a plugin's to set.
 	reserved: boolean?,
-	run: (() -> ...unknown)?,
-	-- A separator line in `menu` instead of a command.
-	separator: boolean?,
 	-- Out of the menus, and its key with it, while true: a state or a
 	-- function saying it follows what it reads (a feature turned off).
 	hidden: (boolean | State<boolean> | (() -> boolean?))?,
+	run: (() -> ...unknown)?,
+	-- A separator line in `menu` instead of a command.
+	separator: boolean?,
 	[number]: never,
 }
 
@@ -4710,7 +4710,8 @@ export type SpanProps = {
 	-- An icon before the text, in the line (a file chip's file type):
 	-- `src` (a file, `https://…`) or `code` (SVG markup), `size` square
 	-- (12), `gap` from the text (4), centred on the line; `tint` a colour,
-	-- or `"currentColor"` for the span's.
+	-- or `"currentColor"` for the span's. A span of no text with an icon
+	-- is the icon alone: nothing of it is copied or read out.
 	icon: {
 		src: string?,
 		code: string?,
