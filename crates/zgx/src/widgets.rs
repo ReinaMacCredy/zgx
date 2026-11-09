@@ -5269,7 +5269,14 @@ impl Ui {
                 },
             );
             let font = editor_font(&s, root, &font).into_owned();
-            s.set_font(text, font.clone());
+            // A placeholder is no secret: it shows as written in a password field.
+            if shown.is_some() && font.masked {
+                let mut unmasked = font.clone();
+                unmasked.masked = false;
+                s.set_font(text, unmasked);
+            } else {
+                s.set_font(text, font.clone());
+            }
             let caret_color = draw_hint.caret.get().0.unwrap_or(color);
             s.set_kind(caret, NodeKind::Rect(caret_color));
             let wrap_width = draw_wrap.get().then_some(inner_width.max(1.));
