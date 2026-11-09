@@ -9,7 +9,7 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class,
     msg_send,
     rc::{Retained, Weak},
-    runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject},
+    runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject},
     sel,
 };
 use objc2_app_kit::{NSColor, NSView};
@@ -19,7 +19,7 @@ use objc2_foundation::{
     NSURL, NSURLRequest, NSUUID,
 };
 use objc2_web_kit::{
-    WKDownload, WKDownloadDelegate, WKFrameInfo, WKNavigation, WKNavigationAction,
+    WKContentWorld, WKDownload, WKDownloadDelegate, WKFrameInfo, WKNavigation, WKNavigationAction,
     WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse,
     WKNavigationResponsePolicy, WKNavigationType, WKOpenPanelParameters, WKScriptMessage,
     WKScriptMessageHandler, WKUIDelegate, WKURLSchemeHandler, WKURLSchemeTask,
@@ -993,6 +993,9 @@ pub(crate) struct MacWebView {
     /// The page's custom-scheme servers, kept for as long as it is.
     _schemes: Vec<Retained<SchemeServer>>,
     messages: bool,
+    /// The app's own world (`WebViewOptions::isolated`): its channel, its
+    /// scripts and `evaluate_js` run there.
+    world: Option<Retained<WKContentWorld>>,
     transparent: bool,
     /// The last HTML shown and its base: WebKit reloads such a page by
     /// fetching its URL (`about:blank`, a blank page), so reload shows it again.
@@ -1031,6 +1034,13 @@ impl MacWebView {
             .iter()
             .map(|handler| SchemeServer::new(web, handler, mtm))
             .collect();
+        // (WKContentWorld is macOS 11's: before it, one world and no isolated scripts.)
+        let world = options
+            .isolated
+            .as_ref()
+            .filter(|_| AnyClass::get(c"WKContentWorld").is_some())
+            // SAFETY: a class method with no precondition, on the main thread.
+            .map(|_| unsafe { WKContentWorld::worldWithName(&NSString::from_str(CHANNEL), mtm) });
         // SAFETY: configuring a fresh configuration on the main thread. Each
         // scheme is one WebKit does not serve, given once (WebKit raises
         // otherwise); the configuration retains its scheme handlers and the
@@ -1062,6 +1072,19 @@ impl MacWebView {
                 );
                 content.addUserScript(&script);
             }
+            if let (Some(world), Some(scripts)) = (&world, &options.isolated) {
+                for script in scripts {
+                    let script =
+                        WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+                            mtm.alloc(),
+                            &NSString::from_str(&script.source),
+                            WKUserScriptInjectionTime::AtDocumentStart,
+                            script.main_frame_only,
+                            world,
+                        );
+                    content.addUserScript(&script);
+                }
+            }
             {
                 let content = configuration.userContentController();
                 content.addScriptMessageHandler_name(
@@ -1078,16 +1101,37 @@ impl MacWebView {
             }
             if options.messages {
                 let content = configuration.userContentController();
-                content.addScriptMessageHandler_name(
-                    ProtocolObject::from_ref(&*observer),
-                    &NSString::from_str(CHANNEL),
-                );
-                let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
-                    mtm.alloc(),
-                    &NSString::from_str(CHANNEL_SCRIPT),
-                    WKUserScriptInjectionTime::AtDocumentStart,
-                    true,
-                );
+                let channel = NSString::from_str(CHANNEL);
+                let source = NSString::from_str(CHANNEL_SCRIPT);
+                let at = WKUserScriptInjectionTime::AtDocumentStart;
+                let script = match &world {
+                    Some(world) => {
+                        content.addScriptMessageHandler_contentWorld_name(
+                            ProtocolObject::from_ref(&*observer),
+                            world,
+                            &channel,
+                        );
+                        WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+                            mtm.alloc(),
+                            &source,
+                            at,
+                            true,
+                            world,
+                        )
+                    }
+                    None => {
+                        content.addScriptMessageHandler_name(
+                            ProtocolObject::from_ref(&*observer),
+                            &channel,
+                        );
+                        WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
+                            mtm.alloc(),
+                            &source,
+                            at,
+                            true,
+                        )
+                    }
+                };
                 content.addUserScript(&script);
             }
             // SAFETY: WKWebView's designated initializer, on a fresh
@@ -1137,6 +1181,7 @@ impl MacWebView {
             observer,
             _schemes: schemes,
             messages: options.messages,
+            world,
             transparent: options.transparent,
             html: RefCell::new(None),
             zoom: Cell::new((1., 1.)),
@@ -1285,10 +1330,20 @@ impl WebViewBackend for MacWebView {
                                 reply(result);
                             });
                         });
-                    self.view.evaluateJavaScript_completionHandler(
-                        &NSString::from_str(&script),
-                        Some(&completion),
-                    );
+                    let script = NSString::from_str(&script);
+                    match &self.world {
+                        Some(world) => self
+                            .view
+                            .evaluateJavaScript_inFrame_inContentWorld_completionHandler(
+                                &script,
+                                None,
+                                world,
+                                Some(&completion),
+                            ),
+                        None => self
+                            .view
+                            .evaluateJavaScript_completionHandler(&script, Some(&completion)),
+                    }
                 }
                 WebViewCommand::Focus(focus) => {
                     let Some(window) = self.view.window() else {
@@ -1392,7 +1447,13 @@ impl Drop for MacWebView {
             let content = self.view.configuration().userContentController();
             content.removeScriptMessageHandlerForName(&NSString::from_str(PRINT));
             if self.messages {
-                content.removeScriptMessageHandlerForName(&NSString::from_str(CHANNEL));
+                let channel = NSString::from_str(CHANNEL);
+                match &self.world {
+                    Some(world) => {
+                        content.removeScriptMessageHandlerForName_contentWorld(&channel, world)
+                    }
+                    None => content.removeScriptMessageHandlerForName(&channel),
+                }
             }
             self.view.stopLoading();
         }

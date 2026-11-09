@@ -252,6 +252,7 @@ impl UserData for WebUd {
         fields.add_field_method_get("can_go_back", |_, w| Ok(w.0.can_go_back()));
         fields.add_field_method_get("can_go_forward", |_, w| Ok(w.0.can_go_forward()));
         fields.add_field_method_get("focused", |_, w| Ok(w.0.focused()));
+        fields.add_field_method_get("isolated", |_, w| Ok(w.0.isolated()));
         fields.add_field_method_get("error", |_, w| Ok(w.0.state().get().error));
         fields.add_field_method_get("full_screen", |_, w| {
             Ok(w.0.state().with(|state| state.full_screen))
@@ -452,7 +453,21 @@ fn web_options(table: &Table) -> mlua::Result<zgx::web_view::WebViewOptions> {
         accelerated: table
             .get::<Option<bool>>("accelerated")?
             .unwrap_or(defaults.accelerated),
-        // Scripts and schemes are set from Rust, not from Luau.
+        isolated: match table.get::<mlua::Value>("isolated")? {
+            mlua::Value::Nil | mlua::Value::Boolean(false) => None,
+            mlua::Value::Boolean(true) => Some(Vec::new()),
+            _ => Some(
+                table
+                    .get::<Vec<String>>("isolated")?
+                    .into_iter()
+                    .map(|source| zgx::web_view::UserScript {
+                        source,
+                        main_frame_only: true,
+                    })
+                    .collect(),
+            ),
+        },
+        // Page-world scripts and schemes are set from Rust, not from Luau.
         ..defaults
     })
 }
@@ -5948,6 +5963,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 "messages",
                 "new_windows",
                 "accelerated",
+                "isolated",
                 "on_navigate",
                 "on_load",
                 "on_title",

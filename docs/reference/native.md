@@ -21,7 +21,7 @@ ui.command(opts: CommandOptions) -> ()
 
 ## Web view options
 
-`ui.webview` takes these, `ui.web` the first seven, and any [property](properties.md) and [event](events.md):
+`ui.webview` takes these, `ui.web` the first eight, and any [property](properties.md) and [event](events.md):
 
 | Option | Type | Default | |
 | --- | --- | --- | --- |
@@ -32,6 +32,7 @@ ui.command(opts: CommandOptions) -> ()
 | `messages` | `boolean` | `true` | the page's `window.zgx.postMessage(value)` reaches `on_message` |
 | `new_windows` | `boolean` | `true` | `window.open` and `target=_blank` reach `on_new_window` (and open nothing) |
 | `accelerated` | `boolean` | `true` | Linux only (macOS and Windows ignore it): `false` paints the page on the CPU and uploads only what each frame changed, far cheaper for a page that animates a little, but draws no `backdrop-filter` and flattens 3D transforms ([what it saves](../native-surfaces.md#what-a-linux-page-frame-costs)) |
+| `isolated` | `boolean` or `{ string }` | `false` | macOS: the app's side of the page in a JavaScript world of its own (a `WKContentWorld`). These scripts, run at document start in the top frame before the page's own, `run`, `eval` and `window.zgx` see the page's DOM but none of its globals; the page's own scripts find no `window.zgx` (nor `window.webkit.messageHandlers.zgx`), so they can't post to `on_message` nor hook what the app's scripts use. Elsewhere (WebKitGTK, WebView2) the channel stays in the page's world and the scripts don't run: `web.isolated` says which |
 | `web` | `Web` | a page for the node | a controller, so the page outlives the node (a tab switched away and back) |
 | `src` | `Reactive<string>` | none | the URL; the page navigates when it changes |
 | `html`, `base_url` | `string`, `string?` | none | a page from markup, loaded once |
@@ -43,7 +44,7 @@ ui.command(opts: CommandOptions) -> ()
 | `on_new_window` | `(url: string) -> ()` | none | |
 | `on_download` | `(d: Download) -> ()` | none | a download the page started (a `download` link, an attachment): `d.url`, `d.name` (as the page or its server suggests it) and `d.mime`; save it with `d:save_to(file, opts?)` (a file the user picked, from `ui.save_file`) or `d:ask(opts?)` (the save dialog suggesting `d.name`: a promise of the file saved to, or nil), or `d:cancel()`. `opts` takes `on_progress(received, total)` and `on_finish(ok, err)`. Both need the Files grant. Without `on_download`, and for a `d` never answered, nothing is saved: a page never starts a download into the user's folders without the app deciding |
 
-A `Web` controller's `url`, `title`, `loading`, `progress`, `can_go_back`, `can_go_forward`, `focused`, `error`, `full_screen` (an element of the page is full screen: on macOS in WebKit's window over the screen, on Windows and Linux filling the node, which an app grows to show it so) and `pointer` (`{ x, y }` in points while the pointer is over the page, else nil) are tracked like state: a text or computed reading them follows the page. Its methods: `load(url)`, `html(html, base_url?)`, `back()`, `forward()`, `reload()`, `stop()`, `focus()`, `blur()`, `devtools()`, `exit_full_screen()`, `zoom(z)`, `run(js)`, `eval(js, function(value, err) … end)` (the script's value as Luau data, or nil and the error), `decide_navigation(fn)` (each navigation is asked of `fn({ url, main_frame, kind, source_url })` before it starts, `kind` `"link"`, `"form"`, `"back_forward"`, `"reload"`, `"form_resubmission"` or `"other"`, a script's or a redirect's; `false` refuses it: a stored page whose links open in the browser and whose scripts can't navigate it), and `close()`.
+A `Web` controller's `url`, `title`, `loading`, `progress`, `can_go_back`, `can_go_forward`, `focused`, `error`, `isolated` (the `isolated` option holds: macOS), `full_screen` (an element of the page is full screen: on macOS in WebKit's window over the screen, on Windows and Linux filling the node, which an app grows to show it so) and `pointer` (`{ x, y }` in points while the pointer is over the page, else nil) are tracked like state: a text or computed reading them follows the page. Its methods: `load(url)`, `html(html, base_url?)`, `back()`, `forward()`, `reload()`, `stop()`, `focus()`, `blur()`, `devtools()`, `exit_full_screen()`, `zoom(z)`, `run(js)`, `eval(js, function(value, err) … end)` (the script's value as Luau data, or nil and the error), `decide_navigation(fn)` (each navigation is asked of `fn({ url, main_frame, kind, source_url })` before it starts, `kind` `"link"`, `"form"`, `"back_forward"`, `"reload"`, `"form_resubmission"` or `"other"`, a script's or a redirect's; `false` refuses it: a stored page whose links open in the browser and whose scripts can't navigate it), and `close()`.
 
 ## Terminal options
 
