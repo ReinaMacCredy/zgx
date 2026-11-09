@@ -89,6 +89,34 @@ fn actions_and_the_tree_read_as_agents_see_them() {
 }
 
 #[test]
+fn a_password_reads_as_bullets_in_the_tree_and_to_assistive_technology() {
+    let mut h = Harness::inline(
+        r##"return ui.column {
+            ui.input { id = "secret", label = "Secret", secure = true, value = ui.state("secret", ""), w = 160 },
+        }"##,
+    );
+    h.type_text(r#""Secret""#, "tskey-test");
+    h.frames(1);
+    let tree = h.tree();
+    assert!(!tree.contains("tskey"), "{tree}");
+    assert!(
+        tree.contains(r#"#secret textbox "Secret" ="••••••••••""#),
+        "{tree}"
+    );
+    let node = h.find("secret").unwrap();
+    let semantics = h.ui.semantics.borrow();
+    let field = semantics.get(node).unwrap();
+    assert_eq!(field.value.as_deref(), Some("••••••••••"));
+    assert_eq!(
+        field.text_selection,
+        Some((30, 30)),
+        "the caret after the last bullet"
+    );
+    drop(semantics);
+    assert_eq!(h.error(), None);
+}
+
+#[test]
 fn targets_and_the_tree_reach_into_a_modal_and_a_popover_in_it() {
     let mut h = Harness::inline(
         r##"return ui.column { id = "scope",

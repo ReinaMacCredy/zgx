@@ -6004,7 +6004,21 @@ impl Ui {
             let mut semantics = sem.borrow_mut();
             // The text, when it changed (a long document isn't compared on a
             // scroll); the selection always.
-            if draw_semantic_revision.get() == Some(e.revision()) {
+            if draw_hint.secure.get() {
+                // A password reads as a bullet per character, here as it
+                // shows, and its caret where it stands among them.
+                let text = e.text();
+                let at = |byte: usize| {
+                    '\u{2022}'.len_utf8() * text[..byte.min(text.len())].chars().count()
+                };
+                semantics.update_text_input(
+                    root,
+                    &"\u{2022}".repeat(text.chars().count()),
+                    (at(selection.anchor), at(selection.focus)),
+                    draw_read_only.get(),
+                );
+                draw_semantic_revision.set(None);
+            } else if draw_semantic_revision.get() == Some(e.revision()) {
                 semantics.update_text_selection(
                     root,
                     (selection.anchor, selection.focus),
