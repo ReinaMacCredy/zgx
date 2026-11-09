@@ -1004,6 +1004,7 @@ impl Engine {
                         })
                         .flatten()
                         .filter(|text| !text.is_empty());
+                    self.selected(selected.clone());
                     if let (Some(text), Some(platform)) = (selected, &*self.platform.borrow()) {
                         platform.0.set_primary_text(text);
                     }
@@ -1012,6 +1013,15 @@ impl Engine {
                 None => {}
             },
             _ => {}
+        }
+    }
+
+    /// What's selected now, for the controller's state (`selection`).
+    fn selected(&self, text: Option<String>) {
+        if let Some(term) = self.controller()
+            && term.state().with_untracked(|state| state.selection != text)
+        {
+            term.update_state(|state| state.selection = text);
         }
     }
 
@@ -1184,7 +1194,7 @@ impl Engine {
             }
             "paste_from_clipboard" | "paste_from_selection" => self.paste_clipboard(),
             "select_all" => {
-                self.with_session(|session| {
+                let selected = self.with_session(|session| {
                     let mut term = session.term();
                     let top = term.topmost_line();
                     let bottom = term.bottommost_line();
@@ -1196,7 +1206,9 @@ impl Engine {
                     );
                     selection.update(Point::new(bottom, last), Side::Right);
                     term.selection = Some(selection);
+                    term.selection_to_string()
                 });
+                self.selected(selected.flatten().filter(|text| !text.is_empty()));
                 self.paint();
             }
             "clear_screen" => {
@@ -1205,6 +1217,7 @@ impl Engine {
                     term.grid_mut().clear_history();
                     term.selection = None;
                     drop(term);
+                    self.selected(None);
                     // The program draws its screen (a shell's prompt) again.
                     session.write(b"\x0c".as_slice());
                 });

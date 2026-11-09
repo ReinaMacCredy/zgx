@@ -1392,6 +1392,9 @@ declare extern type Term with
 	exited: number?
 	columns: number
 	rows: number
+	-- What's selected in it once a drag (or Select All) ends; nil once
+	-- nothing is.
+	selection: string?
 	-- The pointer over it, in points from its top left; nil outside.
 	pointer: { x: number, y: number }?
 	function focus(self): ()

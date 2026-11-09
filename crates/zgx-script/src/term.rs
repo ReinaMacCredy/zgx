@@ -372,6 +372,10 @@ impl UserData for TermUd {
         fields.add_field_method_get("exited", |lua, t| t.field(lua, "exited", |s| s.exited));
         fields.add_field_method_get("columns", |lua, t| t.field(lua, "columns", |s| s.columns));
         fields.add_field_method_get("rows", |lua, t| t.field(lua, "rows", |s| s.rows));
+        // What's selected in it once a drag ends; nil once nothing is.
+        fields.add_field_method_get("selection", |lua, t| {
+            t.field(lua, "selection", |s| s.selection.clone())
+        });
         // `{ x, y }` in points from the top left, or nil outside.
         fields.add_field_method_get("pointer", |lua, t| {
             t.term
