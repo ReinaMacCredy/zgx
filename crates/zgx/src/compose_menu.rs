@@ -255,7 +255,8 @@ pub(crate) fn mount(
         } else {
             (Key::ArrowLeft, Key::ArrowRight)
         };
-        if *key == back && menu.submenu {
+        // Backspace steps back out of a submenu, as gpui's pickers go up.
+        if (*key == back || *key == Key::Backspace) && menu.submenu {
             menu.open.set(false);
             if let Some(trigger) = menu.trigger {
                 ui.input.focus(&ui.scene, Some(trigger));
@@ -285,13 +286,24 @@ pub(crate) fn mount(
         let current = items
             .iter()
             .position(|node| Some(*node) == ui.input.focused());
+        let next = || items[current.map_or(0, |index| (index + 1) % items.len())];
+        let previous = || {
+            items[current.map_or(items.len() - 1, |index| {
+                (index + items.len() - 1) % items.len()
+            })]
+        };
+        // Ctrl+N and Ctrl+P step as the arrows do, as AppKit's menus take them.
+        let emacs = |letter: &str| {
+            modifiers.control
+                && !modifiers.alt
+                && !modifiers.meta
+                && matches!(key, Key::Character(text) if text.eq_ignore_ascii_case(letter))
+        };
         let target = match key {
-            Key::ArrowDown => Some(items[current.map_or(0, |index| (index + 1) % items.len())]),
-            Key::ArrowUp => Some(
-                items[current.map_or(items.len() - 1, |index| {
-                    (index + items.len() - 1) % items.len()
-                })],
-            ),
+            Key::ArrowDown => Some(next()),
+            Key::ArrowUp => Some(previous()),
+            _ if emacs("n") => Some(next()),
+            _ if emacs("p") => Some(previous()),
             Key::Home => Some(items[0]),
             Key::End => items.last().copied(),
             Key::Character(text) if !modifiers.control && !modifiers.alt && !modifiers.meta => {

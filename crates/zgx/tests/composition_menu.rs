@@ -574,3 +574,76 @@ fn a_menu_in_a_popup_window_names_its_trigger_while_open() {
     assert!(ui.scene.borrow().popups().is_empty());
     assert_eq!(ui.scene.borrow().popup_anchor(root), None);
 }
+
+#[test]
+fn ctrl_n_and_p_walk_a_menu_cmd_enter_chooses_and_backspace_leaves_a_submenu() {
+    let held = |ui: &mut Ui, key: Key, modifiers: Modifiers| {
+        ui.dispatch(InputEvent::KeyDown {
+            key,
+            modifiers,
+            repeat: false,
+        });
+        ui.prepare_frame();
+    };
+    let control = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    let command = Modifiers {
+        meta: true,
+        ..Modifiers::default()
+    };
+    let mut ui = Ui::new(600., 400.);
+    let open = ui.signal(false);
+    let child = ui.signal(false);
+    let chosen = ui.signal(0);
+    let choose = chosen.clone();
+    let view = ui.mount(
+        menu("Actions", open.clone(), button().id("anchor").child("Menu"))
+            .p(0.)
+            .children([
+                menu_item("Alpha").id("alpha"),
+                menu_item("Beta").id("beta").on_click(move || {
+                    choose.set(choose.get() + 1);
+                }),
+                submenu("More", child.clone())
+                    .trigger_id("more")
+                    .child(menu_item("Child").id("child")),
+            ]),
+    );
+    ui.prepare_frame();
+    ui.input.focus(&ui.scene, view.find("anchor"));
+    open.set(true);
+    ui.prepare_frame();
+    assert_eq!(ui.input.focused(), view.find("alpha"));
+    held(&mut ui, Key::Character("n".into()), control);
+    assert_eq!(ui.input.focused(), view.find("beta"));
+    held(&mut ui, Key::Character("n".into()), control);
+    assert_eq!(ui.input.focused(), view.find("more"));
+    held(&mut ui, Key::Character("p".into()), control);
+    assert_eq!(ui.input.focused(), view.find("beta"));
+    // Ctrl with another letter is no typeahead.
+    held(&mut ui, Key::Character("m".into()), control);
+    assert_eq!(ui.input.focused(), view.find("beta"));
+    held(&mut ui, Key::Character("n".into()), control);
+    held(&mut ui, Key::ArrowRight, Modifiers::default());
+    assert!(child.get());
+    held(&mut ui, Key::Backspace, Modifiers::default());
+    assert!(!child.get(), "Backspace goes back out");
+    assert!(open.get(), "and leaves its menu open");
+    assert_eq!(ui.input.focused(), view.find("more"));
+    held(&mut ui, Key::Backspace, Modifiers::default());
+    assert!(open.get(), "a menu of its own stays open");
+    held(&mut ui, Key::Character("p".into()), control);
+    held(&mut ui, Key::Enter, command);
+    ui.dispatch(InputEvent::KeyUp {
+        key: Key::Enter,
+        modifiers: command,
+    });
+    for _ in 0..20 {
+        ui.prepare_frame();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(chosen.get(), 1, "Cmd+Enter chooses as Enter does");
+    assert!(!open.get());
+}
