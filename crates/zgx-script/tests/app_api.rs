@@ -107,6 +107,63 @@ fn a_shortcut_following_a_state_is_rebound_without_a_reload() {
 }
 
 #[test]
+fn a_hidden_command_leaves_the_menus_and_its_key_while_it_says_so() {
+    // A feature turned off: its menu item and shortcut go, and come back.
+    let mut h = Harness::inline(
+        r##"local off = ui.state("off", true)
+        local gone = ui.state("gone", false)
+        ui.command { id = "annotate", title = "Annotate", menu = "View", key = "cmd+shift+i",
+            hidden = off, run = function() end }
+        ui.command { id = "zoom", title = "Zoom", menu = "View",
+            hidden = function() return gone:get() end, run = function() end }
+        ui.command { id = "never", title = "Never", hidden = true, run = function() end }
+        ui.command { id = "always", title = "Always", hidden = false, run = function() end }
+        return ui.column {
+            ui.button { id = "on", w = 20, h = 20, on_click = function() off:set(false) end },
+            ui.button { id = "hide-zoom", w = 20, h = 20, on_click = function() gone:set(true) end },
+        }"##,
+    );
+    let listed = |h: &Harness| -> Vec<(String, Option<String>)> {
+        h.host
+            .commands()
+            .get()
+            .iter()
+            .map(|c| (c.id.clone(), c.key.clone()))
+            .collect()
+    };
+    assert_eq!(
+        listed(&h),
+        vec![("zoom".into(), None), ("always".into(), None)]
+    );
+    assert_eq!(
+        h.host.commands().get().iter().find(|c| c.id == "annotate"),
+        None
+    );
+    h.click("on");
+    h.settle();
+    assert_eq!(
+        listed(&h),
+        vec![
+            ("annotate".into(), Some("cmd+shift+i".into())),
+            ("zoom".into(), None),
+            ("always".into(), None)
+        ]
+    );
+    h.click("hide-zoom");
+    h.settle();
+    assert_eq!(
+        listed(&h),
+        vec![
+            ("annotate".into(), Some("cmd+shift+i".into())),
+            ("always".into(), None)
+        ]
+    );
+    // Hidden, it still runs when the app asks.
+    assert!(h.host.run_command("never"));
+    assert_eq!(h.error(), None);
+}
+
+#[test]
 fn a_recorder_with_capture_keys_takes_every_key_while_focused() {
     // Settings' Shortcuts: a field records the next combination, ⌘J
     // included, instead of a menu running its command.
