@@ -259,6 +259,10 @@ pub fn number(node: NodeId) -> u32 {
 /// The text a node shows itself (a text's, a paragraph's), if any.
 pub fn own_text(scene: &Scene, node: NodeId) -> Option<String> {
     match scene.kind(node) {
+        // A password's text, as it shows: a bullet per character.
+        NodeKind::Text { text, .. } if scene.font(node).masked => {
+            Some("\u{2022}".repeat(text.chars().count()))
+        }
         NodeKind::Text { text, .. } => Some(text.to_string()),
         NodeKind::RichText { text, .. } => Some(text.text().to_owned()),
         _ => None,
