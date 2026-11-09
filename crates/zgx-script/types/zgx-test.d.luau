@@ -43,6 +43,8 @@ declare extern type TestApp with
 	function gesture(self, phase: string, swipes: boolean?): ()
 	-- Run a `ui.command` by its id, as its menu item or shortcut does.
 	function command(self, id: string): ()
+	-- The commands the menus show now, in order (a hidden one left out).
+	function commands(self): { { id: string, title: string, menu: string, key: string? } }
 	-- The window's new size, laid out.
 	function resize(self, width: number, height: number): ()
 	-- The next `ui.open_files` picks these files, the next `ui.save_file` saves

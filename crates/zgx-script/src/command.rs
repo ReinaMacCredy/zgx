@@ -84,6 +84,24 @@ impl KeySource {
             }
         }
     }
+    /// Whether it says to hide the command now (tracked).
+    fn hides(&self) -> bool {
+        match self {
+            KeySource::State(state) => state.get().truthy(),
+            KeySource::Function(f, vm) => {
+                let Some(vm) = vm.upgrade() else {
+                    return false;
+                };
+                match vm.call::<mlua::Value>(f, ()) {
+                    Ok(hidden) => !matches!(hidden, mlua::Value::Nil | mlua::Value::Boolean(false)),
+                    Err(error) => {
+                        vm.report(error);
+                        false
+                    }
+                }
+            }
+        }
+    }
 }
 /// What a load declared, kept to publish again as dynamic shortcuts change.
 struct Declared {
@@ -91,6 +109,9 @@ struct Declared {
     /// The commands whose shortcut follows what it reads, by index, and
     /// whether a key alone is refused.
     keys: Vec<(usize, KeySource, bool)>,
+    /// The commands left out of the list, by index: always (`None`), or
+    /// while what they read says so.
+    hidden: Vec<(usize, Option<KeySource>)>,
     reserved: Vec<String>,
 }
 pub(crate) struct Commands {
@@ -98,6 +119,9 @@ pub(crate) struct Commands {
     /// Pending commands' dynamic shortcuts, by id, and whether a key alone
     /// is refused (a plugin's, without the grant).
     pending_keys: RefCell<Vec<(String, KeySource, bool)>>,
+    /// Pending commands' `hidden`, by id: always (`None`), or following a
+    /// state or function.
+    pending_hidden: RefCell<Vec<(String, Option<KeySource>)>>,
     /// While a load's commands have dynamic shortcuts: what publishes them
     /// again as those change.
     following: RefCell<Option<Effect>>,
@@ -117,6 +141,7 @@ impl Commands {
         Self {
             pending: RefCell::default(),
             pending_keys: RefCell::default(),
+            pending_hidden: RefCell::default(),
             following: RefCell::default(),
             runtime: runtime.clone(),
             pending_reserved: RefCell::default(),
@@ -130,21 +155,24 @@ impl Commands {
     pub fn begin(&self) {
         self.pending.borrow_mut().clear();
         self.pending_keys.borrow_mut().clear();
+        self.pending_hidden.borrow_mut().clear();
         self.pending_reserved.borrow_mut().clear();
     }
     /// Where the load's declarations are, before a script runs.
-    pub fn mark(&self) -> (usize, usize, usize) {
+    pub fn mark(&self) -> (usize, usize, usize, usize) {
         (
             self.pending.borrow().len(),
             self.pending_keys.borrow().len(),
+            self.pending_hidden.borrow().len(),
             self.pending_reserved.borrow().len(),
         )
     }
     /// A script failed as it loaded: what it declared since `mark` goes, so
     /// no command of a failed plugin stays in the menu bar unable to run.
-    pub fn discard_since(&self, (commands, keys, reserved): (usize, usize, usize)) {
+    pub fn discard_since(&self, (commands, keys, hidden, reserved): (usize, usize, usize, usize)) {
         self.pending.borrow_mut().truncate(commands);
         self.pending_keys.borrow_mut().truncate(keys);
+        self.pending_hidden.borrow_mut().truncate(hidden);
         self.pending_reserved.borrow_mut().truncate(reserved);
     }
     /// The load succeeded: publish what it declared, and again whenever a
@@ -152,10 +180,12 @@ impl Commands {
     pub fn publish(self: &Rc<Self>) {
         let pending = std::mem::take(&mut *self.pending.borrow_mut());
         let mut dynamic = std::mem::take(&mut *self.pending_keys.borrow_mut());
+        let mut hiding = std::mem::take(&mut *self.pending_hidden.borrow_mut());
         let mut runners = HashMap::new();
         let mut declared = Declared {
             commands: Vec::with_capacity(pending.len()),
             keys: Vec::new(),
+            hidden: Vec::new(),
             reserved: std::mem::take(&mut *self.pending_reserved.borrow_mut()),
         };
         for (command, runner, plugin) in pending {
@@ -170,17 +200,26 @@ impl Commands {
                     .keys
                     .push((declared.commands.len(), source, no_bare));
             }
+            if !hiding.is_empty()
+                && let Some(at) = hiding.iter().position(|(id, _)| *id == command.id)
+            {
+                let (_, source) = hiding.swap_remove(at);
+                declared.hidden.push((declared.commands.len(), source));
+            }
             declared.commands.push((command, plugin));
         }
         *self.runners.borrow_mut() = runners;
         // The last load's following, if any, is done with.
         drop(self.following.borrow_mut().take());
-        if declared.keys.is_empty() {
+        if declared.keys.is_empty() && declared.hidden.iter().all(|(_, source)| source.is_none()) {
             // Published once, as declared.
+            let hidden: Vec<usize> = declared.hidden.iter().map(|(at, _)| *at).collect();
             let pending = declared
                 .commands
                 .into_iter()
-                .map(|(command, plugin)| (command, None, plugin))
+                .enumerate()
+                .filter(|(at, _)| !hidden.contains(at))
+                .map(|(_, (command, plugin))| (command, None, plugin))
                 .collect();
             self.publish_list(pending, &declared.reserved, false, Vec::new());
             return;
@@ -217,7 +256,26 @@ impl Commands {
                 });
             }
         }
-        self.publish_list(pending, &declared.reserved, true, refused);
+        if !declared.hidden.is_empty() {
+            let hidden: Vec<usize> = declared
+                .hidden
+                .iter()
+                .filter(|(_, source)| source.as_ref().is_none_or(KeySource::hides))
+                .map(|(at, _)| *at)
+                .collect();
+            pending = pending
+                .into_iter()
+                .enumerate()
+                .filter(|(at, _)| !hidden.contains(at))
+                .map(|(_, entry)| entry)
+                .collect();
+        }
+        self.publish_list(
+            pending,
+            &declared.reserved,
+            !declared.keys.is_empty(),
+            refused,
+        );
     }
     /// Publish `pending`. A `rebinding`'s key may be one an earlier command
     /// holds: the app's own are checked then too (as declared, they are the
@@ -438,6 +496,20 @@ pub(crate) fn install(lua: &Lua, ui: &Table, commands: Rc<Commands>) -> mlua::Re
                     bare_refused()
                 )));
             }
+            // Out of the menus (and its key with it) while it says so.
+            let hidden = match table.get::<mlua::Value>("hidden")? {
+                mlua::Value::Nil | mlua::Value::Boolean(false) => None,
+                mlua::Value::Boolean(true) => Some(None),
+                mlua::Value::Function(f) => Some(Some(KeySource::Function(f, env.vm.clone()))),
+                state => match crate::node::state_of(&state) {
+                    Some(state) => Some(Some(KeySource::State(state))),
+                    None => {
+                        return Err(mlua::Error::runtime(format!(
+                            "ui.command `{id}`: `hidden` is a boolean, a state or a function"
+                        )));
+                    }
+                },
+            };
             // The app's alone to keep: a plugin's would take a key from
             // every page and terminal.
             let reserved = table.get::<Option<bool>>(&reserved_key)?.unwrap_or(false);
@@ -461,6 +533,9 @@ pub(crate) fn install(lua: &Lua, ui: &Table, commands: Rc<Commands>) -> mlua::Re
                     .pending_keys
                     .borrow_mut()
                     .push((id.clone(), source, no_bare));
+            }
+            if let Some(hidden) = hidden {
+                commands.pending_hidden.borrow_mut().push((id.clone(), hidden));
             }
             pending.push((
                 Command {

@@ -556,6 +556,20 @@ impl UserData for Mounted {
             app.settle();
             Ok(())
         });
+        // The commands the menus show now, in order: `{ id, title, menu, key }`.
+        methods.add_method("commands", |lua, m, ()| {
+            let app = m.app()?;
+            let list = lua.create_table()?;
+            for command in app.host.commands().get().iter().filter(|c| !c.separator) {
+                let entry = lua.create_table()?;
+                entry.set("id", command.id.as_str())?;
+                entry.set("title", command.title.as_str())?;
+                entry.set("menu", command.menu.as_str())?;
+                entry.set("key", command.key.as_deref())?;
+                list.push(entry)?;
+            }
+            Ok(list)
+        });
         methods.add_method("text", |_, m, target: String| {
             let mut app = m.app()?;
             let node = Self::node(&mut app, &target)?;

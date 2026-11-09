@@ -1465,6 +1465,9 @@ export type CommandOptions = {
 	run: (() -> ...unknown)?,
 	-- A separator line in `menu` instead of a command.
 	separator: boolean?,
+	-- Out of the menus, and its key with it, while true: a state or a
+	-- function saying it follows what it reads (a feature turned off).
+	hidden: (boolean | State<boolean> | (() -> boolean?))?,
 	[number]: never,
 }
 
