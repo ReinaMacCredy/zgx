@@ -325,9 +325,9 @@ pub struct WebViewOptions {
     pub scripts: Vec<UserScript>,
     /// The app's side of the page in a JavaScript world of its own (macOS 11
     /// and later: a `WKContentWorld`). These scripts, run at document start
-    /// before the page's own, the message channel (`window.zgx`) and
-    /// [`WebView::evaluate_js`] share the page's DOM but none of its
-    /// globals, and the page's own scripts find no `window.zgx` nor its
+    /// before the page's own (`window.zgx` already there), the message
+    /// channel and [`WebView::evaluate_js`] share the page's DOM but none of
+    /// its globals, and the page's own scripts find no `window.zgx` nor its
     /// WebKit handler, so they can neither post to the app nor hook what the
     /// app's scripts use. `None` keeps one world, the page's. Where the
     /// platform has no such world (WebKitGTK and WebView2 so far) an
