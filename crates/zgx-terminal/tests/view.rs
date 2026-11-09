@@ -719,14 +719,34 @@ fn a_selection_is_the_primary_and_a_middle_click_pastes_it() {
         },
     );
     assert_eq!(selections.primary.borrow().as_deref(), Some("pick me"));
-    // The controller says it too, for an app to quote, and a click that
-    // drags nothing clears it.
+    // The controller says it too, for an app to quote; typing ends it.
     assert_eq!(
         term.state()
             .with_untracked(|s| s.selection.clone())
             .as_deref(),
         Some("pick me")
     );
+    press(&mut app, InputEvent::Text("x".into()));
+    assert_eq!(term.state().with_untracked(|s| s.selection.clone()), None);
+    // Selected again, a click that drags nothing clears it.
+    press(
+        &mut app,
+        InputEvent::PointerDown {
+            x: 11.,
+            y,
+            button: PointerButton::Primary,
+        },
+    );
+    press(&mut app, InputEvent::PointerMove { x: right, y });
+    press(
+        &mut app,
+        InputEvent::PointerUp {
+            x: right,
+            y,
+            button: PointerButton::Primary,
+        },
+    );
+    assert!(term.state().with_untracked(|s| s.selection.is_some()));
     press(
         &mut app,
         InputEvent::PointerDown {
@@ -763,7 +783,7 @@ fn a_selection_is_the_primary_and_a_middle_click_pastes_it() {
         },
     );
     app.until("the paste", |app| {
-        app.texts().iter().any(|t| t.starts_with("from elsewhere"))
+        app.texts().iter().any(|t| t.contains("from elsewhere"))
     });
 }
 

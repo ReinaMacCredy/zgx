@@ -860,6 +860,7 @@ impl Engine {
                         typed.push_str(&text);
                     }
                 }
+                self.typed_over_selection();
                 self.write(text.into_bytes());
                 cx.prevent_default();
             }
@@ -1154,9 +1155,21 @@ impl Engine {
             None => keys::encode(key, modifiers, mode),
         };
         if let Some(bytes) = encoded {
+            self.typed_over_selection();
             self.write(bytes);
             cx.prevent_default();
             cx.stop_propagation();
+        }
+    }
+
+    /// Typing ends a selection, as Ghostty's and Alacritty's do.
+    fn typed_over_selection(&self) {
+        let had = self
+            .with_session(|session| session.term().selection.take().is_some())
+            .unwrap_or(false);
+        if had {
+            self.selected(None);
+            self.paint();
         }
     }
 
