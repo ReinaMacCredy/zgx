@@ -705,6 +705,7 @@ impl Node {
             Kind::Scene3d(_) => "scene3d",
             Kind::WebView(_) => "webview",
             Kind::Terminal(_) => "terminal",
+            Kind::GpuView { .. } => "gpu_view",
             Kind::Checkbox { .. } => "checkbox",
             Kind::Input { .. } => "input",
             Kind::Progress { .. } => "progress",
@@ -1033,6 +1034,13 @@ pub(crate) enum Kind {
     /// `ui.terminal { term = ui.term(id) }`: a terminal session, shown
     /// where the node is.
     Terminal(zgx::terminal::Terminal),
+    /// `ui.gpu_view { view = "<name>" }`: the GPU view the host set as
+    /// `name` (`ScriptHost::gpu_view`), filling the node; nothing while it
+    /// has none.
+    GpuView {
+        label: String,
+        name: String,
+    },
     Checkbox {
         label: String,
         value: Signal<Value>,
@@ -6039,6 +6047,29 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             let node = fill(
                 lua,
                 Node::new(owner(lua)?, Kind::Terminal(term)),
+                Some(&table),
+            )?;
+            node_ud(lua, node)
+        })?,
+    )?;
+    ui.set(
+        "gpu_view",
+        lua.create_function(|lua, table: Table| {
+            let name = match table.get::<mlua::Value>("view")? {
+                mlua::Value::String(name) => name.to_str()?.to_string(),
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "ui.gpu_view needs `view = \"<name>\"`, the host's view, not {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            let label = table.get::<Option<String>>("label")?.unwrap_or_default();
+            table.raw_set("view", mlua::Value::Nil)?;
+            table.raw_set("label", mlua::Value::Nil)?;
+            let node = fill(
+                lua,
+                Node::new(owner(lua)?, Kind::GpuView { label, name }),
                 Some(&table),
             )?;
             node_ud(lua, node)

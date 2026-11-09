@@ -3293,6 +3293,8 @@ export type WebViewProps = Merge<Props, Merge<WebOptions, {
 	on_download: ((d: Download) -> ...unknown)?,
 }>>
 export type TerminalProps = Merge<Props, { term: Term }>
+-- `view`: the name the host set it as (`ScriptHost::gpu_view`).
+export type GpuViewProps = Merge<Props, { view: string, label: string? }>
 -- `from`: only what that plugin (by name) contributes.
 export type SlotProps = Merge<Props, { context: unknown?, from: string? }>
 -- What a plugin targets: an element by its `id` (`"#save"`), declared hook
@@ -3489,6 +3491,8 @@ declare ui: {
 	-- page for `id`, made with `opts` the first time, kept across reloads.
 	web: ((opts: WebOptions?) -> Web) & ((id: string, opts: WebOptions?) -> Web),
 	terminal: (props: TerminalProps) -> Node,
+	-- The host's GPU view (a 3D scene of its own), filling the node.
+	gpu_view: (props: GpuViewProps) -> Node,
 	-- The session for `id`, started the first time; `ui.term(id)` without
 	-- options only looks it up.
 	term: (id: string, opts: TermOptions?) -> Term,

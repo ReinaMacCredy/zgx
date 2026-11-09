@@ -1182,3 +1182,39 @@ fn reserved_commands_publish_their_shortcuts() {
         "reserved commands are menu items too"
     );
 }
+
+#[test]
+fn a_host_gpu_view_shows_where_a_script_names_it_and_goes_when_cleared() {
+    struct Painter;
+    let mut h = Harness::inline(
+        r##"return ui.column { ui.gpu_view { id = "v", view = "scene", w = 40, h = 30 } }"##,
+    );
+    let frame = |h: &mut Harness| {
+        h.ui.prepare_frame();
+        let node = h.find("v").unwrap();
+        let scene = h.ui.scene.borrow();
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            if let zgx::scene::NodeKind::Image(image) = scene.kind(n)
+                && let Some(frame) = image.gpu_frame()
+            {
+                return Some((frame.view, frame.width, frame.height));
+            }
+            stack.extend(scene.children(n).iter().copied());
+        }
+        None
+    };
+    assert_eq!(frame(&mut h), None, "nothing until the host has it");
+    let view = zgx::gpu_view::GpuView::new(Painter);
+    h.host.gpu_view("scene", Some(view.clone()));
+    h.frame();
+    assert_eq!(frame(&mut h), Some((view.id(), 40., 30.)), "{}", h.tree());
+    let other = zgx::gpu_view::GpuView::new(Painter);
+    h.host.gpu_view("scene", Some(other.clone()));
+    h.frame();
+    assert_eq!(frame(&mut h).map(|f| f.0), Some(other.id()));
+    h.host.gpu_view("scene", None);
+    h.frame();
+    assert_eq!(frame(&mut h), None);
+    assert_eq!(h.host.error().get(), None);
+}
