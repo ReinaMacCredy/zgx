@@ -4327,7 +4327,8 @@ fn paragraph_effect<const LOCATING: bool>(
         let mut icons = Vec::new();
         let mut spanned = Vec::new();
         for (index, mut span) in spans.into_iter().enumerate() {
-            if span.text.is_empty() {
+            // An icon alone keeps its room: no text of its own to copy.
+            if span.text.is_empty() && span.extras.as_ref().is_none_or(|e| e.icon.is_none()) {
                 continue;
             }
             let link = span.action.is_some() || span.href.is_some();
@@ -4372,7 +4373,7 @@ fn paragraph_effect<const LOCATING: bool>(
                     href: span.href.clone(),
                 });
             }
-            if link || menu.is_some() {
+            if (link || menu.is_some()) && !span.text.is_empty() {
                 links.push(crate::compose_rich::Link {
                     range: start..content.len(),
                     action: span.action,
@@ -4467,35 +4468,39 @@ fn paragraph_effect<const LOCATING: bool>(
                 });
             }
             let text_end = content.len();
-            runs.push(crate::rich_text::TextRun {
-                background: span.background,
-                underline: {
-                    let underline = span.underline.or(inherited);
-                    match span.underline_color {
-                        None => underline,
-                        Some(crate::theme::Themed::Value(tint)) => underline.map(|d| d.color(tint)),
-                        Some(crate::theme::Themed::Token(token)) => underline.map(|d| {
-                            d.color(
-                                theme
-                                    .get(token)
-                                    .color()
-                                    .unwrap_or(crate::scene::Color(0, 0, 0, 0)),
-                            )
-                        }),
-                    }
-                },
-                strikethrough: span.strikethrough,
-                padding: if lead > 0. {
-                    [0., span.padding[1]]
-                } else {
-                    span.padding
-                },
-                radius: span.radius,
-                range: start..text_end,
-                font: font.clone(),
-                font_size,
-                color,
-            });
+            if text_end > start {
+                runs.push(crate::rich_text::TextRun {
+                    background: span.background,
+                    underline: {
+                        let underline = span.underline.or(inherited);
+                        match span.underline_color {
+                            None => underline,
+                            Some(crate::theme::Themed::Value(tint)) => {
+                                underline.map(|d| d.color(tint))
+                            }
+                            Some(crate::theme::Themed::Token(token)) => underline.map(|d| {
+                                d.color(
+                                    theme
+                                        .get(token)
+                                        .color()
+                                        .unwrap_or(crate::scene::Color(0, 0, 0, 0)),
+                                )
+                            }),
+                        }
+                    },
+                    strikethrough: span.strikethrough,
+                    padding: if lead > 0. {
+                        [0., span.padding[1]]
+                    } else {
+                        span.padding
+                    },
+                    radius: span.radius,
+                    range: start..text_end,
+                    font: font.clone(),
+                    font_size,
+                    color,
+                });
+            }
             if lead > 0. {
                 content.push_str(crate::compose_rich::ICON_PLACEHOLDER);
                 runs.push(crate::rich_text::TextRun {

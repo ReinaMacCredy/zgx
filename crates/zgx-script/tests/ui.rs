@@ -796,6 +796,37 @@ fn a_span_icon_sits_in_the_line_before_its_text() {
 }
 
 #[test]
+fn an_icon_alone_in_a_span_is_drawn_and_never_copied() {
+    use zgx::scene::NodeKind;
+    let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><rect width='12' height='12'/></svg>"#;
+    let mut h = Harness::inline(&format!(
+        r##"return ui.column {{ w = 300, ui.rich {{ id = "p", selectable = true,
+            ui.span {{ "see parse.rs", literal = true }},
+            ui.span {{ "", icon = {{ code = "{svg}", size = 12, gap = 0 }} }},
+            ui.span {{ " and main.rs", literal = true }} }} }}"##
+    ));
+    h.frames(2);
+    let p = h.find("p").unwrap();
+    let drawn = {
+        let scene = h.ui.scene.borrow();
+        let mut stack = vec![p];
+        let mut drawn = None;
+        while let Some(n) = stack.pop() {
+            if let NodeKind::Svg(_) = scene.kind(n) {
+                drawn = Some(scene.bounds(n));
+            }
+            stack.extend(scene.children(n).iter().copied());
+        }
+        drawn
+    };
+    let bounds = drawn.expect("the icon drawn with no text of its own");
+    assert_eq!((bounds.width, bounds.height), (12., 12.));
+    assert!(h.ui.select_all_text(p));
+    assert_eq!(h.ui.selected_text(), "see parse.rs and main.rs");
+    assert_eq!(h.error(), None);
+}
+
+#[test]
 fn a_padded_span_wraps_its_icon_and_text() {
     use zgx::scene::NodeKind;
     let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><rect width='12' height='12'/></svg>"#;
