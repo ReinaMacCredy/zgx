@@ -36,6 +36,11 @@
 //! `--media URL`: the page at URL instead (the smoke's video and audio).
 //! `--unaccelerated`: the page painted on the CPU
 //! (`WebViewOptions::accelerated` false).
+//! `--isolated`: the app's channel, `EVAL` and a script of its own in a world
+//! apart (`WebViewOptions::isolated`). The page titles itself with what its
+//! world finds (`zgx=undefined handler=undefined` when kept out), the app's
+//! script posts `PAGE {"world":"app",…}` with the type of a page global it
+//! can't see, and `EVAL` reads that global's type too.
 use zgx::{
     actions::{Action, KeyBinding, Keymap, Keystroke},
     compose::prelude::*,
@@ -115,10 +120,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `--transparent`: a page with no background of its own, over
             // its box's yellow.
             let transparent = std::env::args().any(|arg| arg == "--transparent");
+            let isolated = std::env::args().any(|arg| arg == "--isolated");
             let options = WebViewOptions {
                 transparent,
                 inspectable: true,
                 accelerated: !std::env::args().any(|arg| arg == "--unaccelerated"),
+                isolated: isolated.then(|| {
+                    vec![zgx::web_view::UserScript {
+                        source: "document.addEventListener('DOMContentLoaded', () => window.zgx.postMessage({ world: 'app', page_global: typeof window.probePageGlobal, title: document.title }));".into(),
+                        main_frame_only: true,
+                    }]
+                }),
                 ..Default::default()
             };
             let web = WebView::new(&cx.ui.runtime, options);
@@ -130,18 +142,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 web.load_url(url);
             } else {
-                let page = if transparent {
+                let mut page = if transparent {
                     PAGE.replace("background: rgb(0, 0, 255)", "background: transparent")
                 } else {
                     PAGE.into()
                 };
+                if isolated {
+                    page = page.replacen(
+                        "const post =",
+                        "window.probePageGlobal = 1; document.title = 'probe page zgx=' + typeof window.zgx + ' handler=' + typeof (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.zgx);\nconst post =",
+                        1,
+                    );
+                }
                 web.load_html(page, Some("https://probe.zgx.test/"));
             }
             let evaluate = web.clone();
             let events = web.on_event(move |event| match event {
                 WebViewEvent::NavigationFinished { url } => {
                     println!("FINISHED {url}");
-                    evaluate.evaluate_js("document.title + ' ' + (1 + 2)", |result| match result {
+                    let script = if isolated {
+                        "document.title + ' ' + (1 + 2) + ' page_global=' + typeof window.probePageGlobal"
+                    } else {
+                        "document.title + ' ' + (1 + 2)"
+                    };
+                    evaluate.evaluate_js(script, |result| match result {
                         Ok(json) => println!("EVAL {json}"),
                         Err(error) => println!("EVAL error {error}"),
                     });

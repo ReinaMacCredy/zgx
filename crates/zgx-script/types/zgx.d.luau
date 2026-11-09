@@ -1313,6 +1313,9 @@ declare extern type Web with
 	-- macOS in WebKit's window over the screen, elsewhere filling the page's
 	-- node, which an app grows to show it so.
 	full_screen: boolean
+	-- The app's scripts, `run`, `eval` and `window.zgx` are in a world of
+	-- their own (`isolated`), on a platform that has one (macOS).
+	isolated: boolean
 	-- The pointer over the page, in points from its top left; nil outside.
 	-- (Over a page zgx hears no pointer moves: its nodes had their leave.)
 	pointer: { x: number, y: number }?
@@ -1354,6 +1357,12 @@ export type WebOptions = {
 	-- Linux: false paints pages on the CPU, uploading only what changed
 	-- (no backdrop-filter, no 3D perspective). macOS and Windows ignore it.
 	accelerated: boolean?,
+	-- macOS: the app's side of the page in a JavaScript world of its own:
+	-- these scripts (run at document start, before the page's), `run`,
+	-- `eval` and `window.zgx` share the page's DOM, never its globals, and
+	-- the page's scripts can't post. Elsewhere the channel stays in the
+	-- page's world and the scripts don't run (`web.isolated` is false).
+	isolated: (boolean | { string })?,
 	[number]: never,
 }
 export type WebEvent = { kind: "started" | "committed" | "finished" | "failed" | "changed", url: string }
@@ -1399,7 +1408,7 @@ declare extern type Term with
 	columns: number
 	rows: number
 	-- What's selected in it once a drag (or Select All) ends; nil once
-	-- nothing is.
+	-- nothing is, a click or a typed key ending it.
 	selection: string?
 	-- The pointer over it, in points from its top left; nil outside.
 	pointer: { x: number, y: number }?
@@ -18126,6 +18135,12 @@ export type WebViewProps = {
 	-- Linux: false paints pages on the CPU, uploading only what changed
 	-- (no backdrop-filter, no 3D perspective). macOS and Windows ignore it.
 	accelerated: boolean?,
+	-- macOS: the app's side of the page in a JavaScript world of its own:
+	-- these scripts (run at document start, before the page's), `run`,
+	-- `eval` and `window.zgx` share the page's DOM, never its globals, and
+	-- the page's scripts can't post. Elsewhere the channel stays in the
+	-- page's world and the scripts don't run (`web.isolated` is false).
+	isolated: (boolean | { string })?,
 	[number]: never,
 	-- A `ui.web()` controller, so the page outlives the node; the options
 	-- above make one otherwise.

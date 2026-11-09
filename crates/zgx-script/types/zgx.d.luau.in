@@ -1306,6 +1306,9 @@ declare extern type Web with
 	-- macOS in WebKit's window over the screen, elsewhere filling the page's
 	-- node, which an app grows to show it so.
 	full_screen: boolean
+	-- The app's scripts, `run`, `eval` and `window.zgx` are in a world of
+	-- their own (`isolated`), on a platform that has one (macOS).
+	isolated: boolean
 	-- The pointer over the page, in points from its top left; nil outside.
 	-- (Over a page zgx hears no pointer moves: its nodes had their leave.)
 	pointer: { x: number, y: number }?
@@ -1322,6 +1325,12 @@ declare extern type Web with
 	function exit_full_screen(self): ()
 	function zoom(self, zoom: number): ()
 	function run(self, js: string): ()
+	-- Each navigation, asked first: `false` refuses it. `kind`: "link",
+	-- "form", "back_forward", "reload", "form_resubmission" or "other".
+	function decide_navigation(
+		self,
+		decide: ((request: { url: string, main_frame: boolean, kind: string, source_url: string }) -> boolean?)?
+	): ()
 	-- The script's value as Luau data (JSON's shape, whatever the page
 	-- returns: `any`), or nil and the error.
 	function eval(self, js: string, reply: ((value: any, err: string?) -> ...unknown)?): ()
@@ -1341,6 +1350,12 @@ export type WebOptions = {
 	-- Linux: false paints pages on the CPU, uploading only what changed
 	-- (no backdrop-filter, no 3D perspective). macOS and Windows ignore it.
 	accelerated: boolean?,
+	-- macOS: the app's side of the page in a JavaScript world of its own:
+	-- these scripts (run at document start, before the page's), `run`,
+	-- `eval` and `window.zgx` share the page's DOM, never its globals, and
+	-- the page's scripts can't post. Elsewhere the channel stays in the
+	-- page's world and the scripts don't run (`web.isolated` is false).
+	isolated: (boolean | { string })?,
 	[number]: never,
 }
 export type WebEvent = { kind: "started" | "committed" | "finished" | "failed" | "changed", url: string }
@@ -1385,6 +1400,9 @@ declare extern type Term with
 	exited: number?
 	columns: number
 	rows: number
+	-- What's selected in it once a drag (or Select All) ends; nil once
+	-- nothing is, a click or a typed key ending it.
+	selection: string?
 	-- The pointer over it, in points from its top left; nil outside.
 	pointer: { x: number, y: number }?
 	function focus(self): ()
@@ -1455,6 +1473,9 @@ export type CommandOptions = {
 	-- a focused web page or terminal, which otherwise get each key first
 	-- (as a browser keeps ⌘T from its pages). Not a plugin's to set.
 	reserved: boolean?,
+	-- Out of the menus, and its key with it, while true: a state or a
+	-- function saying it follows what it reads (a feature turned off).
+	hidden: (boolean | State<boolean> | (() -> boolean?))?,
 	run: (() -> ...unknown)?,
 	-- A separator line in `menu` instead of a command.
 	separator: boolean?,
@@ -1545,6 +1566,10 @@ declare extern type WindowApi with
 	controls: State<WindowRect?>
 	zoom: State<number>
 	zoomable: State<boolean>
+	-- Whether a mouse wheel's notches glide in (true, the default) or each
+	-- steps at once: an app's smooth scrolling setting, off under reduced
+	-- motion. Trackpads are continuous either way.
+	smooth_scrolling: State<boolean>
 	-- Whether the app's window shows: false while zgx.json's `"visible":
 	-- false` keeps it hidden (laid out and drawn meanwhile); setting it true
 	-- shows the window whole, at once.
@@ -2448,7 +2473,8 @@ export type SpanProps = {
 	-- An icon before the text, in the line (a file chip's file type):
 	-- `src` (a file, `https://…`) or `code` (SVG markup), `size` square
 	-- (12), `gap` from the text (4), centred on the line; `tint` a colour,
-	-- or `"currentColor"` for the span's.
+	-- or `"currentColor"` for the span's. A span of no text with an icon
+	-- is the icon alone: nothing of it is copied or read out.
 	icon: {
 		src: string?,
 		code: string?,

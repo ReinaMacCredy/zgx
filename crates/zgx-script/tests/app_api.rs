@@ -740,6 +740,38 @@ fn a_page_asks_the_script_before_each_navigation_and_its_kind_is_told() {
 }
 
 #[test]
+fn a_page_can_keep_the_apps_scripts_in_a_world_of_their_own() {
+    use zgx::web_view::UserScript;
+    let mut h = Harness::inline(
+        r##"local web = ui.web("w1", { isolated = { "window.zgx.postMessage(1)" } })
+        local plain = ui.web("w2", {})
+        return ui.column {
+            ui.webview { web = web, w = 200, h = 100 },
+            ui.text { id = "isolated", tostring(web.isolated) .. " " .. tostring(plain.isolated) },
+        }"##,
+    );
+    let web = page(&mut h);
+    assert_eq!(
+        web.options().isolated.as_deref(),
+        Some(
+            &[UserScript {
+                source: "window.zgx.postMessage(1)".into(),
+                main_frame_only: true,
+            }][..]
+        )
+    );
+    assert_eq!(
+        h.text("isolated"),
+        if cfg!(target_os = "macos") {
+            "true false"
+        } else {
+            "false false"
+        }
+    );
+    assert_eq!(h.error(), None);
+}
+
+#[test]
 fn an_element_takes_focus_when_asked() {
     let mut h = Harness::inline(
         r##"local field = nil

@@ -323,6 +323,17 @@ pub struct WebViewOptions {
     pub new_windows: bool,
     /// Scripts injected at document start, in order, before the page's own.
     pub scripts: Vec<UserScript>,
+    /// The app's side of the page in a JavaScript world of its own (macOS 11
+    /// and later: a `WKContentWorld`). These scripts, run at document start
+    /// before the page's own, the message channel (`window.zgx`) and
+    /// [`WebView::evaluate_js`] share the page's DOM but none of its
+    /// globals, and the page's own scripts find no `window.zgx` nor its
+    /// WebKit handler, so they can neither post to the app nor hook what the
+    /// app's scripts use. `None` keeps one world, the page's. Where the
+    /// platform has no such world (WebKitGTK and WebView2 so far) an
+    /// isolated view keeps its channel in the page's world and these scripts
+    /// don't run; [`WebView::isolated`] says which.
+    pub isolated: Option<Vec<UserScript>>,
     /// Schemes the app serves itself. On macOS each page served this way is
     /// its own origin and, like `https`, a secure context.
     pub schemes: Vec<SchemeHandler>,
@@ -347,6 +358,7 @@ impl Default for WebViewOptions {
             messages: true,
             new_windows: true,
             scripts: Vec::new(),
+            isolated: None,
             schemes: Vec::new(),
             accelerated: true,
         }
@@ -735,6 +747,11 @@ impl WebView {
     pub fn options(&self) -> &WebViewOptions {
         &self.0.options
     }
+    /// The app's side runs in a world of its own
+    /// ([`WebViewOptions::isolated`]): asked for, on a platform that has one.
+    pub fn isolated(&self) -> bool {
+        self.0.options.isolated.is_some() && cfg!(target_os = "macos")
+    }
     /// A reference that doesn't keep the controller alive.
     pub fn downgrade(&self) -> WeakWebView {
         WeakWebView(Rc::downgrade(&self.0))
@@ -876,7 +893,8 @@ impl WebView {
     pub fn forward_list(&self) -> Vec<HistoryItem> {
         self.0.state.with(|state| state.forward_list.clone())
     }
-    /// Evaluate `script` in the page; `reply` gets its result as JSON (an
+    /// Evaluate `script` in the page (in the app's own world when
+    /// [`WebView::isolated`]); `reply` gets its result as JSON (an
     /// `undefined` result is `null`), on the UI thread at a safe point.
     pub fn evaluate_js(
         &self,
