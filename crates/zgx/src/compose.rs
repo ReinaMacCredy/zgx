@@ -475,6 +475,8 @@ pub struct View {
 type Decorations = Vec<(std::ops::Range<usize>, crate::scene::Color)>;
 /// Ranges of a text underlined (`View::underlines`).
 type Underlines = Vec<crate::widgets::EditorUnderline>;
+/// Ranges of a text drawn as chips (`View::chips`).
+type Chips = Vec<crate::widgets::EditorChip>;
 /// What a code editor adds to a text area: its lines' colours, ranges
 /// marked behind its text, its current line and what Tab inserts.
 #[derive(Default)]
@@ -482,6 +484,7 @@ pub(crate) struct CodeOptions {
     highlighter: Option<crate::widgets::SpanHighlighter>,
     decorations: Option<Box<dyn FnMut() -> Decorations>>,
     underlines: Option<Box<dyn FnMut() -> Underlines>>,
+    chips: Option<Box<dyn FnMut() -> Chips>>,
     current_line: Option<Box<dyn FnMut() -> Option<crate::scene::Color>>>,
     indent: Option<String>,
     on_caret: Option<Box<dyn FnMut(crate::widgets::Caret)>>,
@@ -1727,6 +1730,14 @@ impl View {
         ranges: impl FnMut() -> Vec<crate::widgets::EditorUnderline> + 'static,
     ) -> Self {
         self.code_mut().underlines = Some(Box::new(ranges));
+        self
+    }
+    /// Ranges of a text area's text drawn as chips: a rounded fill behind
+    /// each row the range runs on and an icon at its start (a mention whose
+    /// label the text pads with spaces for it), kept current as what
+    /// `ranges` reads changes. Only those in view are drawn.
+    pub fn chips(mut self, ranges: impl FnMut() -> Chips + 'static) -> Self {
+        self.code_mut().chips = Some(Box::new(ranges));
         self
     }
     /// A colour behind a text area's caret row (a code editor's current
@@ -5579,6 +5590,7 @@ fn open_element(
                 highlighter,
                 decorations,
                 underlines,
+                chips,
                 current_line,
                 indent,
                 on_caret,
@@ -5612,6 +5624,10 @@ fn open_element(
             if let Some(mut ranges) = underlines {
                 let editor = editor.clone();
                 ui.bind(root, move || editor.set_underlines(ranges()));
+            }
+            if let Some(mut ranges) = chips {
+                let editor = editor.clone();
+                ui.bind(root, move || editor.set_chips(ranges()));
             }
             if let Some(mut color) = current_line {
                 let editor = editor.clone();

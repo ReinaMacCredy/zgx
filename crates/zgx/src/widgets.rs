@@ -350,6 +350,41 @@ pub struct EditorUnderline {
     /// How it is drawn.
     pub line: crate::rich_text::LineStyle,
 }
+/// A range of an editor's text drawn as a chip (`EditorHandle::set_chips`):
+/// `fill` behind each row it runs on, `inset` in from the row's top and
+/// bottom, its corners `radius`; and `icon` at its first row's start.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorChip {
+    /// Its UTF-8 byte range.
+    pub range: std::ops::Range<usize>,
+    /// The fill behind it (none: only its icon).
+    pub fill: Option<Color>,
+    /// The fill's corner radius.
+    pub radius: f32,
+    /// How far the fill sits in from its row's top and bottom.
+    pub inset: f32,
+    /// An icon at its start.
+    pub icon: Option<EditorChipIcon>,
+}
+/// A chip's icon: `svg` (tinted as it is to be shown), `size` points
+/// square, `x` points in from the chip's start, centred on its row.
+#[derive(Clone, Debug)]
+pub struct EditorChipIcon {
+    /// The picture.
+    pub svg: std::sync::Arc<crate::svg::SvgData>,
+    /// Its side.
+    pub size: f32,
+    /// How far in from the chip's start.
+    pub x: f32,
+}
+impl PartialEq for EditorChipIcon {
+    fn eq(&self, other: &Self) -> bool {
+        self.svg.source_id() == other.svg.source_id()
+            && self.svg.tint() == other.svg.tint()
+            && self.size == other.size
+            && self.x == other.x
+    }
+}
 /// A row's underline, `width` points long, as what a canvas draws: shapes
 /// and lines, drawn without a raster.
 fn underline_canvas(
@@ -452,6 +487,11 @@ struct CodeHint {
     decorations: RefCell<Vec<(std::ops::Range<usize>, Color)>>,
     /// Ranges of the text underlined, by where they start.
     underlines: RefCell<Vec<EditorUnderline>>,
+    /// Ranges of the text drawn as chips, by where they start, and what
+    /// draws them: a layer behind the text, its fills and icons.
+    chips: RefCell<Vec<EditorChip>>,
+    chip_layer: Cell<Option<NodeId>>,
+    chip_nodes: RefCell<Vec<NodeId>>,
     /// What draws them: a node a row of each, what each shows, and so
     /// only what changed is made again.
     underline_nodes: RefCell<Vec<(NodeId, UnderlineDrawn)>>,
@@ -953,6 +993,16 @@ impl EditorHandle {
             return;
         }
         *code.underlines.borrow_mut() = ranges;
+        self.refresh();
+    }
+    /// Draw `chips` (`EditorChip`): only those in view are drawn.
+    pub fn set_chips(&self, mut chips: Vec<EditorChip>) {
+        chips.sort_by_key(|chip| chip.range.start);
+        let code = self.hint.code_made();
+        if *code.chips.borrow() == chips {
+            return;
+        }
+        *code.chips.borrow_mut() = chips;
         self.refresh();
     }
     /// Call `told` with where the caret is whenever it moves or the
@@ -5687,6 +5737,70 @@ impl Ui {
                     let radius = theme.number_untracked(tok::MARK_RADIUS);
                     show_decorations(&mut s, code, size, (shaped, ends), radius);
                 }
+                // Chips behind the text: a fill a row, an icon at each start.
+                let mut drawn: Vec<(Rect, NodeKind)> = Vec::new();
+                for chip in code.chips.borrow().iter() {
+                    let rows = layout.selection_within(
+                        chip.range.clone(),
+                        scroll.1 - line_height,
+                        scroll.1 + inner_height + line_height,
+                    );
+                    for (k, r) in rows.into_iter().enumerate() {
+                        let (x, y) = (r.x - scroll.0, r.y - scroll.1);
+                        if let Some(fill) = chip.fill {
+                            let quad = crate::scene::QuadStyle {
+                                fill,
+                                radius: chip.radius,
+                                ..Default::default()
+                            };
+                            let height = (r.height - 2. * chip.inset).max(0.);
+                            drawn.push((
+                                Rect::new(x, y + chip.inset, r.width, height),
+                                NodeKind::Quad(quad),
+                            ));
+                        }
+                        if let (0, Some(icon)) = (k, &chip.icon) {
+                            let top = y + (r.height - icon.size) / 2.;
+                            drawn.push((
+                                Rect::new(x + icon.x, top, icon.size, icon.size),
+                                NodeKind::Svg(icon.svg.clone()),
+                            ));
+                        }
+                    }
+                }
+                if !drawn.is_empty() && code.chip_layer.get().is_none_or(|l| !s.contains(l)) {
+                    let layer = s.append(
+                        viewport,
+                        NodeKind::Container(Layout::Overlay),
+                        Style::default(),
+                    );
+                    let mut order = s.children(viewport).to_vec();
+                    order.retain(|id| *id != layer);
+                    let at = order
+                        .iter()
+                        .position(|id| *id == selection_layer)
+                        .unwrap_or(0);
+                    order.insert(at, layer);
+                    s.reorder_children(viewport, &order);
+                    code.chip_layer.set(Some(layer));
+                    code.chip_nodes.borrow_mut().clear();
+                }
+                let mut nodes = code.chip_nodes.borrow_mut();
+                while nodes.len() > drawn.len() {
+                    s.remove(nodes.pop().unwrap());
+                }
+                if let Some(layer) = code.chip_layer.get() {
+                    for (k, (rect, kind)) in drawn.into_iter().enumerate() {
+                        if k == nodes.len() {
+                            nodes.push(s.append(layer, kind, Style::default()));
+                        } else if *s.kind(nodes[k]) != kind {
+                            s.set_kind(nodes[k], kind);
+                        }
+                        s.set_style(nodes[k], fixed(rect.width.max(1.), rect.height));
+                        s.set_transform(nodes[k], Transform { x: rect.x, y: rect.y });
+                    }
+                }
+                drop(nodes);
                 // Under the text in view, each row of a range a node.
                 let underlines = code.underlines.borrow();
                 let mut rows: Vec<(Rect, Color, crate::rich_text::LineStyle)> = Vec::new();

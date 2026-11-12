@@ -1399,6 +1399,9 @@ pub(crate) struct CodeProps {
     /// `underlines`: a state or function of `{ { from, to, color,
     /// style = } }`.
     pub underlines: Option<Readable>,
+    /// `chips`: a state or function of `{ { from, to, bg =, radius =,
+    /// inset =, icon =, icon_size =, icon_color =, icon_x = } }`.
+    pub chips: Option<Readable>,
     /// `current_line`: the colour behind the caret's row.
     pub current_line: Option<Source>,
     /// `tab`: what Tab inserts (`"    "`), indenting selected lines.
@@ -3294,6 +3297,7 @@ const WIDGET_FIELDS: &[&str] = &[
     "highlight",
     "decorations",
     "underlines",
+    "chips",
     "find",
     "current_line",
     "tab",
@@ -5171,6 +5175,15 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                                 )
                             })?)),
                         };
+                        let chips = match table.raw_get::<mlua::Value>("chips")? {
+                            mlua::Value::Nil => None,
+                            mlua::Value::Function(f) => Some(Readable::Function(f)),
+                            v => Some(Readable::State(state_of(&v).ok_or_else(|| {
+                                mlua::Error::runtime(
+                                    "`chips` must be a ui.state or a function of ranges",
+                                )
+                            })?)),
+                        };
                         let current_line = optional("current_line", Ty::Color)?;
                         let tab = table.raw_get::<Option<String>>("tab")?;
                         let on_caret = table.raw_get::<Option<Function>>("on_caret")?;
@@ -5201,6 +5214,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                         (highlight.is_some()
                             || decorations.is_some()
                             || underlines.is_some()
+                            || chips.is_some()
                             || current_line.is_some()
                             || tab.is_some()
                             || on_caret.is_some()
@@ -5211,6 +5225,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                                 highlight,
                                 decorations,
                                 underlines,
+                                chips,
                                 current_line,
                                 tab,
                                 on_caret,

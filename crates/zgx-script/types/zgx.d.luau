@@ -7801,6 +7801,11 @@ export type InputProps = {
 	-- Ranges underlined: `{ { from = 1, to = 5, style = "wavy" } }`, a
 	-- spelling mistake's or a diagnostic's.
 	underlines: (State<any> | (() -> { { any } }))?,
+	-- Ranges drawn as chips behind the text: `{ { from = 1, to = 5, bg =
+	-- "$accent", radius = 5, inset = 1.5, icon = src, icon_size = 14,
+	-- icon_color = "$accent", icon_x = 4 } }`, a fill a row and the icon at
+	-- the start (a mention whose label the text pads with spaces).
+	chips: (State<any> | (() -> { { any } }))?,
 	-- Several lines only: a search's matches marked behind the text, found
 	-- by the editor where the text is held; `current` (from 1) stronger.
 	find: {

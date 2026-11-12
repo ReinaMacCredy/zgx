@@ -939,6 +939,63 @@ fn a_text_area_underlines_its_ranges_in_view_and_follows_them() {
 }
 
 #[test]
+fn a_text_area_draws_its_chips_behind_the_text_and_follows_them() {
+    use zgx::scene::NodeKind;
+    let mut h = Harness::inline(
+        r##"local chips = ui.state("chips", { { from = 7, to = 11, bg = "#ff0010", radius = 5, inset = 1.5,
+            icon = "code:<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 2'><rect width='2' height='2'/></svg>",
+            icon_size = 10, icon_x = 2 } })
+        return ui.column {
+            ui.button { id = "clear", on_click = function() chips:set({}) end, "Clear" },
+            ui.button { id = "two", "Two", on_click = function()
+                chips:set({ { from = 1, to = 5, bg = "#ff0010", radius = 5 }, { from = 7, to = 11, bg = "#00ff10" } })
+            end },
+            ui.textarea { id = "code", value = ui.state("text", "hello world"),
+                w = 300, h = 100, chips = chips },
+        }"##,
+    );
+    h.frames(2);
+    let drawn = |h: &mut Harness| {
+        let node = h.find("code").unwrap();
+        let scene = h.ui.scene.borrow();
+        let mut stack = vec![node];
+        let (mut fills, mut icons) = (Vec::new(), Vec::new());
+        while let Some(n) = stack.pop() {
+            match scene.kind(n) {
+                NodeKind::Quad(q) if q.fill == zgx::scene::Color(255, 0, 16, 255)
+                    || q.fill == zgx::scene::Color(0, 255, 16, 255) =>
+                {
+                    fills.push((q.radius, scene.bounds(n)));
+                }
+                NodeKind::Svg(_) => icons.push(scene.bounds(n)),
+                _ => {}
+            }
+            stack.extend(scene.children(n).iter().copied());
+        }
+        (fills, icons)
+    };
+    let (fills, icons) = drawn(&mut h);
+    assert_eq!(fills.len(), 1, "a range, a row");
+    assert_eq!(icons.len(), 1, "its icon at its start");
+    let (radius, fill) = fills[0];
+    assert_eq!(radius, 5.);
+    assert_eq!((icons[0].x - fill.x, icons[0].width), (2., 10.), "the icon in from the start");
+    assert!(
+        (icons[0].y + 5. - (fill.y + fill.height / 2.)).abs() < 0.01,
+        "centred on the row"
+    );
+    h.click("two");
+    h.frames(2);
+    let (fills, icons) = drawn(&mut h);
+    assert_eq!((fills.len(), icons.len()), (2, 0));
+    h.click("clear");
+    h.frames(2);
+    let (fills, icons) = drawn(&mut h);
+    assert_eq!((fills.len(), icons.len()), (0, 0), "and they go");
+    assert_eq!(h.host.error().get(), None);
+}
+
+#[test]
 #[should_panic(expected = "unknown `underline_style` `squiggly`")]
 fn an_unknown_underline_style_says_which_there_are() {
     Harness::inline(r#"return ui.rich { ui.span { "a", underline_style = "squiggly" } }"#);

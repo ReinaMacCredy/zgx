@@ -3192,7 +3192,7 @@ fn kind_view(
                     Some(theme) => theme,
                     None => zgx::theme::Themes::of(&low.runtime).root().clone(),
                 };
-                view = code_editor(view, code, searched, vm, theme);
+                view = code_editor(view, code, searched, vm, theme, low.assets.clone());
             }
             view
         }
@@ -5032,6 +5032,23 @@ fn no_svg() -> Arc<SvgData> {
     }
     NOTHING.with(Clone::clone)
 }
+/// A chip's icon (`code:` source or a file), kept as pictures are; none for
+/// one that can't be had.
+fn chip_svg(vm: &Vm, assets: &Assets, src: &str) -> Option<Arc<SvgData>> {
+    if let Some(svg) = assets.svg(src) {
+        return Some(svg);
+    }
+    let bytes = match src.strip_prefix("code:") {
+        Some(code) => code.as_bytes().to_vec(),
+        None => {
+            let path = resolve_path(vm, src).ok()?;
+            assets.read(src, &path).ok()?
+        }
+    };
+    let svg = Arc::new(SvgData::new(bytes).ok()?);
+    assets.keep_svg(src.to_owned(), svg.clone());
+    Some(svg)
+}
 fn load_svg(vm: &Rc<Vm>, low: &Lowering, src: &str) -> Arc<SvgData> {
     if let Some(svg) = low.assets.svg(src) {
         return svg;
@@ -5922,6 +5939,7 @@ fn code_editor(
     searched: Option<Signal<Value>>,
     vm: &Rc<Vm>,
     theme: Rc<zgx::theme::ThemeScope>,
+    assets: Rc<Assets>,
 ) -> View {
     // A colour as scripts write them (`"#ff8800"`, `"$accent"`), each
     // distinct one parsed once while the theme's tokens stay the same: a
@@ -6052,6 +6070,7 @@ fn code_editor(
     // Ranges a script gives (`decorations`), and a search's matches
     // (`find`), found where the text is held.
     let underline_colors = color_of.clone();
+    let chip_colors = color_of.clone();
     let given = code.decorations.clone().map(|decorations| {
         let vm = vm.clone();
         let default = theme.clone();
@@ -6173,6 +6192,54 @@ fn code_editor(
                     range: from as usize - 1..to as usize,
                     color,
                     line,
+                });
+            }
+            out
+        });
+    }
+    if let Some(chips) = code.chips.clone() {
+        let (vm, color_of) = (vm.clone(), chip_colors);
+        view = view.chips(move || {
+            let list = match &chips {
+                crate::node::Readable::State(state) => {
+                    state.with(|value| crate::value::to_lua(value, &vm.lua, false).ok())
+                }
+                crate::node::Readable::Function(f) => vm.call::<mlua::Value>(f, ()).ok(),
+            };
+            let Some(mlua::Value::Table(list)) = list else {
+                return Vec::new();
+            };
+            let mut out = Vec::with_capacity(list.raw_len());
+            for span in list.sequence_values::<mlua::Table>().flatten() {
+                let number = |name: &str, at: usize| {
+                    (span.raw_get::<Option<f64>>(name).ok().flatten())
+                        .or_else(|| span.raw_get::<Option<f64>>(at).ok().flatten())
+                };
+                let (Some(from), Some(to)) = (number("from", 1), number("to", 2)) else {
+                    continue;
+                };
+                if from < 1. || to < from {
+                    continue;
+                }
+                let text = |name: &str| span.raw_get::<Option<String>>(name).ok().flatten();
+                let icon = text("icon").and_then(|src| {
+                    let svg = chip_svg(&vm, &assets, &src)?;
+                    let svg = match text("icon_color").and_then(|c| color_of(&c)) {
+                        Some(color) => Arc::new(svg.tinted(color)),
+                        None => svg,
+                    };
+                    Some(zgx::widgets::EditorChipIcon {
+                        svg,
+                        size: number("icon_size", 0).unwrap_or(14.) as f32,
+                        x: number("icon_x", 0).unwrap_or(0.) as f32,
+                    })
+                });
+                out.push(zgx::widgets::EditorChip {
+                    range: from as usize - 1..to as usize,
+                    fill: text("bg").and_then(|c| color_of(&c)),
+                    radius: number("radius", 0).unwrap_or(0.) as f32,
+                    inset: number("inset", 0).unwrap_or(0.) as f32,
+                    icon,
                 });
             }
             out
