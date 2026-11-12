@@ -450,6 +450,8 @@ struct PortalOptions {
     /// `View::at_caret`: placed at the caret of the editor in its trigger,
     /// focus left there.
     at_caret: bool,
+    /// `View::keep_focus`: placed as anchored, focus left where it was.
+    keep_focus: bool,
 }
 /// A declarative view: a node to mount, its styles, children, handlers and
 /// semantics. Built with the functions here ([`column()`], [`text()`],
@@ -987,6 +989,13 @@ impl View {
     /// outside it pass through, and close it only as the app says (`open`).
     pub fn at_caret(mut self) -> Self {
         self.rare_mut().portal.get_or_insert_default().at_caret = true;
+        self
+    }
+    /// A popover placed at its trigger's box, as any is, that takes no focus,
+    /// as `View::at_caret`'s doesn't: an editor's suggestions over the whole
+    /// composer, its keys still driving them.
+    pub fn keep_focus(mut self) -> Self {
+        self.rare_mut().portal.get_or_insert_default().keep_focus = true;
         self
     }
     /// A non-modal layer over the window (toasts, a heads-up): a modal view
@@ -3812,7 +3821,7 @@ fn mount_portal_panel(
     // modal: it has no backdrop, and closes nothing as it opens.
     let overlay_only = (view.rare.as_ref())
         .and_then(|r| r.portal.as_ref())
-        .is_some_and(|p| p.layer || p.at_caret);
+        .is_some_and(|p| p.layer || p.at_caret || p.keep_focus);
     if !anchored && !overlay_only {
         // The theme's backdrop, following it.
         let (scene, theme, overlay) = (ui.scene.clone(), ui.theme_scope(), portal.overlay);
@@ -3870,7 +3879,7 @@ fn mount_portal_panel(
     // At an editor's caret: placed there, and focus left in the editor, as
     // a layer leaves it.
     let at_caret = options.is_some_and(|p| p.at_caret);
-    let keeps_focus = is_layer || at_caret;
+    let keeps_focus = is_layer || at_caret || options.is_some_and(|p| p.keep_focus);
     // A layer's panel is only what it holds; a dialog's or menu's is a card.
     let mut defaults = if is_layer {
         Styles::new()

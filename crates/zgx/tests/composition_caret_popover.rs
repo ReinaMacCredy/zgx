@@ -166,3 +166,32 @@ fn the_editor_tells_which_suggestion_it_is_on() {
     c.ui.prepare_frame();
     assert_eq!(active(&c), None);
 }
+
+#[test]
+fn a_popover_at_its_trigger_can_leave_focus_in_the_editor() {
+    let mut ui = Ui::new(500., 400.);
+    let value = ui.signal(String::new());
+    let open = ui.signal(false);
+    let view = ui.mount(
+        column().p(20.).child(
+            popover(
+                "Mentions",
+                open.clone(),
+                column()
+                    .id("pill")
+                    .size(300., 80.)
+                    .child(text_area("Message", value).id("composer").size(280., 60.)),
+            )
+            .keep_focus()
+            .size(120., 40.),
+        ),
+    );
+    let editor = view.find("composer").unwrap();
+    assert!(ui.input.focus(&ui.scene, Some(editor)));
+    open.set(true);
+    ui.prepare_frame();
+    assert_eq!(ui.input.focused(), Some(editor));
+    ui.dispatch(InputEvent::Text("/re".into()));
+    ui.prepare_frame();
+    assert_eq!(ui.editor(editor).unwrap().editor.borrow().text(), "/re");
+}

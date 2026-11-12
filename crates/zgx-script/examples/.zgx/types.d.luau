@@ -16949,6 +16949,8 @@ export type PopoverProps = {
 	-- and taking no focus: keys go on to the input, which drives it (a
 	-- mention's suggestions). It closes as `open` says.
 	at_caret: boolean?,
+	-- A popover only: at its anchor as any, taking no focus, as `at_caret`'s.
+	keep_focus: boolean?,
 }
 -- `ui.menu_item { "Copy", on_click = … }`: the label first.
 -- The label (`{ "Copy" }`), or `label` with content of its own after it

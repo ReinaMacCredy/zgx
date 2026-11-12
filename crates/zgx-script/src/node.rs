@@ -1168,6 +1168,8 @@ pub(crate) enum Kind {
         /// `at_caret = true`: at the caret of the editor in its anchor,
         /// focus left there (`View::at_caret`).
         at_caret: bool,
+        /// `keep_focus = true`: focus left where it was (`View::keep_focus`).
+        keep_focus: bool,
     },
     Menu {
         label: String,
@@ -3361,6 +3363,7 @@ const LATE_FIELDS: &[&str] = &[
     "end_distance",
     "active_descendant",
     "at_caret",
+    "keep_focus",
     "on_start",
     "start_distance",
     "at_end",
@@ -3535,6 +3538,11 @@ fn late_field(lua: &Lua, node: &mut Node, name: &str, value: mlua::Value) -> mlu
         "at_caret" => {
             if let Kind::Popover { at_caret, .. } = &mut node.kind {
                 *at_caret = lua.unpack::<Option<bool>>(value)?.unwrap_or(false);
+            }
+        }
+        "keep_focus" => {
+            if let Kind::Popover { keep_focus, .. } = &mut node.kind {
+                *keep_focus = lua.unpack::<Option<bool>>(value)?.unwrap_or(false);
             }
         }
         "private" => node.private = lua.unpack(value)?,
@@ -5686,6 +5694,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                         match_anchor,
                         // Set as `fill` walks the table (`late_field`).
                         at_caret: false,
+                        keep_focus: false,
                     }
                 };
                 let mut node = fill(lua, Node::new(owner(lua)?, kind), Some(&table))?;

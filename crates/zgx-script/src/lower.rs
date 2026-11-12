@@ -3499,6 +3499,7 @@ fn kind_view(
             dismiss,
             match_anchor,
             at_caret,
+            keep_focus,
         } => {
             let view = popover(
                 label.clone(),
@@ -3525,6 +3526,7 @@ fn kind_view(
                 view
             };
             let view = if *at_caret { view.at_caret() } else { view };
+            let view = if *keep_focus { view.keep_focus() } else { view };
             match placement {
                 Some(at) => view.placement(*at),
                 None => view,
