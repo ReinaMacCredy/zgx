@@ -358,7 +358,7 @@ fn select_all_and_presses_elsewhere() {
 }
 
 #[test]
-fn links_and_buttons_inside_click_and_a_drag_from_one_selects() {
+fn buttons_inside_click_and_a_drag_from_one_neither_clicks_nor_selects() {
     let mut ui = Ui::new(400., 300.);
     let clicks = Rc::new(Cell::new(0));
     let counted = clicks.clone();
@@ -378,14 +378,15 @@ fn links_and_buttons_inside_click_and_a_drag_from_one_selects() {
     release(&mut ui, x, y);
     assert_eq!(clicks.get(), 1);
     assert!(!ui.has_text_selection());
-    // A drag from it selects, and it does not activate.
+    // A drag from it is the button's (as a Mac button's): it selects
+    // nothing, and let go away from it, it does not activate.
     press(&mut ui, x, y, false);
     move_to(&mut ui, x + 2., y);
     assert!(!ui.has_text_selection(), "within the press's slop");
     move_to(&mut ui, 200., 290.);
     release(&mut ui, 200., 290.);
     assert_eq!(clicks.get(), 1);
-    assert_eq!(ui.selected_text(), "Press\nAfter");
+    assert!(!ui.has_text_selection(), "{:?}", ui.selected_text());
 }
 
 /// A button that is itself the selectable root clicks, and a drag from it
@@ -2007,4 +2008,231 @@ mod mark_shapes {
         assert!(scene.text_mark_pieces(node, 0., 0., 1.).is_none());
         assert_eq!(scene.text_marks(node).len(), 1);
     }
+}
+
+/// A press that shakes (a hand's tremor, a trackpad's click) less than the
+/// system's drag threshold selects nothing, as a click in a Mac text view
+/// doesn't: across a character, or across a line's edge to the next line.
+/// Moved past it, the selection runs from where the press began.
+#[test]
+fn a_press_that_shakes_within_the_drag_threshold_selects_nothing() {
+    let mut ui = Ui::new(400., 300.);
+    document(
+        &mut ui,
+        vec![text("Hello world"), text("Second paragraph"), text("Third")],
+    );
+    // Across a character's middle (12 → 15: "l" starts at 12, ends at 18).
+    press(&mut ui, 14., 10., false);
+    move_to(&mut ui, 16., 11.);
+    assert!(!ui.has_text_selection(), "{:?}", ui.selected_text());
+    release(&mut ui, 16., 11.);
+    assert!(!ui.has_text_selection(), "{:?}", ui.selected_text());
+    // Beside a line's end, slipping down into the next paragraph's line.
+    press(&mut ui, 200., 21.5, false);
+    move_to(&mut ui, 200., 24.5);
+    assert!(!ui.has_text_selection(), "{:?}", ui.selected_text());
+    release(&mut ui, 200., 24.5);
+    assert!(!ui.has_text_selection(), "{:?}", ui.selected_text());
+    // Past it, from where it began, not where the shake took it.
+    press(&mut ui, 12., 10., false);
+    move_to(&mut ui, 14., 10.);
+    move_to(&mut ui, 30., 10.);
+    release(&mut ui, 30., 10.);
+    assert_eq!(ui.selected_text(), "llo");
+    // A shaking press on it ends it, as a click does.
+    press(&mut ui, 50., 30., false);
+    move_to(&mut ui, 52., 31.);
+    release(&mut ui, 52., 31.);
+    assert!(!ui.has_text_selection(), "{:?}", ui.selected_text());
+}
+
+/// A selection in a virtual list's row that scrolled away comes back with
+/// that row, found by its key: rows added above it meanwhile (a chat's
+/// older messages arriving) never move it onto another row's text, and it
+/// lasts while its rows are only moved. Rows removed, it ends.
+#[test]
+fn a_parked_selection_comes_back_on_its_own_row_after_rows_are_added_above() {
+    let mut ui = Ui::new(400., 300.);
+    let offset = ui.signal(0.);
+    let keys = ui.signal((0..100).collect::<Vec<i32>>());
+    let (count, key) = (keys.clone(), keys.clone());
+    let _view = ui.mount(
+        column()
+            .w(300.)
+            .text_size(10.)
+            .line_height(20.)
+            .selectable(true)
+            .child(
+                virtual_list(
+                    offset.clone(),
+                    20.,
+                    1,
+                    move || count.with(|k| k.len()),
+                    move |index| key.with(|k| k[index]),
+                    |_, key, _| text(format!("Row {key}")),
+                )
+                .w(300.)
+                .h(100.),
+            ),
+    );
+    ui.prepare_frame();
+    // Row 1 at 20, row 2 at 40.
+    drag(&mut ui, (6., 30.), (18., 50.));
+    assert_eq!(ui.selected_text(), "ow 1\nRow");
+    offset.set(1_000.);
+    ui.prepare_frame();
+    assert!(!ui.has_text_selection(), "nothing selected is mounted");
+    // Ten rows arrive above.
+    keys.set((-10..100).collect());
+    ui.prepare_frame();
+    // Where its rows are now, they show selected.
+    offset.set(200.);
+    ui.prepare_frame();
+    assert_eq!(ui.selected_text(), "ow 1\nRow");
+    // Away again, ten more above, and back at the top: rows -20 to -16
+    // show, none of them selected, and the selection is still its rows'.
+    offset.set(1_000.);
+    ui.prepare_frame();
+    keys.set((-20..100).collect());
+    ui.prepare_frame();
+    offset.set(0.);
+    ui.prepare_frame();
+    assert!(highlighted(&ui).is_empty(), "not on other rows");
+    assert_eq!(ui.selected_text(), "ow 1\nRow");
+    // Where they are now (rows 21 and 22), they show selected.
+    offset.set(400.);
+    ui.prepare_frame();
+    assert!(!highlighted(&ui).is_empty());
+    assert_eq!(ui.selected_text(), "ow 1\nRow");
+    // Away, and its rows removed from the list: it ends.
+    offset.set(1_000.);
+    ui.prepare_frame();
+    keys.set((-20..100).filter(|key| !(1..=2).contains(key)).collect());
+    ui.prepare_frame();
+    offset.set(0.);
+    ui.prepare_frame();
+    assert!(!ui.has_text_selection(), "{:?}", ui.selected_text());
+}
+
+/// A list whose row 1 is built as `shape` says when it mounts: its text
+/// alone, or (a reply still building its blocks) under a note, where the
+/// path to its text leads elsewhere.
+fn shaped_rows(
+    ui: &mut Ui,
+    offset: zgx::reactive::Signal<f32>,
+    building: zgx::reactive::Signal<bool>,
+) -> zgx::compose::ViewHandle {
+    let handle = ui.mount(
+        column()
+            .w(300.)
+            .text_size(10.)
+            .line_height(20.)
+            .selectable(true)
+            .child(
+                virtual_list(
+                    offset,
+                    20.,
+                    1,
+                    || 100,
+                    |index| index,
+                    move |_, key, _| {
+                        if key == 1 && building.with_untracked(|b| *b) {
+                            column()
+                                .child(text("Note"))
+                                .child(text(format!("Row {key}")))
+                        } else {
+                            text(format!("Row {key}"))
+                        }
+                    },
+                )
+                // (A transcript's: what a copy takes of rows not showing.)
+                .row_text(|index| (index < 100).then(|| format!("Row {index}")))
+                .w(300.)
+                .h(100.),
+            ),
+    );
+    ui.prepare_frame();
+    handle
+}
+
+/// A caret put down in a row (a click: nothing selected) whose row is
+/// recycled, then mounted again before its text is where it was (a reply
+/// still building its blocks), selects nothing there; once the row is
+/// built as it was, the caret is back in it.
+#[test]
+fn a_caret_parked_in_a_row_mounted_again_another_way_selects_nothing() {
+    let mut ui = Ui::new(400., 300.);
+    let offset = ui.signal(0.);
+    let building = ui.signal(false);
+    let _view = shaped_rows(&mut ui, offset.clone(), building.clone());
+    // Row 1 at 20: a click in it.
+    press(&mut ui, 12., 30., false);
+    release(&mut ui, 12., 30.);
+    let caret = ui.text_selection().expect("a caret");
+    assert_eq!(caret.0, caret.1);
+    // Scrolled until the row recycles, other rows mounting.
+    for at in [40., 200., 1_000.] {
+        offset.set(at);
+        ui.prepare_frame();
+        assert_eq!(ui.selected_text(), "");
+    }
+    // Back, the row still building.
+    building.set(true);
+    offset.set(0.);
+    ui.prepare_frame();
+    assert_eq!(ui.selected_text(), "", "a caret took the whole row");
+    assert!(highlighted(&ui).is_empty(), "{:?}", highlighted(&ui));
+    assert!(
+        ui.text_selection().is_some(),
+        "the caret is kept for its row"
+    );
+    // Away and back built as it was: the caret is in it again.
+    offset.set(1_000.);
+    ui.prepare_frame();
+    building.set(false);
+    offset.set(0.);
+    ui.prepare_frame();
+    let (anchor, focus) = ui.text_selection().expect("the caret");
+    assert_eq!((anchor, focus.offset), (focus, 2));
+    assert!(ui.scene.borrow().contains(anchor.node));
+    assert_eq!(ui.selected_text(), "");
+}
+
+/// A selection parked in a row mounted again another way keeps what it
+/// selected: the rows between show selected, that row shows nothing until
+/// its text is back, and a copy takes just what was selected.
+#[test]
+fn a_selection_parked_in_a_row_mounted_again_another_way_keeps_its_size() {
+    let mut ui = Ui::new(400., 300.);
+    let offset = ui.signal(0.);
+    let building = ui.signal(false);
+    let _view = shaped_rows(&mut ui, offset.clone(), building.clone());
+    // Row 1 at 20 to row 3 at 60.
+    drag(&mut ui, (6., 30.), (18., 70.));
+    assert_eq!(ui.selected_text(), "ow 1\nRow 2\nRow");
+    offset.set(1_000.);
+    ui.prepare_frame();
+    building.set(true);
+    offset.set(0.);
+    ui.prepare_frame();
+    assert_eq!(ui.selected_text(), "ow 1\nRow 2\nRow", "its size, no more");
+    // Row 2 and row 3's start show it; row 1's note and text don't.
+    let scene = ui.scene.borrow();
+    let lit: Vec<String> = texts(&ui)
+        .into_iter()
+        .filter(|id| scene.text_highlight(*id).is_some())
+        .filter_map(|id| match scene.kind(id) {
+            NodeKind::Text { text, .. } => Some(text.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lit, ["Row 2", "Row 3"]);
+    drop(scene);
+    offset.set(1_000.);
+    ui.prepare_frame();
+    building.set(false);
+    offset.set(0.);
+    ui.prepare_frame();
+    assert_eq!(ui.selected_text(), "ow 1\nRow 2\nRow");
+    assert_eq!(highlighted(&ui).len(), 3);
 }

@@ -12,6 +12,7 @@ on_navigate: (((e: NavigateEvent) -> ()) | Action)?
 on_swipe: ((e: SwipeEvent) -> ())?
 on_hover: (((inside: boolean) -> ()) | Action)?
 on_pointer_move: (((e: PointerEvent) -> ()) | Action)?
+on_pointer_lock: ((locked: boolean) -> ())?
 on_key: (((e: KeyEvent) -> boolean?) | Action)?
 on_key_up: (((key: string) -> ()) | Action)?
 on_focus: (Handler | Action)?
@@ -21,6 +22,7 @@ on_pinch: (((e: PinchEvent) -> boolean?) | Action)?
 on_mount: ((element: Element) -> ())?
 on_resize: ((size: Size, element: Element) -> ())?
 on_visible: ((visible: boolean, element: Element) -> ())?
+visible_margin: number?
 on_drag: (() -> any)?
 drag_preview: ((payload: any) -> Node)?
 drag_preview_anchor: { number }?
@@ -50,16 +52,18 @@ on_drag_spring: ((payload: any) -> boolean?)?
 | `on_file_drop` | the dropped files, each a `File` (`{ path, name, size, type }`), then `{ x, y, local_x, local_y }` | files are dropped on it from outside the window (Finder, Explorer, a file manager), as react-dropzone's `onDrop`. The innermost node with `on_file_drop` takes them. Send them with `ui.fetch`'s `file` or `multipart` ([the network](state.md#the-clipboard-and-files)) |
 | `on_file_hover` | `true`, then `false` | files dragged from outside the window come over it or anything in it, then leave it, are dropped or the drag ends (react-dropzone's `isDragActive`): a drop zone's highlight, or on the window's root, a "Drop files to upload" overlay |
 | `on_hover` | `true`, then `false` | once when the pointer comes inside the node or anything in it, once when it is outside all of them (the DOM's `mouseenter` and `mouseleave`); leaving the window, the window going to the back, and the pointer moving onto a page or a terminal count as leaving |
-| `on_pointer_move` | `{ x, y, local_x, local_y }` | the pointer moves over it (or anywhere, while it holds the pointer) |
+| `on_pointer_move` | `{ x, y, local_x, local_y, dx, dy, locked }` (`dx`, `dy`: how far it moved since the last move, in the window's points, as the DOM's `movementX`) | the pointer moves over it (or anywhere, while it holds the pointer). While the pointer is [locked](#locking-the-pointer) to it or inside it: the mouse's own motion as `dx`, `dy`, with `locked = true`, `x` and `y` staying where it locked |
+| `on_pointer_lock` | `true`, then `false` | it took the pointer's [lock](#locking-the-pointer) (`el:lock_pointer()`), then lost it: let go, Escape, the window losing focus, the node leaving or another node locking it |
 | `on_key` | `{ key, code, shift, ctrl, alt, meta, cmd, repeat, editing }` (`code`: the physical key, as the DOM's `KeyboardEvent.code`, `"KeyA"`, `"Digit1"`; `editing`: a text field holds focus, so a bare-key shortcut gives way) | a key goes down while it, or a node inside it, has focus. Return `true` to consume the key: the default action and the ancestors' handlers do not see it |
 | `on_key_up` | the key's name | the key comes up |
 | `on_focus`, `on_blur` | nothing | it takes or loses keyboard focus |
-| `on_wheel` | `{ dx, dy, x, y, local_x, local_y, shift, ctrl, alt, meta, cmd }` | a wheel or trackpad scroll over it. Return `true` to take it from the scroll views around it: a canvas pans with it, or zooms about the pointer with ⌘ or Ctrl held |
+| `on_wheel` | `{ dx, dy, x, y, local_x, local_y, shift, ctrl, alt, meta, cmd }` | a wheel or trackpad scroll over it. Return `true` to take it from the scroll views around it: a canvas pans with it, or zooms about the pointer with ⌘ or Ctrl held. With Shift (and not Ctrl) held, a mouse wheel's vertical lines arrive as `dx`, as browsers give them, on every platform (macOS reports them so itself) |
 | `on_pinch` | `{ scale, x, y, local_x, local_y, shift, ctrl, alt, meta, cmd }` (`scale`: the change in the fingers' spread, 0.05 for 5% apart: zoom in; negative, out) | a trackpad pinch over it (macOS); `true` takes it |
 | `on_mount` | its [element](#elements) | once, when it is mounted: start animations here |
 | `on_resize` | `{ w, h }`, its element | layout gives it a new size, and at its first layout (as a ResizeObserver reports) |
 | `on_visible` | whether any of it shows, its element | it comes into view or all of it leaves (inside every clip and scroll viewport above it), and at its first layout (as an IntersectionObserver reports): build what only matters on screen |
-| `on_drag` | nothing; returns the payload | the pointer moves past the system's drag threshold from a press on it (4 points until the desktop gives its own, GTK's 8 on Linux): a drag starts, carrying what it returns (any plain value) |
+| `visible_margin` | | with `on_visible`, points: it counts as in view once any of it comes within that many of showing, its box grown by them on every side inside the same clips and viewports (an IntersectionObserver's `rootMargin`). Build what is about to scroll in before it does, as a long reply's paragraphs within a screen of the view: a steady scroll then runs no script until one crosses |
+| `on_drag` | nothing; returns the payload | the pointer moves past the system's drag threshold from a press on it (4 points until the desktop gives its own, GTK's 8 on Linux): a drag starts, carrying what it returns (any plain value). A button or other clickable inside it covering at least three quarters of the node doesn't stop this: moved, the press drags and doesn't click, and let go without moving, it clicks. A smaller one keeps its press, as a tab's close button does |
 | `drag_preview` | the payload; returns a node | what follows the pointer while it drags |
 | `drag_preview_anchor`, `drag_preview_offset` | (values) `{ x, y }` | where the preview goes: its point `anchor` (fractions of its size; `{ 0.5, 0 }` its top middle) `offset` points from the pointer. `{ 0.5, 0 }` with `{ 0, 16 }` hangs it below the pointer, centred, so what the drag is over stays in view; without either, the grab point stays under the pointer |
 | `on_drag_end` | the payload, whether it was dropped on a destination | the drag ends |
@@ -208,6 +212,8 @@ declare extern type Element with
 	y: number?
 	function focus(self): boolean
 	function blur(self): ()
+	function lock_pointer(self): boolean
+	function unlock_pointer(self): ()
 	function has_class(self, class: string): boolean
 	function select_all(self): boolean
 	function set_selection(self, a: number, b: number?): boolean
@@ -223,12 +229,54 @@ end
 | `width`, `height`, `x`, `y` | its laid-out box, in points from the window's top left; nil while it is not in a scene. Read as they are, not followed (a ref's `width` and `height` are) |
 | `focus(options?)` | keyboard focus to it or its first shown focusable descendant, scrolled into view in the scroll views and lists holding it (`{ scroll = false }`: left where it is, the web's `preventScroll`); whether it took |
 | `blur()` | clears keyboard focus when it is on the element or inside it |
+| `lock_pointer()`, `unlock_pointer()` | the pointer [locked](#locking-the-pointer) to it, or let go; `lock_pointer` says whether it holds it |
 | `has_class(class)` | whether its `class` names `class` |
 | `select_all()`, `set_selection(a, b)` | an input's selection, in characters (Unicode code points from 0, as `utf8.len` counts them); `b` defaults to `a`, a caret. False for other elements |
 | `selection()` | an input's anchor and focus (where the caret is); nil for other elements |
 | `snapshot(max_width?)` | a picture of it as the window last showed it, at most `max_width` pixels wide (480 if not given): the `src` of an image showing it (`ui.image { src = el:snapshot(240) }`, a pane's thumbnail), replaced on each call and forgotten as its node goes. Nil if it is not laid out or the host takes none (the desktop host on macOS takes them); native views in it (a page, a terminal) show as what is under them, so ask a terminal itself (`term:snapshot`) |
 
 A ref (`ui.ref()`, given to nodes as `ref = r`) answers `r:get()` and `r.element` (its first mounted element, else nil), `r:peek()` (the same, without following), `r.mounted`, `r.count`, `r:elements()` (every mounted node sharing it, in document order), and `r.width` and `r.height` (its element's laid-out size, nil while none is mounted). Reading `get`, `element`, `mounted`, `count`, `elements`, `width` or `height` in an effect or a computed follows the ref (and `width` and `height` follow layout resizing the element), so an effect that needs the element runs again once it mounts. A ref has no `focus` or other element methods: ask its element (`local el = r:get(); if el then el:focus() end`).
+
+### Locking the pointer
+
+A game that looks about with the mouse, or a 3D view that orbits however far it is dragged, locks the pointer to its element, as the DOM's Pointer Lock: `el:lock_pointer()`. The pointer is hidden and held in place, so it never reaches the window's edge; every press, release and wheel goes to the element wherever it is; and its `on_pointer_move` hears the mouse's own motion as `dx`, `dy` (`locked = true`), `x` and `y` staying where it locked.
+
+- It locks only in a press's, a release's or a key's handler, or within a second of one: nothing takes the pointer without the person doing something. `lock_pointer` returns whether it holds it.
+- Escape always lets it go, and goes nowhere else (no `on_key` hears it, its repeats or its release). Nor is it a gesture to lock with: `on_pointer_lock(false)` can't take the pointer straight back, only the next press or key can. The lock also ends as the window loses focus (and a press before that is no gesture after it), the element leaves or is disabled, another element locks it, or `el:unlock_pointer()`. The element's `on_pointer_lock` hears `true` as it locks and `false` as it ends, whatever ended it: a game pauses there. The pointer shows again where it locked.
+- `dx` and `dy` are the platform's raw report: about a point a count, unaccelerated where the platform gives it so (Windows, X11), with the system's acceleration on macOS. Scale them by a sensitivity of your own.
+- A press and release while locked still clicks the element (`on_click`); a locked press focuses nothing.
+
+```lua
+local yaw, pitch = ui.state("yaw", 0), ui.state("pitch", 0)
+local playing = ui.state("playing", false)
+local view = ui.ref()
+
+return ui.div {
+	ref = view,
+	w_full = true,
+	h_full = true,
+	on_press = function()
+		local el = view:get()
+		if el and not playing:peek() then
+			el:lock_pointer()
+		end
+	end,
+	on_pointer_lock = function(locked)
+		playing:set(locked)
+	end,
+	on_pointer_move = function(e)
+		if e.locked then
+			yaw:set(yaw:peek() + (e.dx or 0) * 0.003)
+			pitch:set(math.clamp(pitch:peek() - (e.dy or 0) * 0.003, -1.5, 1.5))
+		end
+	end,
+	ui.text {
+		function()
+			return if playing:get() then "Esc to let go" else "Click to look about"
+		end,
+	},
+}
+```
 
 ### Container queries
 
@@ -267,7 +315,9 @@ Where styles can't say it (a different component, a computed count of columns), 
 - The innermost node with `on_click` takes a click: a button inside a clickable row runs its own handler, not the row's. An empty `on_click = function() end` keeps clicks on a panel from reaching a backdrop under it.
 - `on_press`, `on_release`, `on_pointer_move`, `on_key` and `on_wheel` hear their events over (or, for keys, from inside) the node, children included, before its ancestors do. A node with `on_press` and either `on_pointer_move` or `on_release` keeps the pointer from press to release, wherever it goes.
 - Keys go to the node with focus and then up its ancestors; with nothing focused (and no modal open) they go to the app's root node, as a page's go to its body, so an `on_key` there hears the app's shortcuts. Check `editing` before taking a bare key, so a text field keeps its typing. A plain node takes focus with `focusable = true`; buttons and inputs take it themselves. Return `true` from `on_key` only for the keys you handle, or typing into an input inside stops working. A field that records a shortcut takes `capture_keys = true`: while focus is in it, every key reaches its `on_key`, ⌘-combinations included, and no shortcut, menu item or command key takes one (⌘Q is the key recorded, not Quit); as focus leaves (a click elsewhere, Tab, `el:blur()`), shortcuts work again.
+- A press moves focus to the focusable node it lands in. With `focus_on_press = false` on a node, a press on it or anything inside it leaves focus where it is, as the web's `mousedown` with `preventDefault()`, and its clicks still come: a list hanging from a field takes clicks while the field keeps the keys and its caret.
 - `on_hover` reports entering and leaving the node as a whole: moving between its children tells it nothing.
+- `on_hover` also fires while the window is at the back, under the pointer with another app in front: the platforms deliver hover there, and native controls react to it. To act only in a window the user is using, read `ui.window.active`. A popup opened from `on_hover` at the back waits for the app to come forward ([overlays](overlays.md)).
 - `on_resize` reports size changes only, not moves, and `on_visible` changes only; both are called outside any tracking: reading state in them subscribes nothing.
 - Drag payloads are the script's own values (`any` to the types): annotate the parameters of `drag_preview`, `drop_when` and `on_drop` with your payload type. The nearest destination that accepts a payload gets the drag; `drop_when` returning nothing (or `false`) refuses it.
 - `on_mount` runs once, when the node mounts; a node that is rebuilt (a row with a new key, a `show` toggled back) mounts again.

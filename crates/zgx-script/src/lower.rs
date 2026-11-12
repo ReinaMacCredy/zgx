@@ -75,6 +75,10 @@ pub(crate) struct Assets {
     /// one (`ui.gpu_view`) follows its version, kept in `hosted` as
     /// `view:<name>`.
     views: std::cell::RefCell<HashMap<String, zgx::gpu_view::GpuView>>,
+    /// Frames the host shows as they are (`ScriptHost::surface`), by
+    /// `host:<name>`: a `ui.image` of one draws it, with no bytes read.
+    #[cfg(target_os = "macos")]
+    surfaces: std::cell::RefCell<HashMap<String, Rc<zgx::native_surface::NativeSurface>>>,
 }
 /// A cached picture, its size, and when it was last shown.
 struct Cached<T> {
@@ -100,6 +104,8 @@ impl Default for Assets {
             links: Default::default(),
             hosted: Default::default(),
             views: Default::default(),
+            #[cfg(target_os = "macos")]
+            surfaces: Default::default(),
         }
     }
 }
@@ -324,6 +330,45 @@ impl Assets {
         self.hosted(&format!("view:{name}"), runtime).get();
         self.views.borrow().get(name).cloned()
     }
+    /// The host sets (or, with None, clears) the frame `host:<name>`
+    /// shows as it is.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_surface(
+        &self,
+        name: &str,
+        surface: Option<Rc<zgx::native_surface::NativeSurface>>,
+        runtime: &zgx::reactive::Runtime,
+    ) {
+        let src = format!("host:{name}");
+        match surface {
+            Some(surface) => drop(self.surfaces.borrow_mut().insert(src.clone(), surface)),
+            None => drop(self.surfaces.borrow_mut().remove(&src)),
+        }
+        let version = self.hosted(&src, runtime);
+        version.update(|v| *v = v.wrapping_add(1));
+    }
+    /// The frame the host set as `host:<name>`, untracked.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn hosted_surface(
+        &self,
+        name: &str,
+    ) -> Option<Rc<zgx::native_surface::NativeSurface>> {
+        self.surfaces.borrow().get(&format!("host:{name}")).cloned()
+    }
+    /// The frame `src` (a `host:` one) shows as it is, followed as the host
+    /// replaces it.
+    #[cfg(target_os = "macos")]
+    fn surface(
+        &self,
+        src: &str,
+        runtime: &zgx::reactive::Runtime,
+    ) -> Option<Rc<zgx::native_surface::NativeSurface>> {
+        if !src.starts_with("host:") {
+            return None;
+        }
+        self.hosted(src, runtime).get();
+        self.surfaces.borrow().get(src).cloned()
+    }
     /// Whether the host set image `host:<name>`.
     pub(crate) fn is_hosted(&self, name: &str) -> bool {
         self.images.borrow().contains_key(&format!("host:{name}"))
@@ -333,6 +378,10 @@ impl Assets {
     fn forget_hosted(&self, name: &str) {
         let src = format!("host:{name}");
         self.forget(&src);
+        #[cfg(target_os = "macos")]
+        if let Ok(mut surfaces) = self.surfaces.try_borrow_mut() {
+            surfaces.remove(&src);
+        }
         if let Ok(mut hosted) = self.hosted.try_borrow_mut() {
             hosted.remove(&src);
         }
@@ -882,7 +931,12 @@ fn plugin_page(plugin: &Rc<str>, node: &Node, low: &Rc<Lowering>) -> View {
             .filter(|(owner, _, _)| **owner == **plugin)
             .map(|(_, n, stats)| counted(lower(n, low), stats)),
     );
-    div().child(zgx::compose::confined(plugin_view(page, low)))
+    // An isolated group: all it can read of what's behind it (`zgx_backdrop`,
+    // a backdrop blur) is its own, never the sealed region's under it.
+    div().child(zgx::compose::confined(plugin_view(
+        page.isolated(true),
+        low,
+    )))
 }
 /// The slot a plugin's page goes to: `ui.contribute("plugin_page", …)`.
 const PLUGIN_PAGE: &str = "plugin_page";
@@ -1299,6 +1353,8 @@ fn filtered(
             shown(copy, &low)
         },
     )
+    // A box of its own around the node, as it has always been.
+    .not_contents()
 }
 /// The places of `ids` in the order `value` lists them: those it names
 /// first, the rest after them as they were (an order filter moves
@@ -2223,35 +2279,71 @@ fn content_hash(item: &Value, hasher: &mut impl std::hash::Hasher) {
 struct Unkeyed {
     order: Vec<Rc<str>>,
     next: u64,
+    /// The last pass's list and its rows' identities, in list order: a
+    /// list starting with the same items (a stream's, growing at its end)
+    /// passes over the rest alone (`unkeyed_rows`'s `from`).
+    items: Value,
+    identities: Vec<Rc<str>>,
 }
-/// The rows of a `ui.each` without a `key` for `list`: each item keeps the
+impl Unkeyed {
+    /// How many of `list`'s first items are the last pass's own: as noted
+    /// where it was made from that list (`value::grown`, a stream's), else
+    /// the same table (by allocation) or an equal value, each a glance.
+    fn kept(&self, list: &Value) -> usize {
+        if let Some(shared) = crate::value::shared_start(list, &self.items) {
+            return shared;
+        }
+        list.list()
+            .iter()
+            .zip(self.items.list())
+            .take_while(|(now, then)| {
+                let id = crate::value::identity(now);
+                if id != 0 {
+                    id == crate::value::identity(then)
+                } else {
+                    now == then
+                }
+            })
+            .count()
+    }
+}
+/// The rows of a `ui.each` without a `key` for a list, given its items from
+/// `from` on (`rest`): each item keeps the
 /// row of the same item last pass, wherever it moved (an insert or removal
 /// builds one row, not every row after it). Items are matched where they
 /// were first (a pointer compare each, in the usual pass), then the rest by
 /// `quick`, then by their contents (a list built afresh from state holds
 /// equal tables, new ones). An item still unmatched takes the free row at
 /// its place, built again if its item differs (or, `live`, given the new
-/// item), as rows keyed by position were. Returns each item's row name;
-/// `rows` keeps the rows still shown.
+/// item), as rows keyed by position were. Returns each item's row name
+/// from `from` on; `rows` keeps the rows still shown, their marks cleared.
+///
+/// The first `from` items are the last pass's own, at the same places
+/// (`Unkeyed::kept`): each matches its row where it was, first, as the full
+/// pass would, so no row of theirs is free and none of them unmatched, and
+/// what follows looks at the rest alone (a stream's last item and those
+/// appended). With `from` 0, the full pass.
 fn unkeyed_rows(
-    list: &[Value],
+    rest: &[Value],
     rows: &mut Rows,
     state: &mut Unkeyed,
+    from: usize,
     live: bool,
     runtime: &zgx::reactive::Runtime,
 ) -> Vec<Rc<str>> {
-    let mut names: Vec<Option<Rc<str>>> = vec![None; list.len()];
-    for (index, item) in list.iter().enumerate() {
+    let mut names: Vec<Option<Rc<str>>> = vec![None; rest.len()];
+    for (index, item) in (from..).zip(rest) {
         if let Some(name) = state.order.get(index)
             && rows[name].last == *item
         {
             rows.get_mut(name).unwrap().seen = true;
-            names[index] = Some(name.clone());
+            names[index - from] = Some(name.clone());
         }
     }
     let free: Vec<&Rc<str>> = state
         .order
         .iter()
+        .skip(from)
         .filter(|name| !rows[*name].seen)
         .collect();
     if !free.is_empty() && names.iter().any(Option::is_none) {
@@ -2263,7 +2355,7 @@ fn unkeyed_rows(
                 .or_default()
                 .push((*name).clone());
         }
-        for (item, name) in list.iter().zip(names.iter_mut()) {
+        for (item, name) in rest.iter().zip(names.iter_mut()) {
             if name.is_none()
                 && let Some(found) = by_item.get_mut(&quick(item)).and_then(Vec::pop)
             {
@@ -2283,7 +2375,7 @@ fn unkeyed_rows(
                 .or_default()
                 .push((*name).clone());
         }
-        for (item, name) in list.iter().zip(names.iter_mut()) {
+        for (item, name) in rest.iter().zip(names.iter_mut()) {
             if name.is_some() || by_contents.is_empty() {
                 continue;
             }
@@ -2296,8 +2388,8 @@ fn unkeyed_rows(
             }
         }
     }
-    for (index, item) in list.iter().enumerate() {
-        if names[index].is_some() {
+    for (index, item) in (from..).zip(rest) {
+        if names[index - from].is_some() {
             continue;
         }
         let name = match state.order.get(index).filter(|name| !rows[*name].seen) {
@@ -2322,10 +2414,29 @@ fn unkeyed_rows(
                 name
             }
         };
-        names[index] = Some(name);
+        names[index - from] = Some(name);
     }
-    state.order = names.into_iter().flatten().collect();
-    state.order.clone()
+    let names: Vec<Rc<str>> = names.into_iter().flatten().collect();
+    // Rows gone from the list go: of the prefix's none, so only those that
+    // were after it are looked at (with `from` 0, every row).
+    if from == 0 {
+        rows.retain(|_, row| std::mem::take(&mut row.seen));
+    } else {
+        for name in state.order.drain(from..) {
+            if rows.get(&name).is_some_and(|row| !row.seen) {
+                rows.remove(&name);
+            }
+        }
+        // Their marks cleared, as the full pass's `retain` does.
+        for name in &names {
+            if let Some(row) = rows.get_mut(name) {
+                row.seen = false;
+            }
+        }
+    }
+    state.order.truncate(from);
+    state.order.extend(names.iter().cloned());
+    names
 }
 pub(crate) fn build_scoped(
     vm: &Rc<Vm>,
@@ -2645,6 +2756,88 @@ fn build_scoped_seeing(
 
 /// A web view: its page from `src` (followed) or `html`, its handlers
 /// subscribed for as long as the view is mounted.
+/// A `ui.glass`, its look read again when state it reads changes.
+fn glass_of(spec: &crate::node::GlassSpec, vm: &Rc<Vm>) -> View {
+    use zgx::glass::{GlassStyle, GlassVariant, glass};
+    let own = |source: &Option<Source>| source.as_ref().map(resolve_owned);
+    let (clear, tint, radius) = (own(&spec.clear), own(&spec.tint), own(&spec.radius));
+    let corners = own(&spec.corners);
+    let vm = vm.clone();
+    glass(move || {
+        let read = |source: &Option<Owned>, ty| {
+            source
+                .as_ref()
+                .and_then(|source| resolve(source, ty, None, &vm))
+        };
+        let mut style = GlassStyle::default();
+        if read(&clear, Ty::Bool) == Some(Lit::Bool(true)) {
+            style.variant = GlassVariant::Clear;
+        }
+        if let Some(Lit::Color(tint)) = read(&tint, Ty::Color) {
+            style.tint = Some(tint);
+        }
+        if let Some(Lit::Num(radius)) = read(&radius, Ty::Num) {
+            style.radius = radius;
+        }
+        if let Some(Lit::Corners(corners)) = read(&corners, Ty::Corners) {
+            style.corners = Some(corners);
+        }
+        style
+    })
+}
+/// What keeps `shaders` up: `layer_clock`, `shader_clock`, `layer_on` and
+/// `layer_params` as a function, read again as what they read changes.
+#[cold]
+#[inline(never)]
+fn drive_of(
+    shaders: &crate::node::Shaders,
+    vm: &Rc<Vm>,
+) -> Option<Box<dyn FnMut() -> zgx::shader_drive::ShaderDrive>> {
+    let vm = vm.clone();
+    let props = shaders.drive.as_ref()?;
+    let fill = shaders.layer.is_none();
+    let shader = shaders.layer.clone().or_else(|| shaders.fill.clone())?;
+    let clock = if fill {
+        props.shader_clock
+    } else {
+        props.layer_clock
+    };
+    let literal = match fill {
+        true => shaders.params,
+        false => shaders.layer_params,
+    };
+    let params_of = props.layer_params_of.clone();
+    let on = props.layer_on.as_ref().map(resolve_owned);
+    let (bleed, reach) = (
+        shaders.layer_bleed.unwrap_or(0.),
+        shaders.layer_reach.unwrap_or(0.),
+    );
+    let mut last = literal.unwrap_or_default();
+    Some(Box::new(move || {
+        if let Some(f) = &params_of {
+            let read = vm.call::<mlua::Value>(f, ()).and_then(|value| {
+                crate::node::shader_params(&vm.lua, &value, "layer_params", None)
+            });
+            match read {
+                Ok(params) => last = params,
+                Err(e) => vm.report(e),
+            }
+        }
+        let shows = on
+            .as_ref()
+            .and_then(|on| resolve(on, Ty::Bool, None, &vm))
+            .is_none_or(|lit| lit == Lit::Bool(true));
+        zgx::shader_drive::ShaderDrive {
+            shader: shows.then(|| shader.clone()),
+            fill,
+            params: last,
+            bleed,
+            reach,
+            frost: 0.,
+            running: clock,
+        }
+    }))
+}
 fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
     use zgx::web_view::{WebViewEvent, web_view, web_view_src};
     let web = spec.web.clone();
@@ -2824,6 +3017,8 @@ fn kind_view(
             follow,
             scrollbar,
             contain,
+            wheel_across,
+            paging,
             padding,
         } => {
             let offset = match offset {
@@ -2844,12 +3039,18 @@ fn kind_view(
             } else {
                 view
             };
+            let view = if *wheel_across {
+                view.wheel_across()
+            } else {
+                view
+            };
+            let view = if *paging { view.paging(true) } else { view };
             let view = match padding {
                 Some(padding) => with_scroll_padding(view, padding, vm),
                 None => view,
             };
-            if *scrollbar {
-                view.scrollbar(true)
+            if let Some(spec) = scrollbar {
+                with_scrollbar(view, spec, vm)
             } else {
                 view
             }
@@ -2935,6 +3136,7 @@ fn kind_view(
         }
         #[cfg(feature = "scene3d")]
         Kind::Scene3d(spec) => crate::scene3d::lower(spec, vm, &low.assets, need(&mut cx)),
+        Kind::Glass(spec) => glass_of(spec, vm),
         Kind::Canvas(draw, options) => {
             let (draw, vm) = (draw.clone(), vm.clone());
             let theme = match cx.as_deref().map(Context::theme) {
@@ -3248,17 +3450,18 @@ fn kind_view(
             let (when_vm, vm) = (vm.clone(), vm.clone());
             let (then, otherwise, low) = (then.clone(), otherwise.clone(), low.clone());
             let when = Rc::new(resolve_owned(when));
-            switch(
+            switch_or_none(
                 move || {
                     resolve(&when, Ty::Bool, None, &when_vm).is_some_and(|l| l == Lit::Bool(true))
                 },
                 move |on, _| {
                     let _keep = &vm;
                     match (on, &otherwise) {
-                        (true, _) => shown(&then, &low),
-                        (false, Some(otherwise)) => shown(otherwise, &low),
-                        // Nothing: not a flex item either (no gap for it).
-                        (false, None) => div().hidden(),
+                        (true, _) => Some(shown(&then, &low)),
+                        (false, Some(otherwise)) => Some(shown(otherwise, &low)),
+                        // Nothing: no child, so not a flex item either (no
+                        // gap for it), and no node of its own.
+                        (false, None) => None,
                     }
                 },
             )
@@ -3331,7 +3534,7 @@ fn kind_view(
             let (rows_in_keys, noted_in_keys) = (rows.clone(), noted.clone());
             let runtime = vm.runtime.clone();
             let (builder, vm, low) = (row_builder(builder, vm, low), vm.clone(), low.clone());
-            keyed(
+            zgx::compose::keyed_grown(
                 move || {
                     keys_from.with(|list| {
                         let mut noted = noted_in_keys.borrow_mut();
@@ -3347,28 +3550,49 @@ fn kind_view(
                                 &runtime,
                             )
                         {
-                            return identities;
+                            return zgx::compose::Keys::All(identities);
+                        }
+                        if key_fn.is_none() {
+                            let mut unkeyed = unkeyed.borrow_mut();
+                            // Those the last pass left as they were keep their
+                            // rows, notes and identities: the rest is passed over
+                            // (a stream's last item, and those appended).
+                            let from = unkeyed.kept(list);
+                            unkeyed.items = list.clone();
+                            // (A grown list's own, not made into one slice.)
+                            let grown: Vec<Value>;
+                            let rest = match crate::value::grown_list(list) {
+                                Some(list) => {
+                                    grown = list.iter_from(from).cloned().collect();
+                                    &grown[..]
+                                }
+                                None => &list.list()[from..],
+                            };
+                            if from == 0 {
+                                noted.clear();
+                                unkeyed.identities.clear();
+                            } else {
+                                for identity in unkeyed.identities.drain(from..) {
+                                    noted.remove(&identity);
+                                }
+                            }
+                            let names =
+                                unkeyed_rows(rest, &mut rows, &mut unkeyed, from, live, &runtime);
+                            for (i, row) in names.into_iter().enumerate() {
+                                let identity = rows[&row].identity.clone();
+                                noted.insert(identity.clone(), (from + i, row));
+                                unkeyed.identities.push(identity);
+                            }
+                            // (Those before `from` are the keys passed last.)
+                            return match from {
+                                0 => zgx::compose::Keys::All(unkeyed.identities.clone()),
+                                unchanged => zgx::compose::Keys::Grown {
+                                    unchanged,
+                                    rest: unkeyed.identities[from..].to_vec(),
+                                },
+                            };
                         }
                         noted.clear();
-                        if key_fn.is_none() {
-                            let names = unkeyed_rows(
-                                list.list(),
-                                &mut rows,
-                                &mut unkeyed.borrow_mut(),
-                                live,
-                                &runtime,
-                            );
-                            rows.retain(|_, state| std::mem::take(&mut state.seen));
-                            return names
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, row)| {
-                                    let identity = rows[&row].identity.clone();
-                                    noted.insert(identity.clone(), (i, row));
-                                    identity
-                                })
-                                .collect();
-                        }
                         let mut seen: HashMap<String, usize> = HashMap::new();
                         let keys = key_fn
                             .as_ref()
@@ -3425,13 +3649,13 @@ fn kind_view(
                                 identities: identities.clone(),
                             });
                         }
-                        identities
+                        zgx::compose::Keys::All(identities)
                     })
                 },
                 move |identity: Rc<str>, cx| {
                     let (index, row) = noted.borrow().get(&identity).cloned().unwrap_or_default();
-                    let item = items
-                        .with_untracked(|list| list.list().get(index).cloned().unwrap_or_default());
+                    let item =
+                        items.with_untracked(|list| list.item(index).cloned().unwrap_or_default());
                     if !live {
                         return build_scoped(&vm, cx, &low, &builder, (item, index + 1));
                     }
@@ -3457,7 +3681,7 @@ fn kind_view(
             if rare.as_ref().is_some_and(|rare| rare.sticky.is_some()) {
                 return list;
             }
-            list_chrome(list, *scrollbar, rare.as_deref(), vm)
+            list_chrome(list, scrollbar, rare.as_deref(), vm)
         }
         Kind::Modal {
             label,
@@ -3724,6 +3948,20 @@ fn build(node: &Rc<Node>, vm: &Rc<Vm>, low: &Rc<Lowering>, mut cx: Option<&mut C
     styled(view, node, vm, low, cx, element)
 }
 
+/// `window_drag` and `focus_on_press`, rare: apart from the node's common
+/// path.
+#[cold]
+#[inline(never)]
+fn press_flagged(mut view: View, flags: u8) -> View {
+    if flags & crate::node::KEEPS_FOCUS != 0 {
+        view = view.focus_on_press(false);
+    }
+    if flags & crate::node::WINDOW_DRAG != 0 {
+        view = view.window_drag();
+    }
+    view
+}
+
 /// What a node sets on its view, after its children: styles, handlers,
 /// observers. Apart from `build` for its frame, as `kind_view`.
 #[cfg_attr(debug_assertions, inline(never))]
@@ -3844,17 +4082,27 @@ fn styled(
         view = swept(view, low);
     }
     let shaders = node.shaders.as_deref();
-    let shader =
-        shaders.and_then(|s| Some((s.fill.clone()?, s.params.unwrap_or_default(), s.tokens)));
+    let shader = shaders.and_then(|s| {
+        Some((
+            s.fill.clone()?,
+            s.params.unwrap_or_default(),
+            s.tokens,
+            s.drive.is_some(),
+        ))
+    });
     // Parameters with no fill of their own: an image's (its `characters`
     // reveal), set on its node all the same.
     let params_only = shaders.and_then(|s| s.params.filter(|_| s.fill.is_none()));
     // A layer shader, with its literal parameters unless animated (boxed:
     // the style closure below holds it, and few nodes have one).
-    let layer = shaders.and_then(|s| {
+    // (Kept up by the engine, `shader_drive`: its uniforms stay the scene's, for
+    // a restyle not to put its time back.)
+    let layer = shaders.filter(|s| s.drive.is_none()).and_then(|s| {
         Some(Box::new((
             s.layer.clone()?,
             s.layer_params.unwrap_or_default(),
+            s.layer_bleed.unwrap_or(0.),
+            s.layer_reach.unwrap_or(0.),
         )))
     });
     if !dynamic.is_empty()
@@ -3866,8 +4114,27 @@ fn styled(
     {
         let vm = vm.clone();
         let element = element.clone();
+        let mut apart: Option<Box<StylesApart>> = None;
+        let mut apartness = Apartness::FirstRun;
         view = view.reactive_style(move || {
             let styles = match &element {
+                _ if apartness != Apartness::Never
+                    && functions_apart(&mut apartness, element.as_deref(), &dynamic) =>
+                {
+                    let apart = apart.get_or_insert_with(|| styles_apart(&dynamic, &vm));
+                    let mut lits = apart.lits.with(|lits| (**lits).clone());
+                    for (prop, source, scalar) in &dynamic {
+                        if !matches!(source, Owned::Computed(..))
+                            && let Some(lit) = resolve_style(source, *prop, scalar.as_ref(), &vm)
+                        {
+                            lits.push((*prop, lit));
+                        }
+                    }
+                    match &element {
+                        Some(element) => with_animated(element, lits),
+                        None => apply_all(Styles::new(), &lits),
+                    }
+                }
                 None if dynamic
                     .iter()
                     .all(|(prop, _, _)| !is_transform(*prop) && !is_corner(*prop)) =>
@@ -3907,12 +4174,14 @@ fn styled(
                 None => styles,
             };
             let styles = match layer.as_deref() {
-                Some((shader, params)) => {
+                Some((shader, params, bleed, reach)) => {
                     let animated = element
                         .as_ref()
                         .and_then(|e| e.animated.borrow().layer.as_deref().copied());
                     styles
                         .layer_shader(shader.clone())
+                        .layer_bleed(*bleed)
+                        .layer_reach(*reach)
                         .layer_uniforms(animated.unwrap_or(zgx::decoration::ShaderUniforms {
                             time: 0.,
                             params: *params,
@@ -3922,7 +4191,7 @@ fn styled(
             };
             // A shader fill, with its literal parameters unless animated.
             match &shader {
-                Some((fill, params, tokens)) => {
+                Some((fill, params, tokens, driven)) => {
                     let animated = element.as_ref().and_then(|e| e.animated.borrow().shader);
                     let uniforms = animated.unwrap_or(zgx::decoration::ShaderUniforms {
                         time: 0.,
@@ -3937,7 +4206,10 @@ fn styled(
                                 styles.token(zgx::theme::Field::ShaderParam(slot as u8), *token);
                         }
                     }
-                    styles.bg_shader(fill.clone()).shader_uniforms(uniforms)
+                    match driven {
+                        true => styles.bg_shader(fill.clone()),
+                        false => styles.bg_shader(fill.clone()).shader_uniforms(uniforms),
+                    }
                 }
                 None => match params_only {
                     Some(params) => styles.shader_uniforms(
@@ -3985,6 +4257,12 @@ fn styled(
             };
         }
     }
+    // Its shader kept up by the engine, once it has its style.
+    if let Some(s) = shaders.filter(|s| s.drive.is_some())
+        && let Some(make) = drive_of(s, vm)
+    {
+        view = zgx::shader_drive::attach(need(&mut cx), view, make);
+    }
     if let Some(disabled) = &node.disabled {
         let (disabled, vm) = (resolve_owned(disabled), vm.clone());
         view = view.disabled_when(move || {
@@ -3994,8 +4272,8 @@ fn styled(
     if let Some(focusable) = node.focusable {
         view = view.focusable(focusable);
     }
-    if node.window_drag {
-        view = view.window_drag();
+    if node.press_flags != 0 {
+        view = press_flagged(view, node.press_flags);
     }
     if let Some(selectable) = node.selectable {
         view = view.selectable(selectable);
@@ -4106,19 +4384,6 @@ fn styled(
             _ => view.context_menu(move |e| context_menu_items(&vm, &low, &build, e, None)),
         };
     }
-    // Listeners scripts add later (a draggable) receive the element's events.
-    if let Some(element) = &element {
-        let element = element.clone();
-        view = view.on_event(move |event| {
-            if element.listeners.borrow().is_empty() {
-                return;
-            }
-            let listeners = element.listeners.borrow().clone();
-            for listener in listeners {
-                listener(event);
-            }
-        });
-    }
     // Input and drag handlers read the node's handle (local coordinates).
     if element.is_some() || node.events().any_input() || node.events().any_drag() {
         let (element, elements, refs) = (element.clone(), low.elements.clone(), node.refs.clone());
@@ -4133,10 +4398,11 @@ fn styled(
             let depth = if node.sizes_layout() { 2 } else { 0 };
             (node.layout_id.clone(), timing, depth)
         });
-        let (mount, resize, visible, vm) = (
+        let (mount, resize, visible, visible_margin, vm) = (
             node.events().mount.clone(),
             node.events().resize.clone(),
             node.events().visible.clone(),
+            node.events().visible_margin,
             vm.clone(),
         );
         let handle = handle_for();
@@ -4191,7 +4457,10 @@ fn styled(
                 mounted.retain(effect);
             }
             if let Some(f) = visible.clone()
-                && let Some(shown) = mounted.observe_visibility()
+                && let Some(shown) = match visible_margin {
+                    Some(margin) => mounted.observe_visibility_within(margin),
+                    None => mounted.observe_visibility(),
+                }
             {
                 // Changes only, and the first layout's answer, delivered
                 // after the frame as an IntersectionObserver does: what the
@@ -4235,14 +4504,19 @@ fn styled(
                     match timers.as_ref() {
                         Some(timers) => {
                             let deliver = deliver.clone();
-                            let stop = timers.start(
-                                std::time::Duration::from_millis(1),
-                                false,
-                                move || {
-                                    deliver();
-                                    false
-                                },
-                            );
+                            // Its first report is due at once: an element that
+                            // mounts as the view jumps (a list's new rows) hears
+                            // it in the frame that shows it, and what it builds
+                            // lays out before that frame is drawn. A change
+                            // after waits a millisecond, past this frame.
+                            let wait = match told.get() {
+                                None => std::time::Duration::ZERO,
+                                Some(_) => std::time::Duration::from_millis(1),
+                            };
+                            let stop = timers.start(wait, false, move || {
+                                deliver();
+                                false
+                            });
                             *pending.borrow_mut() = Some(stop);
                         }
                         None => deliver(),
@@ -4292,8 +4566,18 @@ fn styled(
         if let Some(description) = &a11y.description {
             view = view.accessible_description(description.to_string());
         }
+        if let Some(description) = &a11y.description_of {
+            let (description, vm) = (resolve_owned(description), vm.clone());
+            view = view.description_when(move || match resolve(&description, Ty::Str, None, &vm) {
+                Some(Lit::Str(s)) => s.to_string(),
+                _ => String::new(),
+            });
+        }
         if a11y.hidden {
             view = view.accessible_hidden();
+        }
+        if a11y.modal {
+            view = view.accessible_modal();
         }
         if let Some(axis) = a11y.focus_group {
             view = view.focus_group(axis);
@@ -4493,6 +4777,104 @@ pub(crate) fn with_animated(element: &Element, mut lits: Vec<(Prop, Lit)>) -> St
     styles
 }
 
+/// The functions among a node's styles, resolved by an effect of their own
+/// once what else moves it runs them for nothing: a frame of an animation or a
+/// tween applies what they said again, running none of them.
+struct StylesApart {
+    lits: Signal<Rc<Vec<(Prop, Lit)>>>,
+    _resolves: zgx::reactive::Effect,
+}
+/// Whether a node's functions resolve apart: looked at once, on its second run
+/// (a node not run again pays nothing), and from then on a byte's compare.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Apartness {
+    FirstRun,
+    SecondRun,
+    /// No functions, or none beside what moves it and no animation to come.
+    Never,
+    /// Functions on a node an animation may come to.
+    Animated,
+    Apart,
+}
+/// Whether the node, run now, should resolve its functions apart.
+#[inline]
+fn functions_apart(
+    apartness: &mut Apartness,
+    element: Option<&Element>,
+    dynamic: &[(Prop, Owned, Option<Signal<f32>>)],
+) -> bool {
+    match *apartness {
+        Apartness::Apart => true,
+        Apartness::Never => false,
+        Apartness::FirstRun => {
+            *apartness = Apartness::SecondRun;
+            false
+        }
+        Apartness::SecondRun => {
+            *apartness = look_at_functions(element, dynamic);
+            *apartness == Apartness::Apart
+        }
+        Apartness::Animated => {
+            let animated = animated(element);
+            if animated {
+                *apartness = Apartness::Apart;
+            }
+            animated
+        }
+    }
+}
+fn animated(element: Option<&Element>) -> bool {
+    element.is_some_and(|element| element.revision.with_untracked(|r| *r != 0))
+}
+/// A node run again: what its functions, if any, do from here.
+#[cold]
+#[inline(never)]
+fn look_at_functions(
+    element: Option<&Element>,
+    dynamic: &[(Prop, Owned, Option<Signal<f32>>)],
+) -> Apartness {
+    let function = |source: &Owned| matches!(source, Owned::Computed(..));
+    if !dynamic.iter().any(|(_, source, _)| function(source)) {
+        return Apartness::Never;
+    }
+    let moved_beside = dynamic
+        .iter()
+        .any(|(_, source, _)| !function(source) && !matches!(source, Owned::Lit(_)));
+    if moved_beside || animated(element) {
+        Apartness::Apart
+    } else if element.is_some() {
+        Apartness::Animated
+    } else {
+        Apartness::Never
+    }
+}
+#[cold]
+#[inline(never)]
+fn styles_apart(dynamic: &[(Prop, Owned, Option<Signal<f32>>)], vm: &Rc<Vm>) -> Box<StylesApart> {
+    let lits = vm.runtime.signal(Rc::new(Vec::new()));
+    let functions: Vec<_> = dynamic
+        .iter()
+        .filter(|(_, source, _)| matches!(source, Owned::Computed(..)))
+        .cloned()
+        .collect();
+    let (out, resolving) = (lits.clone(), vm.clone());
+    let _resolves = vm.runtime.untracked(|| {
+        vm.runtime.effect_now(move || {
+            let now: Vec<(Prop, Lit)> = functions
+                .iter()
+                .filter_map(|(prop, source, scalar)| {
+                    let lit = resolve_style(source, *prop, scalar.as_ref(), &resolving)?;
+                    Some((*prop, lit))
+                })
+                .collect();
+            if out.with_untracked(|was| **was != now) {
+                out.set(Rc::new(now));
+            }
+        })
+    });
+    Box::new(StylesApart { lits, _resolves })
+}
+
 /// A view carrying `element`'s animated values, registered once mounted.
 fn element_view(
     view: View,
@@ -4508,6 +4890,13 @@ fn element_view(
         })
 }
 
+/// How much of a point a `layout` box's size may change by and be taken at
+/// once rather than eased: text measured again or a shrinking parent's
+/// share moves one by thousandths, more than layout's own tolerance for a
+/// size told again (zgx's `SIZE_NOISE`, a 1024th), and easing that would
+/// lay the box out each frame for nothing. Under any change anyone sees.
+const EASED_SIZE_NOISE: f32 = 0.01;
+
 /// The springy default for size changes, as for moves.
 fn layout_ease(layout: &LayoutAnim) -> (crate::anime::ease::Ease, f64) {
     crate::motion::Timing {
@@ -4515,6 +4904,77 @@ fn layout_ease(layout: &LayoutAnim) -> (crate::anime::ease::Ease, f64) {
         duration: layout.duration,
     }
     .resolve()
+}
+
+/// A size-animated box while it is mounted (`layout_box`): its content, the
+/// content's laid-out size, and its ease, if one has run.
+struct LiveBox {
+    content: zgx::compose::NodeHandle,
+    sizes: zgx::reactive::Signal<(f32, f32)>,
+    /// The content's size as the box last took it (what it eases from).
+    taken: Rc<std::cell::Cell<Option<(f32, f32)>>>,
+    /// What holds its margins (the space it shows past its content's).
+    slack: Rc<Element>,
+}
+impl LiveBox {
+    /// Whether its space is easing (it shows more or less than its content),
+    /// or its content changed and it hasn't taken that yet (it will, this
+    /// frame).
+    fn moving(&self) -> bool {
+        let now = self.sizes.with_untracked(|s| *s);
+        let untaken = self
+            .taken
+            .get()
+            .is_some_and(|t| (t.0 - now.0).abs() > 0.5 || (t.1 - now.1).abs() > 0.5);
+        untaken
+            || margin_of(&self.slack, Prop::Mb).abs() > 0.01
+            || margin_of(&self.slack, Prop::Mr).abs() > 0.01
+    }
+}
+/// A layout box's margin now (`layout_box`'s slack), 0 for none.
+fn margin_of(slack: &Element, prop: Prop) -> f32 {
+    slack
+        .animated
+        .borrow()
+        .styles
+        .iter()
+        .find(|(p, _)| *p == prop)
+        .and_then(|(_, lit)| match lit {
+            Lit::Len(zgx::layout::Length::Px(v)) => Some(*v),
+            Lit::Num(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or(0.)
+}
+thread_local! {
+    /// Every size-animated box mounted, for a box to find those inside it.
+    static LIVE_BOXES: std::cell::RefCell<Vec<std::rc::Weak<LiveBox>>> = Default::default();
+    /// How many times a box has looked for those inside it (`layout_box_scans`).
+    static SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// How many times a size-animated box on this thread has looked through the
+/// others for those inside it: none for a box's first size (a page of them
+/// mounting), once per later change.
+pub(crate) fn layout_box_scans() -> u64 {
+    SCANS.with(std::cell::Cell::get)
+}
+/// The size-animated boxes nearest inside `outer` (none between them and it),
+/// by identity.
+fn boxes_inside(outer: &LiveBox) -> Vec<Rc<LiveBox>> {
+    SCANS.with(|n| n.set(n.get() + 1));
+    let inside: Vec<Rc<LiveBox>> = LIVE_BOXES.with(|all| {
+        let mut all = all.borrow_mut();
+        all.retain(|b| b.strong_count() > 0);
+        all.iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|b| outer.content.holds(&b.content))
+            .collect()
+    });
+    inside
+        .iter()
+        .filter(|b| !inside.iter().any(|other| other.content.holds(&b.content)))
+        .cloned()
+        .collect()
 }
 
 /// Wraps `inner` in a box whose size follows the inner content's, animated.
@@ -4526,6 +4986,12 @@ fn layout_ease(layout: &LayoutAnim) -> (crate::anime::ease::Ease, f64) {
 /// constraints never change, so a frame of the animation lays out only the
 /// box and its ancestors. Nothing is clipped unless `layout_clip` asks: then
 /// a clip inset follows the margin, cutting the content to the space.
+///
+/// A change that comes from a size-animated box inside it (a fold in a
+/// group that folds too) is that box's to ease: the space follows it frame
+/// for frame rather than easing after it again, which left the space lagging
+/// the content (what followed the box overlapping its foot, its clip cutting
+/// it). A box inside it mounting or going is its own change, eased as ever.
 fn layout_box(inner: View, layout: &LayoutAnim, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
     let slack = Element::new(&low.runtime, None, Rc::new([]), "layout");
     let (enter, grow_h, grow_w, clip) = (layout.enter, layout.height, layout.width, layout.clip);
@@ -4538,7 +5004,17 @@ fn layout_box(inner: View, layout: &LayoutAnim, vm: &Rc<Vm>, low: &Rc<Lowering>)
         let (Some(sizes), Some(engine)) = (handle.observe_size(), engine) else {
             return;
         };
-        let last: std::cell::Cell<Option<(f32, f32)>> = Default::default();
+        let last: Rc<std::cell::Cell<Option<(f32, f32)>>> = Default::default();
+        let me = Rc::new(LiveBox {
+            content: handle.clone(),
+            sizes: sizes.clone(),
+            taken: last.clone(),
+            slack: target.clone(),
+        });
+        LIVE_BOXES.with(|all| all.borrow_mut().push(Rc::downgrade(&me)));
+        // The boxes inside it that were moving as it last looked: one that
+        // has just stopped (its last frame) is still the change's.
+        let moving_before: std::cell::RefCell<Vec<std::rc::Weak<LiveBox>>> = Default::default();
         let runtime = engine.runtime.clone();
         let effect = runtime.effect(move || {
             let size = sizes.get();
@@ -4546,6 +5022,26 @@ fn layout_box(inner: View, layout: &LayoutAnim, vm: &Rc<Vm>, low: &Rc<Lowering>)
                 return;
             }
             let previous = last.replace(Some(size));
+            // A box inside it that is moving (its content changed, or its
+            // space eases), or was the last time it looked (its last frame):
+            // the change is that box's, followed.
+            // (Not on its first size: nothing to follow yet, and a page of
+            // boxes mounting would each look through all the others.)
+            let moving: Vec<Rc<LiveBox>> = if previous.is_some() {
+                boxes_inside(&me)
+                    .into_iter()
+                    .filter(|b| b.moving())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let follows = previous.is_some()
+                && (!moving.is_empty()
+                    || moving_before.borrow().iter().any(|b| b.strong_count() > 0));
+            *moving_before.borrow_mut() = moving.iter().map(Rc::downgrade).collect();
+            if follows {
+                return;
+            }
             // The margin now: what the box shows beyond (or short of) the
             // content's last size.
             let current = |prop| {
@@ -4607,7 +5103,12 @@ fn layout_box(inner: View, layout: &LayoutAnim, vm: &Rc<Vm>, low: &Rc<Lowering>)
                     // Entering grows from nothing; a first size otherwise holds.
                     None if enter => 0.,
                     None => continue,
-                    Some(before) if before == now => continue,
+                    // Rounding (text measured again, a shrinking parent's
+                    // share): easing it would lay the box out again each
+                    // frame for nothing.
+                    Some(before) if before == now || (before - now).abs() < EASED_SIZE_NOISE => {
+                        continue;
+                    }
                     Some(before) => before + current(prop).unwrap_or(0.),
                 };
                 let margin = (shown - now) as f64;
@@ -5139,6 +5640,8 @@ fn with_events(
     // script's own) keeps it until release, wherever it goes.
     let captures = press.is_some() && (moved.is_some() || release.is_some());
     let (vm, actions) = (vm.clone(), low.actions.clone());
+    // Where the last move was, for the next one's `dx`, `dy`.
+    let mut last: Option<(f32, f32)> = None;
     view.on_event(move |event| {
         let lua = &vm.lua;
         let local = |x: f32, y: f32| {
@@ -5148,20 +5651,21 @@ fn with_events(
                 .unwrap_or((x, y))
         };
         let held = event.pointer_modifiers();
-        let point = |x: f32, y: f32| -> mlua::Result<mlua::Table> {
+        let point_with = |x: f32, y: f32, motion| -> mlua::Result<mlua::Table> {
             let (lx, ly) = local(x, y);
-            let t = lua.create_table()?;
-            t.set("x", x)?;
-            t.set("y", y)?;
-            t.set("local_x", lx)?;
-            t.set("local_y", ly)?;
-            t.set("shift", held.shift)?;
-            t.set("ctrl", held.control)?;
-            t.set("alt", held.alt)?;
-            t.set("meta", held.meta)?;
-            t.set("cmd", held.primary_shortcut())?;
-            Ok(t)
+            vm.point_table(
+                (x, y, lx, ly),
+                (
+                    held.shift,
+                    held.control,
+                    held.alt,
+                    held.meta,
+                    held.primary_shortcut(),
+                ),
+                motion,
+            )
         };
+        let point = |x: f32, y: f32| point_with(x, y, None);
         if captures
             && event.phase == EventPhase::Target
             && matches!(
@@ -5200,8 +5704,20 @@ fn with_events(
                     run(h, &vm, &actions, p);
                 }
             }
+            // `dx`, `dy`: how far it moved since the last move heard, in
+            // the window's points (the DOM's `movementX`).
             InputEvent::PointerMove { x, y } => {
-                if let (Some(h), Ok(p)) = (&moved, point(*x, *y)) {
+                let (dx, dy) = last.map_or((0., 0.), |(lx, ly)| (x - lx, y - ly));
+                last = Some((*x, *y));
+                if let (Some(h), Ok(p)) = (&moved, point_with(*x, *y, Some((dx, dy, false)))) {
+                    run(h, &vm, &actions, p);
+                }
+            }
+            // The mouse's motion while the pointer is locked: `dx`, `dy`
+            // as it moved, `x`, `y` where it stays.
+            InputEvent::PointerMotion { dx, dy } => {
+                let (x, y) = handle.get().and_then(|h| h.pointer()).unwrap_or_default();
+                if let (Some(h), Ok(p)) = (&moved, point_with(x, y, Some((*dx, *dy, true)))) {
                     run(h, &vm, &actions, p);
                 }
             }
@@ -5211,6 +5727,7 @@ fn with_events(
                 }
             }
             InputEvent::PointerLeave => {
+                last = None;
                 if let Some(h) = &hover {
                     run(h, &vm, &actions, false);
                 }
@@ -5320,6 +5837,9 @@ fn with_rare(
     }
     if let Some(handler) = &rare.double_click {
         view = with_double_click(view, handler.clone(), vm, low, handle.clone());
+    }
+    if let Some(handler) = &rare.pointer_lock {
+        view = with_pointer_lock(view, handler.clone(), vm, low);
     }
     if rare.capture_keys {
         view = view.capture_keys(true);
@@ -5517,6 +6037,20 @@ fn with_double_click(
             }
             InputEvent::PointerLeave => armed = false,
             _ => {}
+        }
+    })
+}
+
+/// `on_pointer_lock`: the node took the pointer's lock or lost it. Its own
+/// lock alone: a descendant's goes by.
+#[inline(never)]
+fn with_pointer_lock(view: View, handler: Handler, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
+    let (vm, actions) = (vm.clone(), low.actions.clone());
+    view.on_event(move |event| {
+        if event.phase == EventPhase::Target
+            && let InputEvent::PointerLockChange(locked) = event.event
+        {
+            run(&handler, &vm, &actions, locked);
         }
     })
 }
@@ -6709,6 +7243,13 @@ fn lower_image(node: &Node, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
             .map(|(_, source)| resolve_owned(source))
     };
     let (dither, characters) = (prop(Prop::Dither), prop(Prop::Characters));
+    // Drawn as a frame the host shows as it is, when it sets one: a `src`
+    // written `host:<name>` (any other lowers as an image alone, its view
+    // as it was), not dithered or drawn in characters, which read pixels.
+    #[cfg(target_os = "macos")]
+    let surfaced = dither.is_none()
+        && characters.is_none()
+        && matches!(src, Source::Lit(Lit::Str(path)) if path.starts_with("host:"));
     // When its file decodes (`ImageData::set_decoding`): as written.
     let decoding = match prop(Prop::Decode)
         .as_ref()
@@ -6762,6 +7303,68 @@ fn lower_image(node: &Node, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
                     (None, None) => image,
                 }
             })
+        }
+    };
+    // A frame the host shows as it is (`ScriptHost::surface`): drawn from
+    // its own storage while the host sets one, its image (pixels read when
+    // asked for) otherwise. Either fills the switch between them, which takes
+    // the node's styles, and takes how the picture fills it (`placement`).
+    #[cfg(target_os = "macos")]
+    let picture = {
+        let plain = Rc::new(picture);
+        let placed = Rc::new(placement(node, vm));
+        let (src, vm2, low2, label) = (resolve_owned(src), vm.clone(), low.clone(), label.clone());
+        let (told, low4, vm4) = (told.clone(), low.clone(), vm.clone());
+        move || -> View {
+            if !surfaced {
+                return plain();
+            }
+            let (src, vm2, low2) = (src.clone(), vm2.clone(), low2.clone());
+            let current = Rc::new(move || match picture_of(&src, &vm2) {
+                Some(Picture::Path(path)) => {
+                    let surface = low2.assets.surface(&path, &low2.runtime)?;
+                    Some((path, surface))
+                }
+                _ => None,
+            });
+            let (plain, label, told, low3, vm3, placed) = (
+                plain.clone(),
+                label.clone(),
+                told.clone(),
+                low4.clone(),
+                vm4.clone(),
+                placed.clone(),
+            );
+            let shown = current.clone();
+            zgx::compose::switch(
+                move || shown().is_some(),
+                move |on, _| match on {
+                    false => placed(plain().w_full().h_full()),
+                    true => {
+                        let (current, told, low3, vm3) =
+                            (current.clone(), told.clone(), low3.clone(), vm3.clone());
+                        // The frame last shown, while its replacement is told:
+                        // dropped with this branch, as the host's goes.
+                        let mut last = None;
+                        let surface =
+                            zgx::compose::native_surface_signal(label.clone(), move || {
+                                if let Some((path, surface)) = current() {
+                                    if let Some(image) = low3.assets.image(&path) {
+                                        told.loaded(&vm3, path, &image);
+                                    }
+                                    last = Some(surface);
+                                }
+                                last.clone().expect("a surface while one shows")
+                            });
+                        placed(
+                            surface
+                                .object_fit(zgx::style::ObjectFit::default())
+                                .w_full()
+                                .h_full(),
+                        )
+                    }
+                },
+            )
         }
     };
     // As it unmounts, the cache lets go of pictures no node shows.
@@ -7174,6 +7777,9 @@ fn list_edges(mut list: View, rare: &crate::node::ListRare, vm: &Rc<Vm>) -> View
     if rare.ancestor {
         list = list.virtualize_in_ancestor();
     }
+    if let Some(ahead) = rare.ahead {
+        list = list.list_ahead(ahead);
+    }
     if let Some(padding) = &rare.scroll_padding {
         list = with_scroll_padding(list, padding, vm);
     }
@@ -7214,6 +7820,8 @@ fn list_heights(
         };
         let values = value.list().iter().map(|v| match v {
             Value::Num(n) if n.is_finite() && *n > 0. => *n as f32,
+            // No room, and not built (`heights` takes positive numbers).
+            Value::Num(n) if *n == 0. => f32::MIN_POSITIVE,
             _ => 1.,
         });
         let _ = r.replace(values);
@@ -7236,15 +7844,24 @@ fn with_scroll_padding(view: View, padding: &crate::node::ScrollPadding, vm: &Rc
         }
     }
 }
+/// `view` with its own scrollbar (`scrollbar = { … }`): apart, as few views
+/// have one, so the lowering of every scroll view and list stays as small.
+#[cold]
+#[inline(never)]
+// (The box as it is held: its deref here, not inlined where it's lowered.)
+#[allow(clippy::borrowed_box)]
+fn with_scrollbar(view: View, spec: &Box<crate::node::ScrollbarSpec>, vm: &Rc<Vm>) -> View {
+    view.scrollbar_style(spec.style(vm))
+}
 /// A list's scrollbar and what happens at its edges.
 fn list_chrome(
     mut list: View,
-    scrollbar: bool,
+    scrollbar: &Option<Box<crate::node::ScrollbarSpec>>,
     rare: Option<&crate::node::ListRare>,
     vm: &Rc<Vm>,
 ) -> View {
-    if scrollbar {
-        list = list.scrollbar(true);
+    if let Some(spec) = scrollbar {
+        list = with_scrollbar(list, spec, vm);
     }
     match rare {
         Some(rare) => list_edges(list, rare, vm),
@@ -7416,7 +8033,7 @@ fn lower_list(kind: &Kind, vm: &Rc<Vm>, low: &Rc<Lowering>, cx: &mut Option<&mut
         match sticky {
             None => list,
             Some(sticky) => {
-                let list = list_chrome(list, *scrollbar, rare.as_deref(), vm);
+                let list = list_chrome(list, scrollbar, rare.as_deref(), vm);
                 match key {
                     None => sticky_list(
                         list,
@@ -7480,6 +8097,7 @@ impl KeptKeys {
 
 /// An item's `field` as a list key: a number, string or boolean, else its
 /// index.
+#[inline]
 fn field_key(item: &Value, field: &str, index: usize) -> ListKey {
     item.field(field)
         .and_then(ListKey::of)
@@ -7661,7 +8279,7 @@ fn lower_item_list(
     let row = {
         let (items, builder, vm, low) = (items.clone(), builder.clone(), vm.clone(), low.clone());
         move |index: Signal<usize>, _: ListKey, cx: &mut Context| -> View {
-            let at = |list: &Value, i: usize| list.list().get(i).cloned().unwrap_or(Value::Nil);
+            let at = |list: &Value, i: usize| list.item(i).cloned().unwrap_or(Value::Nil);
             let runtime = cx.runtime();
             let first = index.with_untracked(|i| *i);
             let item = runtime.signal(items.with_untracked(|l| at(l, first)));
@@ -7710,7 +8328,7 @@ fn lower_item_list(
     };
     let count = {
         let items = items.clone();
-        move || items.with(|l| l.list().len())
+        move || items.with(|l| l.items().len())
     };
     let list_key = {
         let (items, key, vm) = (items.clone(), key.clone(), vm.clone());
@@ -7727,7 +8345,7 @@ fn lower_item_list(
             let Some(key) = &key else {
                 return ListKey::Index(index);
             };
-            let item = items.with(|l| l.list().get(index).cloned().unwrap_or(Value::Nil));
+            let item = items.with(|l| l.item(index).cloned().unwrap_or(Value::Nil));
             if let Some(known) = kept.borrow().get(&item) {
                 return known;
             }
@@ -7736,7 +8354,7 @@ fn lower_item_list(
             let mut kept = kept.borrow_mut();
             kept.whole_items = whole_items;
             // The items gone since stop being kept as the list's length.
-            if kept.keys.len() > 4 * items.with_untracked(|l| l.list().len()) + 64 {
+            if kept.keys.len() > 4 * items.with_untracked(|l| l.items().len()) + 64 {
                 kept.keys.clear();
             }
             kept.keep(&item, &found);
@@ -7754,7 +8372,7 @@ fn lower_item_list(
         );
         let runtime = need(&mut cx).runtime();
         move |index: usize| -> Option<String> {
-            let item = items.with_untracked(|l| l.list().get(index).cloned())?;
+            let item = items.with_untracked(|l| l.item(index).cloned())?;
             if let Some(text) = &explicit {
                 return Some(match vm.call::<Value>(text, index + 1) {
                     Ok(Value::Nil) => String::new(),
@@ -7781,6 +8399,16 @@ fn lower_item_list(
         if *follow {
             rows = rows.anchor_end();
         }
+        // With `estimate`: told of its passes, rows out of view get heights.
+        let watch = rare
+            .as_ref()
+            .and_then(|rare| rare.estimate.clone())
+            .map(|rule| {
+                let (rows, items) = (rows.clone(), items.clone());
+                let now = Rc::new(move || items.with_untracked(Clone::clone));
+                Rc::new(crate::estimate::Estimator::new(rule, now, rows))
+                    as Rc<dyn zgx::compose::RowsWatch>
+            });
         let list = match key {
             // Heights by key, kept as rows move, each read here: no item is
             // made a table to give its key.
@@ -7788,12 +8416,17 @@ fn lower_item_list(
                 let (items, field) = (items.clone(), key_field.clone().unwrap());
                 let keys = move || {
                     items.with(|l| {
-                        let items = l.list().iter().enumerate();
+                        let items = l.items().iter().enumerate();
                         items.map(|(i, item)| field_key(item, &field, i)).collect()
                     })
                 };
                 let estimate = |_: &[ListKey], _: usize| f32::NAN;
-                measured_rows(offset, rows, *overscan, keys, estimate, row)
+                match watch {
+                    Some(watch) => zgx::compose::measured_rows_watched(
+                        watch, offset, rows, *overscan, keys, estimate, row,
+                    ),
+                    None => measured_rows(offset, rows, *overscan, keys, estimate, row),
+                }
             }
             None => {
                 let r = rows.clone();
@@ -7808,7 +8441,12 @@ fn lower_item_list(
                 let mut kept = KeptKeys::default();
                 let keys = move || items.with(|l| item_keys(&vm, &key, l, &mut kept));
                 let estimate = |_: &[ListKey], _: usize| f32::NAN;
-                measured_rows(offset, rows, *overscan, keys, estimate, row)
+                match watch {
+                    Some(watch) => zgx::compose::measured_rows_watched(
+                        watch, offset, rows, *overscan, keys, estimate, row,
+                    ),
+                    None => measured_rows(offset, rows, *overscan, keys, estimate, row),
+                }
             }
         };
         return list.keyboard_navigation(keyboard).row_text(copy);
@@ -7824,7 +8462,7 @@ fn lower_item_list(
             return list;
         };
         let inset = rare.as_ref().map_or(0., |rare| rare.sticky_top);
-        let list = list_chrome(list, *scrollbar, rare.as_deref(), vm);
+        let list = list_chrome(list, scrollbar, rare.as_deref(), vm);
         return sticky_list(
             list, sticky, inset, offset, rows, sticky_key, sticky_row, vm, cx,
         );
@@ -8020,51 +8658,78 @@ fn lower_rich(spans: &[Span], vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
         underline_thickness: Option<f32>,
         hover: Option<(bool, Option<zgx::theme::Themed<Color>>)>,
     }
+    // Whether any span fades in: known as they're taken, so a paragraph
+    // none of whose spans does builds them as before, and only one that has
+    // one fades them after (`fade_spans`, out of line).
+    let mut fades = false;
     let owned: Vec<OwnedSpan> = spans
         .iter()
-        .map(|s| OwnedSpan {
-            text: match &s.text {
-                Text::Literal(l) => Text::Literal(l.clone()),
-                Text::Template(segments) => Text::Template(
-                    segments
-                        .iter()
-                        .map(|seg| match seg {
-                            Segment::Literal(l) => Segment::Literal(l.clone()),
-                            Segment::State(s, path) => Segment::State(s.clone(), path.clone()),
-                        })
-                        .collect(),
-                ),
-                Text::Computed(computed) => Text::Computed(computed.clone()),
-            },
-            style: SpanStyle {
-                color: s.color,
-                background: s.background,
-                size: s.size,
-                weight: s.weight,
-                italic: s.italic,
-                underline: s.underline,
-                strike: s.strike,
-                padding: s.padding,
-                radius: s.radius,
-                underline_offset: s.underline_offset,
-                underline_style: s.underline_style,
-                underline_color: s.underline_color,
-                underline_thickness: s.underline_thickness,
-                hover: s.hover,
-            },
-            font: s.font.clone(),
-            lang: s.lang.clone(),
-            followed: (s.followed.iter())
-                .map(|(name, ty, source)| (*name, *ty, resolve_owned(source)))
-                .collect(),
-            click: s.click.clone(),
-            href: s.href.clone(),
-            rare: s.rare.clone(),
+        .map(|s| {
+            if let Some(rare) = &s.rare
+                && rare.fade.is_some()
+            {
+                fades = true;
+            }
+            OwnedSpan {
+                text: match &s.text {
+                    Text::Literal(l) => Text::Literal(l.clone()),
+                    Text::Template(segments) => Text::Template(
+                        segments
+                            .iter()
+                            .map(|seg| match seg {
+                                Segment::Literal(l) => Segment::Literal(l.clone()),
+                                Segment::State(s, path) => Segment::State(s.clone(), path.clone()),
+                            })
+                            .collect(),
+                    ),
+                    Text::Computed(computed) => Text::Computed(computed.clone()),
+                },
+                style: SpanStyle {
+                    color: s.color,
+                    background: s.background,
+                    size: s.size,
+                    weight: s.weight,
+                    italic: s.italic,
+                    underline: s.underline,
+                    strike: s.strike,
+                    padding: s.padding,
+                    radius: s.radius,
+                    underline_offset: s.underline_offset,
+                    underline_style: s.underline_style,
+                    underline_color: s.underline_color,
+                    underline_thickness: s.underline_thickness,
+                    hover: s.hover,
+                },
+                font: s.font.clone(),
+                lang: s.lang.clone(),
+                followed: (s.followed.iter())
+                    .map(|(name, ty, source)| (*name, *ty, resolve_owned(source)))
+                    .collect(),
+                click: s.click.clone(),
+                href: s.href.clone(),
+                rare: s.rare.clone(),
+            }
         })
         .collect();
     let (vm, actions, low) = (vm.clone(), low.actions.clone(), low.clone());
+    /// `spans`, made from `owned` one for one, with those whose spans fade in
+    /// fading.
+    #[cold]
+    #[inline(never)]
+    fn fade_spans(spans: Vec<TextSpan>, owned: &[OwnedSpan]) -> Vec<TextSpan> {
+        spans
+            .into_iter()
+            .zip(owned)
+            .map(
+                |(out, span)| match span.rare.as_ref().and_then(|rare| rare.fade) {
+                    Some(fade) => out.fade_in(fade),
+                    None => out,
+                },
+            )
+            .collect()
+    }
     rich_text_signal(move || {
-        owned
+        let spans: Vec<TextSpan> = owned
             .iter()
             .map(|span| {
                 // Copied only for the few that follow: a span's own is read
@@ -8186,9 +8851,15 @@ fn lower_rich(spans: &[Span], vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
                     }
                 }
                 let rare = span.rare.as_deref();
-                if let Some(build) = rare.and_then(|rare| rare.menu.as_ref()) {
-                    let (build, vm, low) = (build.clone(), vm.clone(), low.clone());
-                    out = out.context_menu(move |e| context_menu_items(&vm, &low, &build, e, None));
+                if let Some(rare) = rare {
+                    if let Some(end) = rare.padding_end.filter(|end| *end != padding[0]) {
+                        out = out.padding_end(end);
+                    }
+                    if let Some(build) = rare.menu.as_ref() {
+                        let (build, vm, low) = (build.clone(), vm.clone(), low.clone());
+                        out = out
+                            .context_menu(move |e| context_menu_items(&vm, &low, &build, e, None));
+                    }
                 }
                 if let Some(href) = &span.href {
                     out = out.href(href.clone());
@@ -8212,11 +8883,19 @@ fn lower_rich(spans: &[Span], vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
                         size: icon.size,
                         gap: icon.gap,
                         tint,
+                        bg: icon.bg.as_ref().and_then(crate::node::themed_color),
+                        radius: icon.radius,
+                        pad: icon.pad,
                     });
                 }
                 out
             })
-            .collect()
+            .collect();
+        if fades {
+            fade_spans(spans, &owned)
+        } else {
+            spans
+        }
     })
 }
 
@@ -8817,7 +9496,9 @@ fn apply<S: Styled>(s: S, prop: Prop, lit: &Lit) -> S {
         (Font, Lit::Str(v)) => s.font_family(font_family(v)),
         (Wrap, Lit::Bool(v)) => s.text_wrap(*v),
         (Wrap, Lit::Str(_)) => s.text_balance(true),
-        (Truncate, Lit::Bool(true)) => s.truncate(),
+        // The ellipsis alone: text with one and no clamp keeps one line, so
+        // `lines` wins however the two are set, in whichever order.
+        (Truncate, Lit::Bool(true)) => s.text_overflow(zgx::text_layout::TextOverflow::Ellipsis),
         (Lines, Lit::Num(v)) => s.line_clamp(*v as u32),
         (LineHeight, Lit::Num(v)) => s.line_height(*v),
         (LetterSpacing, Lit::Num(v)) => s.letter_spacing(*v),
@@ -8829,6 +9510,7 @@ fn apply<S: Styled>(s: S, prop: Prop, lit: &Lit) -> S {
         }
         (FontFeatures, Lit::Str(v)) => s.font_features(font_features(v)),
         (Lang, Lit::Str(v)) => s.lang(&**v),
+        (Geometry, Lit::Str(v)) => geometry_of(s, v),
         _ => s,
     }
 }
@@ -9334,5 +10016,94 @@ fn a_rows_identity_and_key_read_as_formatted() {
         assert!(!displays_as(&value, &format!("{text}0")));
         assert!(!displays_as(&value, &text[..text.len() - 1]));
         assert!(!displays_as(&value, "x"));
+    }
+}
+/// `geometry = "tag"`: its box read by shaders asking for the tag.
+#[cold]
+#[inline(never)]
+fn geometry_of<S: Styled>(s: S, name: &str) -> S {
+    s.geometry_tag(zgx::decoration::geometry_tag(name))
+}
+
+/// A list keeping its first items (a stream's, growing at its end or its
+/// last item changing) passes over the rest alone, and every row, name and
+/// mark comes out as the full pass makes them, through any mix of edits:
+/// appends, last items changed, equal items in new tables, inserts,
+/// removals and swaps, rows live or built again.
+#[cfg(test)]
+#[test]
+fn a_list_keeping_its_first_items_passes_over_the_rest_as_the_full_pass_does() {
+    let runtime = zgx::reactive::Runtime::new();
+    // A table item: `n` its contents, a new allocation each call.
+    let table = |n: u64| Value::Map(Rc::from(vec![(Rc::from("n"), Value::Num(n as f64))]));
+    for live in [false, true] {
+        for seed in 1..=40_u64 {
+            let mut random = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = || {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                random
+            };
+            let (mut full_rows, mut full) = (Rows::default(), Unkeyed::default());
+            let (mut rows, mut state) = (Rows::default(), Unkeyed::default());
+            let mut list: Vec<Value> = Vec::new();
+            let mut skipped = 0;
+            for step in 0..120 {
+                let at = |len: usize, r: u64| (r % (len.max(1) as u64)) as usize;
+                match next() % 10 {
+                    0..=2 => list.push(table(next() % 6)),
+                    3 => list.push(Value::Num((next() % 4) as f64)),
+                    4 if !list.is_empty() => {
+                        let last = list.len() - 1;
+                        list[last] = table(next() % 6);
+                    }
+                    5 if !list.is_empty() => {
+                        // Equal contents, a new table.
+                        let i = at(list.len(), next());
+                        if let Value::Map(m) = &list[i] {
+                            list[i] = Value::Map(Rc::from(m.to_vec()));
+                        }
+                    }
+                    6 => {
+                        let i = at(list.len() + 1, next());
+                        list.insert(i.min(list.len()), table(next() % 6));
+                    }
+                    7 if !list.is_empty() => {
+                        let i = at(list.len(), next());
+                        list.remove(i);
+                    }
+                    8 if list.len() > 1 => {
+                        let (i, j) = (at(list.len(), next()), at(list.len(), next()));
+                        list.swap(i, j);
+                    }
+                    _ => {}
+                }
+                let names = unkeyed_rows(&list, &mut full_rows, &mut full, 0, live, &runtime);
+                let value = Value::List(list.clone().into());
+                full.items = value.clone();
+                let from = state.kept(&value);
+                skipped += from;
+                let rest = unkeyed_rows(&list[from..], &mut rows, &mut state, from, live, &runtime);
+                state.items = value;
+                assert_eq!(rest[..], names[from..], "seed {seed} step {step}: names");
+                assert_eq!(state.order, full.order, "seed {seed} step {step}: order");
+                assert_eq!(state.next, full.next, "seed {seed} step {step}: next");
+                assert_eq!(rows.len(), full_rows.len(), "seed {seed} step {step}: rows");
+                for (name, row) in &full_rows {
+                    let ours = &rows[name];
+                    assert!(
+                        ours.last == row.last
+                            && ours.generation == row.generation
+                            && ours.identity == row.identity
+                            && ours.seen == row.seen
+                            && !row.seen,
+                        "seed {seed} step {step}: row {name}"
+                    );
+                }
+            }
+            // The prefix was taken, not only the full pass run twice.
+            assert!(skipped > 0, "seed {seed}");
+        }
     }
 }

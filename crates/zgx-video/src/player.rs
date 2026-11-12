@@ -1,0 +1,1015 @@
+//! A composition playing live, in any zgx app: its frames made on a thread of
+//! its own, on that thread's virtual clock, through the film a render uses, so
+//! what plays is what a render writes. `Player::view` shows it; the studio is
+//! a `Player` with a timeline and a props panel around it. Nothing runs while
+//! it's neither playing nor asked for a frame: its thread waits for a message.
+use crate::film::Timing;
+use crate::script::{Composition, ScriptStage, compositions};
+use serde_json::{Value as Json, json};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
+use zgx::image::ImageData;
+use zgx::reactive::{Runtime, Signal};
+use zgx::scene::Color;
+
+/// What the app asks of the thread making its frames.
+pub(crate) enum Ask {
+    /// Show this composition, with these props, from this frame.
+    Open(String, Json, u64),
+    Seek(u64),
+    Play(bool),
+    Loop(bool),
+    /// Whether what it draws is seen: unseen, it draws nothing.
+    Watch(bool),
+    /// The script changed: build it again, staying at the frame it's at.
+    Reload,
+    /// How long it keeps its drawn frames once nothing is asked of it.
+    KeepFor(Duration),
+    /// Frames as pixel buffers for a window to show as they are (macOS,
+    /// `Player::view`), rather than read back to bytes.
+    #[cfg(target_os = "macos")]
+    Surfaces(bool),
+    /// Bytes wanted too (a script's player where there are no pixel
+    /// buffers): none then. On macOS a script's player takes pixel buffers.
+    #[cfg_attr(target_os = "macos", expect(dead_code))]
+    Pixels(bool),
+    /// Lose its renderer's device, as a driver reset would (tests).
+    LoseDevice,
+    Quit,
+}
+
+/// What a player's thread tells: a frame drawn, the composition opened, the
+/// sequences shown so far, playing stopped, or why it couldn't go on.
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// A frame drawn: RGBA, premultiplied.
+    Frame {
+        /// Which.
+        frame: u64,
+        /// Its width in pixels.
+        width: u32,
+        /// Its height.
+        height: u32,
+        /// Its pixels.
+        pixels: Arc<[u8]>,
+    },
+    /// A composition opened.
+    Opened {
+        /// Which, as its props measure it.
+        composition: Box<Composition>,
+    },
+    /// The sequences shown so far.
+    Tracks(Vec<crate::script::Track>),
+    /// Playing stopped (at its end, not looping, or for an error).
+    Stopped,
+    /// Why it couldn't go on.
+    Error(String),
+}
+
+/// How many bytes of drawn frames the thread keeps, for scrubbing back without
+/// playing the composition from its start.
+const CACHE_BYTES: usize = 512 << 20;
+/// How long it keeps them once nothing is asked of it: at rest, a player
+/// holds no frames.
+const CACHE_KEPT: Duration = Duration::from_secs(5);
+
+/// A frame kept: its bytes (for a script), its pixel buffer (for a view on
+/// macOS, outside the pool's count once the pool's are held), or both, as
+/// what showed it wanted.
+#[derive(Clone)]
+struct Kept {
+    pixels: Option<Arc<[u8]>>,
+    #[cfg(target_os = "macos")]
+    buffer: Option<zgx_gpu::PixelBuffer>,
+    /// Bytes it holds: a buffer's counted as its pixels.
+    bytes: usize,
+}
+
+/// What its thread keeps count of, for the player to read (tests): the
+/// bytes of frames it keeps, and the times it gave back pixel buffers at rest.
+#[derive(Default)]
+pub(crate) struct Counts {
+    cached: AtomicUsize,
+    #[cfg(target_os = "macos")]
+    releases: AtomicUsize,
+}
+
+/// Frames drawn for this script, as they were: those shown while paused or
+/// scrubbing, not those played (played on, a frame isn't asked for again).
+/// `counts` says how many bytes, for the player to read.
+struct Cache {
+    frames: HashMap<u64, Kept>,
+    order: VecDeque<u64>,
+    bytes: usize,
+    counts: Arc<Counts>,
+}
+impl Cache {
+    fn new(counts: Arc<Counts>) -> Self {
+        Self {
+            frames: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            counts,
+        }
+    }
+    fn get(&mut self, frame: u64) -> Option<Kept> {
+        self.frames.get(&frame).cloned()
+    }
+    fn put(&mut self, frame: u64, kept: Kept) {
+        self.bytes += kept.bytes;
+        match self.frames.insert(frame, kept) {
+            Some(was) => self.bytes -= was.bytes,
+            None => self.order.push_back(frame),
+        }
+        while self.bytes > CACHE_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(gone) = self.frames.remove(&oldest) {
+                self.bytes -= gone.bytes;
+            }
+        }
+        self.counts.cached.store(self.bytes, Ordering::Relaxed);
+    }
+    fn clear(&mut self) {
+        *self = Self::new(self.counts.clone());
+        self.counts.cached.store(0, Ordering::Relaxed);
+    }
+}
+
+/// What's playing on the thread, and how to get to any frame of it.
+struct Preview {
+    path: PathBuf,
+    scale: f32,
+    composition: Option<Composition>,
+    props: Json,
+    stage: Option<ScriptStage>,
+    cache: Cache,
+    tell: Sender<Event>,
+    wake: Rc<dyn Fn()>,
+    tracks: usize,
+    /// Frames as pixel buffers, sent here (`Ask::Surfaces`), unless bytes
+    /// are wanted (`Ask::Pixels`).
+    surfaces: bool,
+    pixels_wanted: bool,
+    #[cfg(target_os = "macos")]
+    surfaces_to: Sender<(u64, zgx_gpu::PixelBuffer)>,
+}
+impl Preview {
+    fn say(&self, told: Event) {
+        let _ = self.tell.send(told);
+        (self.wake)();
+    }
+    fn build(&mut self) -> Result<(), String> {
+        self.stage = None;
+        let id = self.composition.as_ref().map(|comp| comp.id.clone());
+        let list = compositions(&self.path, id.as_deref(), &self.props)?;
+        let composition = id
+            .and_then(|id| list.iter().find(|comp| comp.id == id).cloned())
+            .unwrap_or_else(|| list[0].clone());
+        // The preview is drawn no larger than a window shows it.
+        // No wider than a window shows it: playing keeps up.
+        let scale = self.scale * (1280. / composition.width).min(1.);
+        self.stage = Some(ScriptStage::with(
+            &self.path,
+            composition.clone(),
+            &self.props,
+            scale,
+            Color(0, 0, 0, 0),
+            Timing::default(),
+        )?);
+        let same = self.composition.as_ref() == Some(&composition);
+        self.composition = Some(composition.clone());
+        self.tracks = 0;
+        if !same {
+            self.say(Event::Opened {
+                composition: Box::new(composition),
+            });
+        }
+        Ok(())
+    }
+    /// Draw `frame` (or take it from the cache) and tell it; `keep`, keep it.
+    fn show(&mut self, frame: u64, keep: bool) -> Result<(), String> {
+        if self.stage.is_none() {
+            self.build()?;
+        }
+        let (width, height) = self.stage.as_ref().map_or((1, 1), |s| s.stage.pixel_size());
+        // A frame kept serves if it holds what's wanted: bytes for a
+        // script, a pixel buffer for a view.
+        let bytes_wanted = !self.surfaces || self.pixels_wanted;
+        if let Some(kept) = self.cache.get(frame) {
+            let serves = kept.pixels.is_some() || !bytes_wanted;
+            #[cfg(target_os = "macos")]
+            let serves = serves && (kept.buffer.is_some() || !self.surfaces);
+            if serves {
+                #[cfg(target_os = "macos")]
+                if let Some(buffer) = kept.buffer.filter(|_| self.surfaces) {
+                    let _ = self.surfaces_to.send((frame, buffer));
+                }
+                self.say(Event::Frame {
+                    frame,
+                    width,
+                    height,
+                    pixels: kept.pixels.unwrap_or_else(|| Arc::from(&[][..])),
+                });
+                return Ok(());
+            }
+        }
+        if self
+            .stage
+            .as_ref()
+            .is_some_and(|stage| stage.output_frame() > frame)
+        {
+            self.build()?;
+        }
+        let stage = self.stage.as_mut().expect("built");
+        // For a window that shows it as it is: copied on the GPU, no bytes
+        // (and read back too, for a script that shows bytes as well).
+        #[cfg(target_os = "macos")]
+        if self.surfaces {
+            let mut pixels = Vec::new();
+            let buffer = stage.film.draw_output_surface(
+                frame,
+                &mut pixels,
+                self.pixels_wanted,
+                Duration::from_secs(30),
+            )?;
+            if !self.pixels_wanted {
+                // A blurred frame's bytes: not asked for.
+                pixels = Vec::new();
+            }
+            let tracks = stage.tracks();
+            if tracks.len() != self.tracks {
+                self.tracks = tracks.len();
+                self.say(Event::Tracks(tracks));
+            }
+            let pixels: Arc<[u8]> = pixels.into();
+            if keep {
+                let wanted = self.pixels_wanted.then(|| pixels.clone());
+                self.cache.put(
+                    frame,
+                    Kept {
+                        bytes: wanted.as_ref().map_or(0, |p| p.len())
+                            + width as usize * height as usize * 4,
+                        pixels: wanted,
+                        buffer: Some(buffer.clone()),
+                    },
+                );
+            }
+            let _ = self.surfaces_to.send((frame, buffer));
+            self.say(Event::Frame {
+                frame,
+                width,
+                height,
+                pixels,
+            });
+            return Ok(());
+        }
+        let mut pixels = Vec::new();
+        stage.draw_output(frame, &mut pixels, Duration::from_secs(30))?;
+        let tracks = stage.tracks();
+        if tracks.len() != self.tracks {
+            self.tracks = tracks.len();
+            self.say(Event::Tracks(tracks));
+        }
+        let pixels: Arc<[u8]> = pixels.into();
+        if keep {
+            self.cache.put(
+                frame,
+                Kept {
+                    bytes: pixels.len(),
+                    pixels: Some(pixels.clone()),
+                    #[cfg(target_os = "macos")]
+                    buffer: None,
+                },
+            );
+        }
+        self.say(Event::Frame {
+            frame,
+            width,
+            height,
+            pixels,
+        });
+        Ok(())
+    }
+    /// Move there without drawing: playing, behind time.
+    fn last_frame(&self) -> u64 {
+        self.composition
+            .as_ref()
+            .map_or(0, |comp| comp.duration.saturating_sub(1))
+    }
+    fn fps(&self) -> f64 {
+        self.composition.as_ref().map_or(30., |comp| comp.fps)
+    }
+}
+
+/// The thread's loop. Playing, it keeps to real time, drawing the frame due
+/// now; else it sleeps until it's asked something.
+pub(crate) fn run(
+    path: PathBuf,
+    scale: f32,
+    asks: Receiver<Ask>,
+    tell: Sender<Event>,
+    wake: Box<dyn Fn() + Send>,
+    counts: Arc<Counts>,
+    #[cfg(target_os = "macos")] surfaces_to: Sender<(u64, zgx_gpu::PixelBuffer)>,
+) {
+    let wake: Rc<dyn Fn()> = Rc::from(wake as Box<dyn Fn()>);
+    let mut preview = Preview {
+        path,
+        scale,
+        composition: None,
+        props: json!({}),
+        stage: None,
+        cache: Cache::new(counts.clone()),
+        tell,
+        wake,
+        tracks: 0,
+        surfaces: false,
+        pixels_wanted: false,
+        #[cfg(target_os = "macos")]
+        surfaces_to,
+    };
+    let mut at = 0u64;
+    let mut playing: Option<(Instant, u64)> = None;
+    let mut looping = true;
+    // Unseen (its box offscreen, scrolled away, its window covered), it
+    // draws nothing: its clock runs on, and seen again it draws the frame
+    // due then. `stale`: a frame it moved to and didn't draw.
+    let mut watched = true;
+    let mut stale = false;
+    let mut keep_for = CACHE_KEPT;
+    // Pixel buffers drawn since it last gave back those no one holds: once
+    // it rests (paused, nothing asked), a while on, it does (`keep_for`).
+    // Its pool can't free one CoreVideo still holds, about a second past the
+    // last frame, so giving back at the pause itself frees little.
+    #[cfg(target_os = "macos")]
+    let mut drawn_since_release = false;
+    loop {
+        // Until the next frame is due, or for ever: an idle preview waits.
+        // Unseen and playing, only its end matters (not looping), or nothing.
+        let wait = match playing {
+            Some((started, from)) if watched => {
+                Some(started + Duration::from_secs_f64((at + 1 - from) as f64 / preview.fps()))
+            }
+            Some((started, from)) if !looping => Some(
+                started
+                    + Duration::from_secs_f64(
+                        (preview.last_frame() + 1).saturating_sub(from) as f64 / preview.fps(),
+                    ),
+            ),
+            _ => None,
+        };
+        let ask = match wait {
+            Some(due) => match asks.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                Ok(ask) => Some(ask),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            // At rest with frames kept: kept a while, then given back.
+            None if preview.cache.bytes > 0 => match asks.recv_timeout(keep_for) {
+                Ok(ask) => Some(ask),
+                Err(RecvTimeoutError::Timeout) => {
+                    preview.cache.clear();
+                    // Its pixel buffers too: only the one shown stays.
+                    #[cfg(target_os = "macos")]
+                    if let Some(stage) = &preview.stage {
+                        stage.film.stage.release_surfaces();
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            // At rest after drawing pixel buffers: those no one holds given
+            // back once, a while on.
+            #[cfg(target_os = "macos")]
+            None if drawn_since_release => match asks.recv_timeout(keep_for) {
+                Ok(ask) => Some(ask),
+                Err(RecvTimeoutError::Timeout) => {
+                    drawn_since_release = false;
+                    if let Some(stage) = &preview.stage {
+                        stage.film.stage.release_surfaces();
+                        counts.releases.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            None => match asks.recv() {
+                Ok(ask) => Some(ask),
+                Err(_) => return,
+            },
+        };
+        // The latest of what's waiting: scrubbing runs ahead of drawing.
+        let mut asked = ask.into_iter().collect::<Vec<_>>();
+        asked.extend(asks.try_iter());
+        // Where to show: the last frame asked for. An ask that only shows
+        // the frame it's at again (seen, another form, built anew) keeps a
+        // frame asked for before it in the same batch.
+        let mut seek = None;
+        let mut result = Ok(());
+        // At its end, not looping: `Stopped` once its last frame is drawn.
+        let mut ended = false;
+        for ask in asked {
+            match ask {
+                Ask::Quit => return,
+                Ask::LoseDevice => {
+                    if let Some(stage) = &preview.stage {
+                        stage.film.stage.debug_lose_device();
+                    }
+                }
+                Ask::Open(id, props, frame) => {
+                    if preview
+                        .composition
+                        .as_ref()
+                        .is_none_or(|comp| comp.id != id)
+                        || preview.props != props
+                    {
+                        preview.cache.clear();
+                        preview.props = props;
+                        let list = compositions(&preview.path, Some(&id), &preview.props);
+                        match list.map(|list| list.into_iter().find(|comp| comp.id == id)) {
+                            Ok(Some(comp)) => {
+                                let same =
+                                    preview.composition.as_ref().is_some_and(|was| *was == comp);
+                                preview.composition = Some(comp.clone());
+                                preview.stage = None;
+                                if !same {
+                                    preview.say(Event::Opened {
+                                        composition: Box::new(comp),
+                                    });
+                                }
+                                result = preview.build();
+                            }
+                            Ok(None) => result = Err(format!("no composition `{id}`")),
+                            Err(error) => result = Err(error),
+                        }
+                    }
+                    seek = Some(frame);
+                }
+                Ask::Seek(frame) => {
+                    seek = Some(frame);
+                    playing = playing.map(|_| (Instant::now(), frame));
+                }
+                Ask::Play(on) => {
+                    if on {
+                        // Played on, no frame is asked for again.
+                        preview.cache.clear();
+                        if at >= preview.last_frame() {
+                            at = 0;
+                            seek = Some(0);
+                        }
+                        playing = Some((Instant::now(), at));
+                    } else {
+                        playing = None;
+                    }
+                }
+                Ask::Loop(on) => looping = on,
+                Ask::Watch(on) => {
+                    // Seen again: playing, it draws the frame due now
+                    // (below); else the one it moved to unseen.
+                    if on && !watched && stale && playing.is_none() {
+                        seek.get_or_insert(at);
+                    }
+                    watched = on;
+                }
+                Ask::KeepFor(time) => keep_for = time,
+                #[cfg(target_os = "macos")]
+                Ask::Surfaces(on) => {
+                    // A frame shown already, shown again the other way. Its
+                    // view asks as it's built, before it's seen or not.
+                    if preview.surfaces != on {
+                        preview.surfaces = on;
+                        if preview.composition.is_some() {
+                            seek.get_or_insert(at);
+                        }
+                    }
+                }
+                Ask::Pixels(on) => {
+                    if preview.pixels_wanted != on {
+                        preview.pixels_wanted = on;
+                        seek.get_or_insert(at);
+                    }
+                }
+                Ask::Reload => {
+                    preview.cache.clear();
+                    result = preview.build();
+                    seek.get_or_insert(at);
+                }
+            }
+        }
+        if result.is_ok() {
+            if let Some((started, from)) = playing.filter(|_| seek.is_none()) {
+                // Behind time, it skips: real speed comes first.
+                let due = from + (started.elapsed().as_secs_f64() * preview.fps()) as u64;
+                let last = preview.last_frame();
+                if due > last {
+                    if looping {
+                        // Around again, as far into it as time says (unseen
+                        // for longer than a pass, past several).
+                        let into = (due - last - 1) % (last + 1);
+                        let back = Duration::from_secs_f64(into as f64 / preview.fps());
+                        playing = Some((
+                            Instant::now()
+                                .checked_sub(back)
+                                .unwrap_or_else(Instant::now),
+                            0,
+                        ));
+                        seek = Some(into);
+                    } else {
+                        // Told once the last frame is drawn: stopped, it
+                        // shows its last, not the one before it.
+                        playing = None;
+                        seek = Some(last);
+                        ended = true;
+                    }
+                } else {
+                    seek = Some(due.max(at + 1));
+                }
+            }
+            if let Some(frame) = seek {
+                at = frame.min(
+                    preview
+                        .last_frame()
+                        .max(frame * u64::from(preview.composition.is_none())),
+                );
+                if watched {
+                    result = preview.show(at, playing.is_none());
+                    #[cfg(target_os = "macos")]
+                    {
+                        drawn_since_release |= preview.surfaces;
+                    }
+                    // Its device lost (a driver reset, a GPU removed): built
+                    // again on a new one, and the frame drawn again, rather
+                    // than stopping with an error the app can't undo.
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.starts_with("GPU device lost"))
+                    {
+                        result = preview
+                            .build()
+                            .and_then(|()| preview.show(at, playing.is_none()));
+                    }
+                    stale = false;
+                    // At rest, only the buffer shown is held.
+                    #[cfg(target_os = "macos")]
+                    if playing.is_none()
+                        && let Some(stage) = &preview.stage
+                    {
+                        stage.film.stage.release_surfaces();
+                    }
+                } else {
+                    stale = true;
+                }
+            }
+        }
+        if ended && result.is_ok() {
+            preview.say(Event::Stopped);
+        }
+        if let Err(error) = result {
+            playing = None;
+            preview.say(Event::Stopped);
+            preview.say(Event::Error(error));
+        }
+    }
+}
+
+/// A composition playing live: ask it for frames, play it, give it props;
+/// what it shows follows as signals and as [`Player::view`].
+pub struct Player {
+    asks: Sender<Ask>,
+    events: RefCell<Option<(Receiver<Event>, zgx::task::LatestReceiver<()>)>>,
+    /// The frame it shows.
+    pub frame: Signal<u64>,
+    /// Whether it plays.
+    pub playing: Signal<bool>,
+    /// What it opened.
+    pub composition: Signal<Option<Composition>>,
+    /// The sequences shown so far.
+    pub tracks: Signal<Vec<crate::script::Track>>,
+    /// Why it couldn't go on, until it can.
+    pub error: Signal<Option<String>>,
+    /// The picture it shows, as bytes. While its [`Player::view`] shows
+    /// pixel buffers (macOS), they are read when an image's pixels are first
+    /// asked for, and no frame is read back that no one reads.
+    pub image: Signal<Option<Arc<ImageData>>>,
+    /// What its thread keeps count of: the bytes of drawn frames it keeps,
+    /// and the times it gave back the pixel buffers no one held, at rest.
+    counts: Arc<Counts>,
+    /// Its frames as pixel buffers, as its thread sends them (`view`, macOS).
+    #[cfg(target_os = "macos")]
+    surfaces: Receiver<(u64, zgx_gpu::PixelBuffer)>,
+    #[cfg(target_os = "macos")]
+    surface: Signal<Option<Rc<zgx::native_surface::NativeSurface>>>,
+}
+impl Player {
+    /// A player of the script at `path` (a file, or a directory holding
+    /// `video.luau`), its frames drawn `scale` pixels a point (no wider than
+    /// 1280). It shows nothing until [`Player::open`].
+    pub fn new(runtime: &Runtime, path: &Path, scale: f32) -> Result<Rc<Self>, String> {
+        crate::script::entry_of(path)?;
+        let (asks, asked) = channel();
+        let (tell, told) = channel::<Event>();
+        let (wake_up, woken) = zgx::task::latest::<()>();
+        #[cfg(target_os = "macos")]
+        let (surfaces_to, surfaces) = channel();
+        let path = path.to_owned();
+        let counts = Arc::new(Counts::default());
+        let counted = counts.clone();
+        std::thread::Builder::new()
+            .name("zgx-video player".into())
+            .spawn(move || {
+                run(
+                    path,
+                    scale,
+                    asked,
+                    tell,
+                    Box::new(move || {
+                        wake_up.send(());
+                    }),
+                    counted,
+                    #[cfg(target_os = "macos")]
+                    surfaces_to,
+                );
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Rc::new(Self {
+            asks,
+            events: RefCell::new(Some((told, woken))),
+            frame: runtime.signal(0),
+            playing: runtime.signal(false),
+            composition: runtime.signal(None),
+            tracks: runtime.signal(Vec::new()),
+            error: runtime.signal(None),
+            image: runtime.signal(None),
+            counts,
+            #[cfg(target_os = "macos")]
+            surfaces,
+            #[cfg(target_os = "macos")]
+            surface: runtime.signal(None),
+        }))
+    }
+    /// Bytes of drawn frames its thread keeps now: for tests.
+    #[doc(hidden)]
+    pub fn cached_bytes(&self) -> usize {
+        self.counts.cached.load(Ordering::Relaxed)
+    }
+    /// Times its thread gave back pixel buffers at rest: for tests.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn surface_releases(&self) -> usize {
+        self.counts.releases.load(Ordering::Relaxed)
+    }
+    /// How long it keeps drawn frames once nothing is asked of it (5 s):
+    /// for tests.
+    #[doc(hidden)]
+    pub fn keep_frames_for(&self, time: Duration) {
+        let _ = self.asks.send(Ask::KeepFor(time));
+    }
+    /// Show composition `id` with `props` over its defaults, at `frame`.
+    pub fn open(&self, id: &str, props: Json, frame: u64) {
+        let _ = self.asks.send(Ask::Open(id.to_owned(), props, frame));
+    }
+    /// Show `frame`.
+    pub fn seek(&self, frame: u64) {
+        let _ = self.asks.send(Ask::Seek(frame));
+    }
+    /// Play at real speed, or stop.
+    pub fn play(&self, on: bool) {
+        self.playing.set(on);
+        let _ = self.asks.send(Ask::Play(on));
+    }
+    /// Whether what it shows is seen (true to begin with). Unseen, it draws
+    /// nothing, playing or not: its clock runs on, and seen again it draws
+    /// the frame due then. [`Player::view`] says so itself, from its box's
+    /// visibility and its window's; a script's player is told by
+    /// `"<name>.watch"`.
+    pub fn watch(&self, seen: bool) {
+        let _ = self.asks.send(Ask::Watch(seen));
+    }
+    /// Lose the device its frames are drawn on, as a driver reset would:
+    /// for tests of recovery.
+    #[doc(hidden)]
+    pub fn debug_lose_device(&self) {
+        let _ = self.asks.send(Ask::LoseDevice);
+    }
+    /// Play again from its start at its end (true by default), or stop there.
+    pub fn looping(&self, on: bool) {
+        let _ = self.asks.send(Ask::Loop(on));
+    }
+    /// Build the script again (it changed), staying at the frame it shows.
+    pub fn reload(&self) {
+        let _ = self.asks.send(Ask::Reload);
+    }
+    /// Follow what its thread tells, keeping its signals current and telling
+    /// `heard` too, for as long as the returned future runs: spawn it on the
+    /// window's tasks. Only the first call follows; later ones end at once.
+    pub fn listen<F: FnMut(&Event) + 'static>(
+        self: &Rc<Self>,
+        mut heard: F,
+    ) -> impl std::future::Future<Output = ()> + 'static + use<F> {
+        let events = self.events.borrow_mut().take();
+        let this = self.clone();
+        async move {
+            let Some((told, mut woken)) = events else {
+                return;
+            };
+            while woken.recv().await.is_some() {
+                // The latest frame only: a picture each frame is enough to show.
+                // A frame before another event is told before it: a stop
+                // after the last frame comes after that frame.
+                let mut frame = None;
+                for event in told.try_iter() {
+                    match &event {
+                        Event::Frame { .. } => frame = Some(event),
+                        other => {
+                            if let Some(shown) = frame.take() {
+                                this.show_frame(&shown, &mut heard);
+                            }
+                            this.keep(other);
+                            heard(other);
+                        }
+                    }
+                }
+                if let Some(event) = frame {
+                    this.show_frame(&event, &mut heard);
+                }
+            }
+        }
+    }
+    /// Tells `frame` (`Event::Frame`): its pixel buffer first, on macOS,
+    /// as the picture it shows.
+    fn show_frame<F: FnMut(&Event)>(&self, frame: &Event, heard: &mut F) {
+        // The latest pixel buffer, before the frame it is of says so.
+        #[cfg(target_os = "macos")]
+        if let Some((_, buffer)) = self.surfaces.try_iter().last() {
+            // The picture shown, as bytes when asked for: read from
+            // the buffer then, once, and not at all if no one asks.
+            if let Ok(surface) = buffer.native_surface() {
+                let (width, height) = (surface.width(), surface.height());
+                self.surface.set(Some(Rc::new(surface)));
+                if let Ok(image) = ImageData::on_demand_premultiplied(width, height, move || {
+                    buffer.to_rgba().into()
+                }) {
+                    self.image.set(Some(Arc::new(image)));
+                }
+            }
+        }
+        self.keep(frame);
+        heard(frame);
+    }
+    fn keep(&self, event: &Event) {
+        match event {
+            Event::Frame {
+                frame,
+                width,
+                height,
+                pixels,
+            } => {
+                // None read back (shown as pixel buffers): `image` is the
+                // buffer shown, read when asked for (`listen`).
+                if !pixels.is_empty()
+                    && let Ok(image) = ImageData::new_premultiplied(*width, *height, pixels.clone())
+                {
+                    self.image.set(Some(Arc::new(image)));
+                }
+                self.frame.set(*frame);
+                self.error.set(None);
+            }
+            Event::Opened { composition } => {
+                self.composition.set(Some((**composition).clone()));
+                self.tracks.set(Vec::new());
+            }
+            Event::Tracks(tracks) => {
+                self.tracks.set(tracks.clone());
+            }
+            Event::Stopped => {
+                self.playing.set(false);
+            }
+            Event::Error(error) => {
+                self.error.set(Some(error.clone()));
+            }
+        }
+    }
+    /// What it shows, as a view: its picture, scaled to fit the box it's given
+    /// (give it a size), following it as it plays.
+    pub fn view(self: &Rc<Self>) -> zgx::compose::View {
+        let this = self.clone();
+        zgx::compose::component(move |cx| {
+            cx.tasks().spawn(this.listen(|_| {}));
+            // Seen while any of its box shows, in a window that shows: else
+            // its thread draws nothing (`Player::watch`).
+            let watching: Rc<RefCell<Option<zgx::reactive::Effect>>> = Rc::default();
+            cx.retain(watching.clone());
+            // Gone, unseen.
+            struct Unwatch(Rc<Player>);
+            impl Drop for Unwatch {
+                fn drop(&mut self) {
+                    self.0.watch(false);
+                }
+            }
+            cx.retain(Unwatch(this.clone()));
+            let (player, runtime) = (this.clone(), cx.runtime());
+            let watch = move |handle: zgx::compose::NodeHandle| {
+                let (Some(visible), Some(shown)) =
+                    (handle.observe_visibility(), handle.observe_shown())
+                else {
+                    return;
+                };
+                let mut told = None;
+                *watching.borrow_mut() = Some(runtime.effect_now(move || {
+                    let seen = visible.get() && shown.get();
+                    if told != Some(seen) {
+                        told = Some(seen);
+                        player.watch(seen);
+                    }
+                }));
+            };
+            // On macOS its frames are pixel buffers the window shows as they
+            // are: copied on the GPU, never read back or uploaded again.
+            #[cfg(target_os = "macos")]
+            if let Ok(blank) = zgx_gpu::blank_surface()
+                && let Ok(blank) = blank.native_surface()
+            {
+                struct Bytes(Rc<Player>);
+                impl Drop for Bytes {
+                    fn drop(&mut self) {
+                        let _ = self.0.asks.send(Ask::Surfaces(false));
+                    }
+                }
+                let _ = this.asks.send(Ask::Surfaces(true));
+                cx.retain(Bytes(this.clone()));
+                let (surface, blank) = (this.surface.clone(), Rc::new(blank));
+                return zgx::compose::native_surface_signal("Video", move || {
+                    surface.get().unwrap_or_else(|| blank.clone())
+                })
+                .on_mount(watch);
+            }
+            let image = this.image.clone();
+            let blank = Arc::new(ImageData::new(1, 1, vec![0u8; 4]).expect("a pixel"));
+            zgx::compose::image_signal("Video", move || {
+                image.get().unwrap_or_else(|| blank.clone())
+            })
+            .on_mount(watch)
+        })
+    }
+}
+impl Player {
+    /// Give a script `host` runs this player as `name`: `ui.image { src =
+    /// "host:<name>" }` shows it, `ui.call("<name>.listen")` (once, as the
+    /// script mounts) follows it, and `ui.invoke("<name>.open", { id, props,
+    /// frame })`, `"<name>.seek"` (a frame), `"<name>.play"` and `"<name>.loop"`
+    /// (booleans) drive it. `ui.shared("<name>")` holds `{ frame, playing,
+    /// composition, error }`.
+    pub fn expose(self: &Rc<Self>, host: &zgx_script::ScriptHost, name: &str) {
+        use zgx_script::Value;
+        let state = host.shared(name, Value::from_json("{}").unwrap_or_default());
+        let json_of =
+            |value: &Value| serde_json::from_str::<Json>(&value.to_json()).unwrap_or(Json::Null);
+        // What the script reads of it, told again as it changes: at each
+        // event, and as it's played or stopped (which sends none: a stopped
+        // player draws nothing more to tell it by).
+        let tell: Rc<dyn Fn()> = Rc::new({
+            let (player, state) = (self.clone(), state.clone());
+            move || {
+                let composition = player
+                    .composition
+                    .with_untracked(|c| c.as_ref().map(|c| c.id.clone()));
+                let told = json!({
+                    "frame": player.frame.with_untracked(|f| *f),
+                    "playing": player.playing.with_untracked(|p| *p),
+                    "composition": composition,
+                    "error": player.error.with_untracked(Clone::clone),
+                });
+                state.set(Value::from_json(&told.to_string()).unwrap_or_default());
+            }
+        });
+        let (this, shown, image) = (self.clone(), host.clone(), name.to_owned());
+        let telling = tell.clone();
+        // What a script's listening ends with: this action, as another
+        // player takes the name or the host goes. Its listening holds the
+        // player (and its frames), which would otherwise outlive both.
+        let stops: RefCell<Vec<zgx::task::LatestSender<()>>> = RefCell::default();
+        host.async_action(format!("{name}.listen"), move |_| {
+            let (stop, mut stopped) = zgx::task::latest::<()>();
+            stops.borrow_mut().push(stop);
+            // A script shows it as `host:<name>`. On macOS, as the frames
+            // are, pixel buffers drawn from their own storage, their bytes
+            // read only if something asks (`Player::image`); elsewhere, as
+            // bytes read back.
+            #[cfg(target_os = "macos")]
+            let _ = this.asks.send(Ask::Surfaces(true));
+            #[cfg(not(target_os = "macos"))]
+            let _ = this.asks.send(Ask::Pixels(true));
+            // The frame it set last, and its picture, for when it ends.
+            #[cfg(target_os = "macos")]
+            let set: Set = Rc::default();
+            #[cfg(target_os = "macos")]
+            let (player, ended, setting) =
+                (this.clone(), (shown.clone(), image.clone()), set.clone());
+            let (shown, image, tell) = (shown.clone(), image.clone(), telling.clone());
+            let listen = this.listen(move |event| {
+                if let Event::Frame {
+                    width,
+                    height,
+                    pixels,
+                    ..
+                } = event
+                {
+                    #[cfg(target_os = "macos")]
+                    if pixels.is_empty() {
+                        let surface = player.surface.with_untracked(Clone::clone);
+                        let picture = player.image.with_untracked(Clone::clone);
+                        *setting.borrow_mut() = surface.as_ref().map(|s| (s.id(), picture.clone()));
+                        shown.surface(&image, surface);
+                        shown.image(&image, picture);
+                    }
+                    if !pixels.is_empty()
+                        && let Ok(picture) =
+                            ImageData::new_premultiplied(*width, *height, pixels.clone())
+                    {
+                        shown.image(&image, Some(Arc::new(picture)));
+                    }
+                }
+                tell();
+            });
+            // As it ends, or is dropped (the script reloaded, its player
+            // replaced): if what shows is still its frame, that frame's bytes
+            // are read once, to show on as before, and the frame goes, its
+            // buffer back to the pool it came from. One since set under its
+            // name (another player's) stays.
+            #[cfg(target_os = "macos")]
+            struct Leave(zgx_script::ScriptHost, String, Set);
+            #[cfg(target_os = "macos")]
+            impl Drop for Leave {
+                fn drop(&mut self) {
+                    let Leave(host, name, set) = self;
+                    if let Some((id, picture)) = set.borrow_mut().take()
+                        && (host.hosted_surface(name)).is_some_and(|shown| shown.id() == id)
+                    {
+                        if let Some(picture) = picture {
+                            let _ = picture.pixels();
+                        }
+                        host.surface(name, None);
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            let leave = Leave(ended.0, ended.1, set);
+            async move {
+                #[cfg(target_os = "macos")]
+                let _leave = leave;
+                let mut listen = std::pin::pin!(listen);
+                let mut stopped = std::pin::pin!(stopped.recv());
+                std::future::poll_fn(|cx| {
+                    if listen.as_mut().poll(cx).is_ready() || stopped.as_mut().poll(cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                    std::task::Poll::Pending
+                })
+                .await;
+                Ok(Value::Nil)
+            }
+        });
+        let this = self.clone();
+        host.action(format!("{name}.open"), move |arg| {
+            let arg = json_of(&arg);
+            this.open(
+                arg["id"].as_str().unwrap_or_default(),
+                arg.get("props").cloned().unwrap_or(json!({})),
+                arg["frame"].as_f64().unwrap_or(0.).max(0.) as u64,
+            );
+        });
+        let this = self.clone();
+        host.action(format!("{name}.seek"), move |arg| {
+            this.seek(json_of(&arg).as_f64().unwrap_or(0.).max(0.) as u64);
+        });
+        let this = self.clone();
+        host.action(format!("{name}.play"), move |arg| {
+            this.play(json_of(&arg).as_bool().unwrap_or(false));
+            tell();
+        });
+        let this = self.clone();
+        host.action(format!("{name}.loop"), move |arg| {
+            this.looping(json_of(&arg).as_bool().unwrap_or(true))
+        });
+        let this = self.clone();
+        host.action(format!("{name}.watch"), move |arg| {
+            this.watch(json_of(&arg).as_bool().unwrap_or(true))
+        });
+    }
+}
+/// What a script's player set last: its frame's id, and its picture.
+#[cfg(target_os = "macos")]
+type Set = Rc<RefCell<Option<(u64, Option<Arc<ImageData>>)>>>;
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = self.asks.send(Ask::Quit);
+    }
+}

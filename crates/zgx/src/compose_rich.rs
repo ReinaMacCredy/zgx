@@ -75,8 +75,20 @@ pub(crate) struct InlineIcon {
     pub range: Range<usize>,
     pub svg: Arc<crate::svg::SvgData>,
     pub size: f32,
-    /// How far into the room it starts (the span's padding before it).
+    /// How far into the room it starts (the span's padding before it, and
+    /// its well's room round it).
     pub inset: f32,
+    /// The well it sits on (`SpanIcon::bg`), resolved: drawn under it,
+    /// `pad` larger on every side.
+    pub well: Option<IconWell>,
+}
+/// An inline icon's well: a rounded fill under it, `pad` past it on every
+/// side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct IconWell {
+    pub color: crate::scene::Color,
+    pub radius: f32,
+    pub pad: f32,
 }
 /// A span's leading icon: `size` square, `gap` before the text, tinted
 /// with `tint` (a colour or token) if set, else as the SVG says (one that
@@ -91,6 +103,14 @@ pub struct SpanIcon {
     pub gap: f32,
     /// Its colour, or a colour token; `None` paints it as the SVG says.
     pub tint: Option<crate::theme::Themed<Color>>,
+    /// A well under it (a file chip's): its fill, a colour or a token;
+    /// `None`, none. The well is `pad` past the icon on every side, its
+    /// corner `radius`, and the span keeps room for it.
+    pub bg: Option<crate::theme::Themed<Color>>,
+    /// The well's corner radius.
+    pub radius: f32,
+    /// The well's room round the icon, on every side.
+    pub pad: f32,
 }
 /// What keeps an icon's room in the line: a word joiner (zero width, and
 /// no line break either side, so the icon stays with its text), padded.
@@ -122,6 +142,46 @@ pub(crate) struct SpanExtras {
     pub menu: Option<SpanMenu>,
     /// Not underlined, though a link (`TextSpan::no_underline`).
     pub plain: bool,
+    /// Room after the text, where it isn't `padding`'s across
+    /// (`TextSpan::padding_end`).
+    pub padding_end: Option<f32>,
+    /// Its text fading in (`TextSpan::fade_in`).
+    pub fade: Option<TextFade>,
+}
+/// A run's text fading in (`TextSpan::fade_in`): from clear at `start`
+/// (milliseconds since the Unix epoch, as `ui.now()` says, on the thread's
+/// clock) to its own colour `ms` later, easing out by `power` (its alpha
+/// `1 - (1 - t)^power`). Drawn in Rust, a frame at a time while it fades:
+/// no script runs for it, and nothing lays out again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextFade {
+    /// When it starts: milliseconds since the Unix epoch (`ui.now()`).
+    pub start: f64,
+    /// How long it takes, in milliseconds.
+    pub ms: f32,
+    /// How it eases out: its alpha `1 - (1 - t)^power`.
+    pub power: f32,
+}
+impl TextFade {
+    /// How far in it is at `now` (ms since the epoch): 0 clear, 1 its colour.
+    pub fn at(&self, now: f64) -> f32 {
+        if self.ms.is_nan() || self.ms <= 0. {
+            return 1.;
+        }
+        let t = (((now - self.start) / self.ms as f64) as f32).clamp(0., 1.);
+        1. - (1. - t).powf(self.power)
+    }
+    /// Whether it's still fading at `now`.
+    pub fn fading(&self, now: f64) -> bool {
+        self.ms > 0. && now < self.start + self.ms as f64
+    }
+}
+/// Now, as a fade counts it: milliseconds since the Unix epoch on the
+/// thread's clock (`ui.now()`'s).
+pub fn fade_now() -> f64 {
+    crate::clock::system_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0., |d| d.as_secs_f64() * 1000.)
 }
 /// How a link span looks under the pointer (`TextSpan::hover`): CSS's
 /// `a:hover { text-decoration: underline }`.
@@ -156,6 +216,13 @@ impl TextSpan {
         self.extras.get_or_insert_default().icon = Some(icon);
         self
     }
+    /// Its text fading in, from clear to its colour (`TextFade`): a
+    /// streamed reply's new words. The paragraph draws the fade itself, a
+    /// frame at a time while it lasts, recolouring its glyphs only.
+    pub fn fade_in(mut self, fade: TextFade) -> Self {
+        self.extras.get_or_insert_default().fade = Some(fade);
+        self
+    }
     /// Restyled under the pointer, once it's a link (`on_click`), in place
     /// of the pointer's focus-ring outline. Not underlined at rest unless
     /// asked (`underline`).
@@ -168,6 +235,13 @@ impl TextSpan {
     /// the text: an inline code chip.
     pub fn padding(mut self, x: f32, y: f32) -> Self {
         self.padding = [x.max(0.), y.max(0.)];
+        self
+    }
+    /// Room after the text other than before it (`padding`'s `x` is then
+    /// the room before it alone): a chip whose icon sits close to its
+    /// edge, its name with more room after it.
+    pub fn padding_end(mut self, end: f32) -> Self {
+        self.extras.get_or_insert_default().padding_end = Some(end.max(0.));
         self
     }
     /// The span background's corner radius.
@@ -648,8 +722,10 @@ pub(crate) fn mount_links(
         /// Restyled under the pointer: no ring for hover.
         styled: Rc<Cell<bool>>,
     }
-    let bounds = ui.observe_bounds(paragraph);
-    let owner_bounds = ui.observe_bounds(owner);
+    // Its box and its owner's, watched once it has a link to place: most
+    // paragraphs never do, and each box watched is published at every
+    // layout that moves it.
+    let mut observed: Option<(crate::reactive::Signal<Rect>, crate::reactive::Signal<Rect>)> = None;
     let engine = ui.observe_text_geometry_revision();
     let theme = ui.theme_scope();
     let weak = ui.downgrade();
@@ -668,9 +744,6 @@ pub(crate) fn mount_links(
     ui.retain(owner, guard);
     ui.bind(owner, move || {
         let data = content.get();
-        let bounds = bounds.get();
-        let owner_bounds = owner_bounds.get();
-        let engine = engine.get();
         let Some(mut ui) = weak.upgrade() else {
             return;
         };
@@ -686,6 +759,16 @@ pub(crate) fn mount_links(
             crate::selection::set_links(&ui, paragraph, now.clone());
             targets = now;
         }
+        // No link, and none placed: nothing here reads where it is.
+        if data.links.is_empty() && mounted.is_empty() {
+            return;
+        }
+        let (bounds, owner_bounds) = observed
+            .get_or_insert_with(|| (ui.observe_bounds(paragraph), ui.observe_bounds(owner)))
+            .clone();
+        let bounds = bounds.get();
+        let owner_bounds = owner_bounds.get();
+        let engine = engine.get();
         let key = (
             data.rich.clone(),
             bounds.width.to_bits(),
@@ -991,8 +1074,11 @@ pub(crate) fn mount_icons(
     content: crate::reactive::Signal<Content>,
 ) {
     use crate::scene::{NodeId, NodeKind, Style};
-    let bounds = ui.observe_bounds(paragraph);
-    let owner_bounds = ui.observe_bounds(owner);
+    // Watched once it has an icon, as links' boxes are (`mount_links`).
+    let mut observed: Option<(
+        crate::reactive::Signal<crate::scene::Rect>,
+        crate::reactive::Signal<crate::scene::Rect>,
+    )> = None;
     let engine = ui.observe_text_geometry_revision();
     let weak = ui.downgrade();
     let mut mounted: Vec<NodeId> = Vec::new();
@@ -1002,9 +1088,6 @@ pub(crate) fn mount_icons(
     let mut rects: Vec<Option<crate::scene::Rect>> = Vec::new();
     ui.bind(owner, move || {
         let data = content.get();
-        let bounds = bounds.get();
-        let owner_bounds = owner_bounds.get();
-        let engine = engine.get();
         let Some(mut ui) = weak.upgrade() else {
             return;
         };
@@ -1017,6 +1100,12 @@ pub(crate) fn mount_icons(
         if data.icons.is_empty() {
             return;
         }
+        let (bounds, owner_bounds) = observed
+            .get_or_insert_with(|| (ui.observe_bounds(paragraph), ui.observe_bounds(owner)))
+            .clone();
+        let bounds = bounds.get();
+        let owner_bounds = owner_bounds.get();
+        let engine = engine.get();
         let key = (data.rich.clone(), bounds.width.to_bits(), engine);
         if geometry_key.as_ref() != Some(&key) {
             let scene = ui.scene.borrow();
@@ -1038,25 +1127,99 @@ pub(crate) fn mount_icons(
         for (index, (icon, rect)) in data.icons.iter().zip(rects.iter()).enumerate() {
             let rect = rect.unwrap_or_default();
             // At the room's start, centred on the line; placed from the
-            // owner's content box.
+            // owner's content box. With a well: the well there, the icon in
+            // it, `pad` in from its every side.
+            let pad = icon.well.map_or(0., |well| well.pad);
+            let side = icon.size + 2. * pad;
             let style = Style {
                 absolute: true,
-                width: Some(icon.size),
-                height: Some(icon.size),
+                width: Some(side),
+                height: Some(side),
                 margin: crate::scene::Insets {
                     left: bounds.x - owner_bounds.x + rect.x + icon.inset - padding.left,
-                    top: bounds.y - owner_bounds.y + rect.y + (rect.height - icon.size) / 2.
+                    top: bounds.y - owner_bounds.y + rect.y + (rect.height - side) / 2.
                         - padding.top,
                     ..Default::default()
                 },
                 ..Default::default()
             };
             let mut scene = ui.scene.borrow_mut();
+            // A well and its icon: a rounded box, the icon its child.
+            if let Some(well) = icon.well {
+                let quad = crate::scene::QuadStyle {
+                    fill: well.color,
+                    radius: well.radius,
+                    ..Default::default()
+                };
+                let glyph = Style {
+                    absolute: true,
+                    width: Some(icon.size),
+                    height: Some(icon.size),
+                    margin: crate::scene::Insets {
+                        left: pad,
+                        top: pad,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let fits = index < mounted.len()
+                    && matches!(scene.kind(mounted[index]), NodeKind::Panel { .. })
+                    && scene.children(mounted[index]).len() == 1;
+                if !fits {
+                    let node = scene.append(
+                        owner,
+                        NodeKind::Panel {
+                            layout: crate::scene::Layout::Overlay,
+                            quad: quad.clone(),
+                        },
+                        style.clone(),
+                    );
+                    scene.append(node, NodeKind::Svg(icon.svg.clone()), glyph.clone());
+                    if index < mounted.len() {
+                        let old = std::mem::replace(&mut mounted[index], node);
+                        drop(scene);
+                        ui.remove(old);
+                        scene = ui.scene.borrow_mut();
+                    } else {
+                        mounted.push(node);
+                    }
+                    continue;
+                }
+                let node = mounted[index];
+                if !matches!(scene.kind(node), NodeKind::Panel { quad: q, .. } if *q == quad) {
+                    scene.set_kind(
+                        node,
+                        NodeKind::Panel {
+                            layout: crate::scene::Layout::Overlay,
+                            quad,
+                        },
+                    );
+                }
+                if scene.style(node) != style {
+                    scene.set_style(node, style);
+                }
+                let inner = scene.children(node)[0];
+                if !matches!(scene.kind(inner), NodeKind::Svg(svg) if Arc::ptr_eq(svg, &icon.svg)) {
+                    scene.set_kind(inner, NodeKind::Svg(icon.svg.clone()));
+                }
+                if scene.style(inner) != glyph {
+                    scene.set_style(inner, glyph);
+                }
+                continue;
+            }
             if index == mounted.len() {
                 mounted.push(scene.append(owner, NodeKind::Svg(icon.svg.clone()), style));
             } else {
                 // Unchanged (the paragraph only moved): nothing to lay out.
                 let node = mounted[index];
+                if !matches!(scene.kind(node), NodeKind::Svg(_)) {
+                    // (It had a well: the icon alone now.)
+                    let fresh = scene.append(owner, NodeKind::Svg(icon.svg.clone()), style);
+                    drop(scene);
+                    ui.remove(node);
+                    mounted[index] = fresh;
+                    continue;
+                }
                 if !matches!(scene.kind(node), NodeKind::Svg(svg) if Arc::ptr_eq(svg, &icon.svg)) {
                     scene.set_kind(node, NodeKind::Svg(icon.svg.clone()));
                 }

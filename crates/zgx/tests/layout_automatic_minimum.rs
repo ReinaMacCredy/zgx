@@ -1,7 +1,8 @@
 //! A flex item shrinks no further than its content's min-content size
 //! (CSS's `min-width: auto`): a word it cannot break keeps its width while
 //! a sibling gives way. One that clips (a scroll container) may shrink to
-//! nothing, and a minimum the item sets, `min_w(0.)` say, is its own. An
+//! nothing, as text that ends in an ellipsis may across (CSS's needs
+//! `overflow: hidden`), and a minimum the item sets, `min_w(0.)` say, is its own. An
 //! icon or an image that sets its size keeps it, as CSS's replaced elements
 //! (`<img>`, `<canvas>`) do: its box holds no content to measure. An image
 //! sized by its pixels keeps that natural size, as `<img>` does, unless its
@@ -73,6 +74,149 @@ fn a_clipping_box_and_an_explicit_minimum_shrink_past_the_content() {
         squeezed(text(WORD).text_wrap(false).min_w(0.)),
     ] {
         assert!((share(&rects) - proportional).abs() < 0.01, "{rects:?}");
+    }
+}
+
+#[test]
+fn a_truncated_label_shrinks_past_its_longest_word() {
+    // It gives way in proportion, as one that clips does; a styled
+    // paragraph too.
+    let word = word_width();
+    let proportional = word - (180. + word - 200.) * word / (180. + word);
+    for rects in [
+        squeezed(text(WORD).truncate()),
+        squeezed(rich_text().child(text_span(WORD)).truncate().into()),
+    ] {
+        assert!((rects[1].width - proportional).abs() < 0.01, "{rects:?}");
+    }
+}
+
+#[test]
+fn a_truncated_label_shrinks_in_rows_and_grids_taffy_lays_out() {
+    // A gap lays the row out with taffy: the label still gives way.
+    let word = word_width();
+    let gapped = |label: View| {
+        children(
+            row()
+                .w(200.)
+                .gap_x(8.)
+                .child(div().w(180.).h(10.).flex_shrink(1.).min_w(0.))
+                .child(label.flex_shrink(1.)),
+        )
+    };
+    let proportional = word - (180. + word - 192.) * word / (180. + word);
+    let rects = gapped(text(WORD).truncate());
+    assert!((rects[1].width - proportional).abs() < 0.01, "{rects:?}");
+    assert_eq!(gapped(text(WORD).text_wrap(false))[1].width, word);
+    // A grid's `1fr` track (`minmax(auto, 1fr)`) takes its share, where
+    // the word would widen it. (`grid_cols(2)`'s are `minmax(0, 1fr)`, as
+    // Tailwind's, which no word widens.)
+    let tracks = |label: View| {
+        children(
+            column()
+                .w(60.)
+                .grid()
+                .grid_template_columns("1fr 1fr".parse().unwrap())
+                .child(label)
+                .child(div().h(10.)),
+        )
+    };
+    let rects = tracks(text(WORD).truncate());
+    assert!((rects[0].width - 30.).abs() < 0.01, "{rects:?}");
+    assert!(
+        tracks(text(WORD).text_wrap(false))[0].width > 30.,
+        "the word widens it"
+    );
+}
+
+#[test]
+fn a_paragraph_truncated_and_untruncated_again_gives_way_and_holds() {
+    // A paragraph's truncation is its own (its kind), not its style:
+    // turned on and off in place, by `set_kind` or a streamed
+    // `set_leaf_kind`, in a plain row and in the rows and grids taffy lays
+    // out. Taffy measures an item's min-content at no width, where a
+    // truncated paragraph, wrapping or not, ends in an ellipsis that fits.
+    use zgx::rich_text::{RichText, TextRun};
+    use zgx::scene::NodeKind;
+    use zgx::text_layout::{TextOptions, TextOverflow};
+    type Parent = fn(View) -> View;
+    let rows: [(Parent, usize); 3] = [
+        (
+            |label| {
+                row()
+                    .w(60.)
+                    .child(div().w(180.).h(10.).flex_shrink(1.))
+                    .child(label.flex_shrink(1.))
+            },
+            1,
+        ),
+        (
+            |label| {
+                row()
+                    .w(60.)
+                    .gap_x(8.)
+                    .child(div().w(180.).h(10.).flex_shrink(1.).min_w(0.))
+                    .child(label.flex_shrink(1.))
+            },
+            1,
+        ),
+        (
+            |label| {
+                column()
+                    .w(60.)
+                    .grid()
+                    .grid_template_columns("1fr 1fr".parse().unwrap())
+                    .child(label)
+                    .child(div().h(10.))
+            },
+            0,
+        ),
+    ];
+    let words = format!("{WORD} {WORD}");
+    let paragraph = |overflow| NodeKind::RichText {
+        text: RichText::new(
+            words.as_str(),
+            vec![TextRun {
+                range: 0..words.len(),
+                ..TextRun::default()
+            }],
+        )
+        .unwrap()
+        .with_options(TextOptions {
+            overflow,
+            ..TextOptions::default()
+        })
+        .into(),
+    };
+    for leaf in [false, true] {
+        for (parent, at) in rows {
+            let mut ui = Ui::new(400., 300.);
+            let _view = ui.mount(parent(text(words.as_str()).text_wrap(true)));
+            ui.prepare_frame();
+            // The row's own child a paragraph, as a streamed reply's are.
+            let label = {
+                let scene = ui.scene.borrow();
+                let id = scene.children(scene.root())[0];
+                scene.children(id)[at]
+            };
+            let set = |ui: &mut Ui, overflow| {
+                let mut scene = ui.scene.borrow_mut();
+                if leaf {
+                    scene.set_leaf_kind(label, paragraph(overflow));
+                } else {
+                    scene.set_kind(label, paragraph(overflow));
+                }
+                drop(scene);
+                ui.prepare_frame();
+                ui.scene.borrow().bounds(label).width
+            };
+            // Untruncated, it holds its longest word, wider than the room.
+            let held = set(&mut ui, TextOverflow::Clip);
+            assert!(held > 60., "{leaf} {at}: {held}");
+            let width = set(&mut ui, TextOverflow::Ellipsis);
+            assert!(width < 31., "{leaf} {at}: {width}");
+            assert_eq!(set(&mut ui, TextOverflow::Clip), held, "{leaf} {at}");
+        }
     }
 }
 
@@ -181,4 +325,79 @@ fn taffy_laid_out_rows_keep_an_icons_size() {
             .child(icon().flex_shrink(1.).align_self(Align::Center)),
     );
     assert_eq!(rects[1].width, 15., "{rects:?}");
+}
+
+/// Down a column, an item's floor is the lesser of its height and its
+/// content's at its own width (CSS's `min-height: auto`): a card 56 wide
+/// whose text is four lines at that width keeps the 40 it sets, and one of
+/// two lines its 36, past the 30 its column has room for, however the
+/// column aligns it. Measured at the column's width, its text was one line,
+/// and the column shrank it to the room it had.
+#[test]
+fn down_a_column_a_box_needs_its_content_at_its_own_width() {
+    use zgx::scene::{Color, Layout, NodeKind, Scene, Style};
+    // 7 points a character, 18 a line, wrapped at the room it is given.
+    fn measure(text: &str, _: f32, limit: Option<f32>) -> (f32, f32) {
+        let width = text.len() as f32 * 7.;
+        let room = limit.unwrap_or(width).max(7.);
+        (width.min(room), (width / room).ceil().max(1.) * 18.)
+    }
+    // 16 words: 224 wide on one line; at 56, 4 lines (72), or 5 (90) at the
+    // 52 inside a padding of 2. 6 words: 84 wide; at 56, 2 lines (36).
+    for (words, padding, height) in [(16, 0., 40.), (16, 2., 40.), (6, 0., 36.)] {
+        let words = "w ".repeat(words);
+        for align in [Align::Center, Align::Stretch, Align::Start] {
+            let mut scene = Scene::new(300., 600.);
+            scene.set_text_measurer(measure);
+            let root = scene.root();
+            let column = scene.append(
+                root,
+                NodeKind::Container(Layout::Column),
+                Style {
+                    height: Some(60.),
+                    align,
+                    ..Style::default()
+                },
+            );
+            let card = scene.append(
+                column,
+                NodeKind::Container(Layout::Column),
+                Style {
+                    width: Some(56.),
+                    height: Some(40.),
+                    padding,
+                    ..Style::default()
+                },
+            );
+            scene.append(
+                card,
+                NodeKind::Text {
+                    text: words.as_str().into(),
+                    color: Color(0, 0, 0, 255),
+                    font_size: 14.,
+                },
+                Style {
+                    text_wrap: true,
+                    ..Style::default()
+                },
+            );
+            scene.append(
+                column,
+                NodeKind::Container(Layout::Column),
+                Style {
+                    height: Some(30.),
+                    flex_shrink: 0.,
+                    ..Style::default()
+                },
+            );
+            scene.flush();
+            let bounds = scene.bounds(card);
+            assert_eq!(
+                (bounds.width, bounds.height),
+                (56., height),
+                "{align:?}, padding {padding}, {} characters",
+                words.len()
+            );
+        }
+    }
 }

@@ -43,6 +43,12 @@ const COMPACT_BUDGET: usize = 16 * 1024 * 1024;
 /// all change every frame held about 1.3 MB more heap at 512 KB, for no
 /// measurable CPU difference.
 const UNDRAWN_BUDGET: usize = 64 * 1024;
+/// Past `UNDRAWN_BUDGET`, what is kept of it: half, so a text that changes as
+/// it is drawn (a counter, a header rolling its count) trims once in many
+/// frames rather than in every one it shapes, each of which would otherwise
+/// put it just past the budget again (a 54-character label: every frame, and
+/// once in 7 with this).
+const UNDRAWN_KEPT: usize = UNDRAWN_BUDGET / 2;
 /// Estimated bytes per character of shaped lines: a shape glyph and a layout
 /// glyph (96 + 88 bytes), and words and line text.
 const SHAPED_BYTES_PER_CHAR: usize = 190;
@@ -236,7 +242,8 @@ struct Compact {
 impl Compact {
     /// The measurements of shaped `lines`, or None where arithmetic over them
     /// would not match cosmic-text: right-to-left or mixed-direction lines,
-    /// justified lines, or a word whose glyphs set different line heights.
+    /// justified lines, lines holding inline boxes (CSS's line box), or a
+    /// word whose glyphs set different line heights.
     /// Its words and advances go at the end of `slab`'s lists.
     fn of(lines: &[BufferLine], font_size: f32, slab: &mut Slab) -> Option<Self> {
         // Counted first, the lists grow once: a text changing every frame
@@ -244,7 +251,9 @@ impl Compact {
         let (mut spans, mut words, mut glyphs) = (0, 0, 0);
         for line in lines {
             let shape = line.shape_opt()?;
-            if shape.rtl || line.align() == Some(Align::Justified) {
+            // (The box test here, not in `TextCache::prepare`: there it cost
+            // every call into the cache a larger frame.)
+            if shape.rtl || shape.boxes || line.align() == Some(Align::Justified) {
                 return None;
             }
             spans += shape.spans.len();
@@ -278,6 +287,9 @@ impl Compact {
             lines: smallvec::SmallVec::with_capacity(lines.len()),
         };
         let (mut word_at, mut glyph_at) = (0, 0);
+        // Written in turn (not indexed): a pointer steps a word, wherever
+        // this is inlined, with no register held for a word's stride.
+        let (mut packed, mut advances) = (packed.iter_mut(), advances.iter_mut());
         // What does not qualify leaves the chunk as it was.
         let filled = (|| {
             for line in lines {
@@ -299,10 +311,10 @@ impl Compact {
                             if glyph.metrics_opt.map(|metrics| metrics.line_height) != line_height {
                                 return None;
                             }
-                            advances[glyph_at] = glyph.width(font_size).to_bits();
+                            *advances.next()? = glyph.width(font_size).to_bits();
                             glyph_at += 1;
                         }
-                        packed[word_at] = Word {
+                        *packed.next()? = Word {
                             width: word.width(font_size),
                             blank: word.blank,
                             glyphs,
@@ -356,6 +368,8 @@ impl Compact {
                 .map(|(_, word)| word.glyphs.len())
                 .sum::<usize>();
         let length = 3 * words + glyphs;
+        #[cfg(test)]
+        words::worked(|w| w.compact += words);
         let index = slab.room(length);
         let end = slab.chunks[index].as_ref().expect("live chunk").data.len();
         let start = if length == 0 { 0 } else { end };
@@ -454,6 +468,8 @@ impl Compact {
             for span in spans {
                 let offset = span.start as usize;
                 let words = &all_words[offset..span.end as usize];
+                #[cfg(test)]
+                words::worked(|w| w.measured += words.len());
                 // Where the words not yet added start: (word, glyph).
                 let mut fitting = (0, 0);
                 let mut range_width = 0_f32;
@@ -967,9 +983,12 @@ impl Entry {
         if let Some((_, size)) = self.sizes.iter().find(|(w, _)| *w == width) {
             return *size;
         }
-        let size = match &self.compact {
-            Some(compact) => compact.size(slab, width, self.metrics.line_height),
-            None => {
+        let size = match (&self.compact, &mut self.words) {
+            (Some(compact), _) => compact.size(slab, width, self.metrics.line_height),
+            // A stream's paragraph, grown from its last state: measured
+            // from its words, from the lines its new words can change.
+            (None, Some(words)) => words.measure(width, self.metrics.line_height).0,
+            (None, None) => {
                 self.lay_out(fonts, width);
                 let lines = self.lines.as_deref().expect("laid out");
                 LayoutRunIter::from_lines(lines, None, self.metrics.line_height, 0., 0)
@@ -1232,6 +1251,23 @@ impl TextCache {
         let hash = self.entry(fonts, Source::Rich(rich), false, Need::Layout);
         self.laid_out(fonts, hash, width)
     }
+    /// Where `rich`'s inline boxes are laid out at `width`: each one's
+    /// character's offset, its left and its top (`TextLayout::inline_boxes`),
+    /// from the lines drawn. Clamped or ellipsized text, laid out by its own
+    /// path, lists those it keeps.
+    pub fn inline_boxes(
+        &mut self,
+        fonts: &mut FontSystem,
+        rich: &RichText,
+        width: Option<f32>,
+    ) -> Vec<(usize, f32, f32)> {
+        if !Self::handles(rich) {
+            use zgx::text_layout::TextLayout;
+            return crate::text::ShapedText::with_runs(fonts, rich, width).inline_boxes();
+        }
+        let laid = self.layout(fonts, rich, width);
+        crate::text::inline_box_places(laid.runs(None), &laid.line_starts())
+    }
     /// Whether plain text goes through the cache: nonempty, at a valid size.
     pub fn handles_plain(text: &str, font_size: f32) -> bool {
         !text.is_empty() && font_size.is_finite() && font_size > 0.
@@ -1277,10 +1313,12 @@ impl TextCache {
             self.evict(hash);
             return (size, 0.);
         }
-        let Some(compact) = &entry.compact else {
-            return (self.sized(fonts, hash, width), 0.);
+        let reach = match (&entry.compact, &mut entry.words) {
+            (Some(compact), _) => compact.size_reach(&self.slab, width, entry.metrics.line_height),
+            // A stream's paragraph (`Entry::size`).
+            (None, Some(words)) => words.measure(width, entry.metrics.line_height),
+            (None, None) => return (self.sized(fonts, hash, width), 0.),
         };
-        let reach = compact.size_reach(&self.slab, width, entry.metrics.line_height);
         if entry.sizes.len() == SIZES {
             entry.sizes.remove(0);
         }
@@ -1393,7 +1431,7 @@ impl TextCache {
             font_size,
             font,
         };
-        self.entry(fonts, source, true, need)
+        self.entry_hashed(fonts, source, true, need, Some(hash))
     }
     fn sized(&mut self, fonts: &mut FontSystem, hash: u64, width: Option<f32>) -> (f32, f32) {
         // Measuring changes no compact (`update` is not needed).
@@ -1415,6 +1453,11 @@ impl TextCache {
             line_height: entry.metrics.line_height,
             key: hash,
         }
+    }
+    /// How many times the cache was trimmed (`trim`, `rest`). For tests.
+    #[doc(hidden)]
+    pub fn trims(&self) -> u64 {
+        self.trims
     }
     /// Whether texts are held past what `trim` keeps.
     pub fn needs_trim(&self) -> bool {
@@ -1445,13 +1488,13 @@ impl TextCache {
             .filter(|(_, entry)| entry.shaped() && entry.drawn != mark)
             .map(|(hash, entry)| (entry.used, *hash))
             .collect();
-        // Newest first; keep those within the budget.
+        // Newest first; keep those within what is kept of the budget.
         undrawn.sort_unstable_by(|a, b| b.cmp(a));
         let mut kept = 0;
         for (_, hash) in undrawn {
             let entry = &self.entries[&hash];
             kept += entry.shaped_bytes();
-            if kept > UNDRAWN_BUDGET {
+            if kept > UNDRAWN_KEPT {
                 let entry = self.remove(hash);
                 self.retire(entry);
             }
@@ -1519,6 +1562,18 @@ impl TextCache {
         caret_row: bool,
         need: Need,
     ) -> u64 {
+        self.entry_hashed(fonts, source, caret_row, need, None)
+    }
+    /// `entry`, with the key's hash if the caller worked it out
+    /// (`plain_entry`'s `Key::plain_hash`, which is the plain key's `hash`).
+    fn entry_hashed(
+        &mut self,
+        fonts: &mut FontSystem,
+        source: Source<'_>,
+        caret_row: bool,
+        need: Need,
+        hashed: Option<u64>,
+    ) -> u64 {
         self.clock += 1;
         let key = match source {
             Source::Rich(rich) => Key::of(rich, caret_row),
@@ -1528,7 +1583,8 @@ impl TextCache {
                 font,
             } => Key::plain(text, font_size, font, caret_row),
         };
-        let hash = key.hash();
+        let hash = hashed.unwrap_or_else(|| key.hash());
+        debug_assert_eq!(hash, key.hash());
         let cached = self.entries.get_mut(&hash).filter(|entry| entry.key == key);
         if let Some(entry) = &cached
             && (entry.shaped() || (need != Need::Layout && entry.compact.is_some()))
@@ -1652,8 +1708,15 @@ impl TextCache {
         grew: Option<u64>,
     ) -> Option<(Box<words::Words>, &'s FontStyle, usize)> {
         // Most text that doesn't qualify is turned away by its bytes alone
-        // (a line break): before anything is done with its runs.
-        if !cosmic_text::plain_line(source.text()) {
+        // (a line break): before anything is done with its runs. Grown from
+        // a paragraph laid out from its words (one that qualified), only what
+        // was appended is read: whether a line qualifies is each
+        // character's (`plain_line`), and a stream's chunk reads its own.
+        let read_from = grew
+            .and_then(|grew| self.entries.get(&grew))
+            .filter(|entry| entry.words.is_some())
+            .map_or(0, |entry| entry.key.text.len());
+        if !cosmic_text::plain_line(&source.text()[read_from..]) {
             return None;
         }
         let one = |text: &str, font: &'s FontStyle, size: f32| words::Run {
@@ -1724,13 +1787,22 @@ impl TextCache {
                 }
             },
         };
-        // The words of the paragraph it grew from, to where they hold.
-        let grew = grew
-            .and_then(|grew| self.entries.get(&grew))
-            .and_then(|grew| {
-                let words = grew.words.as_deref()?;
-                Some((words, words.resume_at(&grew.key.text)?))
-            });
+        // The words of the paragraph it grew from, to where they hold, and
+        // its lines: taken, not copied (it is superseded, and goes as this
+        // is prepared: `drop_superseded`), so a chunk costs its own words.
+        let mut taken = None;
+        if let Some(entry) = grew.and_then(|grew| self.entries.get_mut(&grew))
+            && let Some(at) = entry
+                .words
+                .as_deref()
+                .and_then(|words| words.resume_at(&entry.key.text))
+        {
+            let bytes = entry.shaped_bytes();
+            taken = entry.words.take().map(|words| (words, at));
+            entry.laid = None;
+            self.shaped_bytes -= bytes;
+        }
+        let grew = taken;
         let (words, taken) =
             self.words
                 .words(fonts, text, &runs, base, size, &mut self.spare_words, grew)?;
@@ -1741,9 +1813,9 @@ impl TextCache {
     /// last state, its words taken as far as they hold.
     fn grew_from(&self, key: &Key, extended: &[u64]) -> Option<u64> {
         extended.iter().rev().copied().find(|recent| {
-            self.entries.get(recent).is_some_and(|entry| {
-                entry.words.is_some() && entry.compact.is_some() && key.extends(&entry.key)
-            })
+            self.entries
+                .get(recent)
+                .is_some_and(|entry| entry.words.is_some() && key.extends(&entry.key))
         })
     }
     /// The recent texts `text` starts with, shorter and not short: a
@@ -1800,8 +1872,16 @@ impl TextCache {
             {
                 self.taken += taken;
             }
-            let compact = Compact::of_words(&plain, &mut self.slab, grew);
             let detached = need == Need::Detached;
+            // A stream's paragraph grown from its last state keeps no
+            // compact: it is measured from its words (`Entry::size`),
+            // from the lines its new words change, where packing them all
+            // again would cost its whole length each chunk. Measured
+            // without its words (detached), it needs one.
+            let compact = match taken > 0 && !detached {
+                true => None,
+                false => Some(Compact::of_words(&plain, &mut self.slab, grew)),
+            };
             let words = if detached {
                 self.recycle_words(Some(plain));
                 None
@@ -1810,7 +1890,7 @@ impl TextCache {
             };
             let entry = Entry {
                 key,
-                compact: Some(compact),
+                compact,
                 lines: None,
                 words,
                 metrics,
@@ -2325,6 +2405,39 @@ mod tests {
             }
         }
     }
+    /// A long text is found by its own hash wherever it is used: the same
+    /// text at another size, and texts of one length dropped and made again
+    /// (likely at the address the last one had), each get the hash their
+    /// whole text makes, and their own entry.
+    #[test]
+    fn a_long_texts_kept_hash_is_never_another_texts() {
+        let mut fonts = FontSystem::new();
+        let font = FontStyle::default();
+        let filler = "the same words in every row of the list, ".repeat(13);
+        let mut cache = TextCache::default();
+        let mut look_up = |text: &Arc<str>, size: f32| {
+            let hash = cache.plain_entry(&mut fonts, text, size, &font, Need::Measure);
+            assert_eq!(
+                hash,
+                Key::plain_hash(text, size, &font),
+                "{:?} at {size}",
+                &text[..20]
+            );
+            assert!(cache.entries[&hash].key.is_plain(text, size, &font));
+        };
+        let kept: Arc<str> = format!("Row of the list 000: {filler}").into();
+        for size in [14., 14., 16., 14., 16., 16.] {
+            look_up(&kept, size);
+        }
+        for i in 0..32 {
+            // Made, looked up twice, and dropped: the next is likely where
+            // it was.
+            let row: Arc<str> = format!("Row of the list {i:03}: {filler}").into();
+            look_up(&row, 14.);
+            look_up(&row, 14.);
+            drop(row);
+        }
+    }
     #[test]
     fn plain_text_is_found_by_the_key_its_rich_text_makes() {
         let font = FontStyle {
@@ -2732,6 +2845,285 @@ mod tests {
             .collect();
         assert_eq!(long.len(), 1, "earlier states were superseded");
         assert_eq!(long[0].key.text.len(), end - 7);
+    }
+
+    /// Text with inline boxes: `parts`' text, a `Some` part a box that big
+    /// (width, height, baseline), its text one U+FFFC, a run of its own.
+    /// A part: its text, or a box's (width, height, baseline).
+    type Part<'a> = (&'a str, Option<(f32, f32, f32)>);
+    fn boxed(parts: &[Part<'_>]) -> RichText {
+        use zgx::rich_text::{INLINE_BOX_TEXT, InlineBox};
+        let (mut text, mut runs, mut boxes) = (String::new(), Vec::new(), Vec::new());
+        for (part, inline) in parts {
+            let at = text.len();
+            match inline {
+                Some((width, height, baseline)) => {
+                    text.push_str(INLINE_BOX_TEXT);
+                    boxes.push(InlineBox {
+                        width: *width,
+                        height: *height,
+                        baseline: *baseline,
+                        ..InlineBox::new(at)
+                    });
+                }
+                None => text.push_str(part),
+            }
+            runs.push(TextRun {
+                range: at..text.len(),
+                font_size: 14.,
+                ..Default::default()
+            });
+        }
+        RichText::new(text, runs)
+            .unwrap()
+            .with_inline_boxes(boxes)
+            .unwrap()
+    }
+
+    /// A paragraph's inline boxes take their room in its lines, measured
+    /// and laid out from prepared lines as a shaped text lays them out: the
+    /// text after a box moves over by its width, and the box sits on the
+    /// baseline, its line grown to hold it.
+    #[test]
+    fn inline_boxes_measure_and_lay_out_as_shaped_text() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let plain = boxed(&[("Ask  to review", None)]);
+        let rich = boxed(&[
+            ("Ask ", None),
+            ("", Some((40., 30., 26.))),
+            (" to review", None),
+        ]);
+        let (without, with) = (
+            cache.measure(&mut fonts, &plain, None),
+            cache.measure(&mut fonts, &rich, None),
+        );
+        let shaped = ShapedText::with_runs(&mut fonts, &rich, None);
+        use zgx::text_layout::TextLayout;
+        assert_eq!(with, shaped.size());
+        assert!(
+            (with.0 - without.0 - 40.).abs() < 0.5,
+            "{with:?} {without:?}"
+        );
+        assert!(with.1 > without.1, "the line grew to hold it");
+        let places = cache.inline_boxes(&mut fonts, &rich, None);
+        assert_eq!(places, shaped.inline_boxes());
+        let [(at, x, top)] = places[..] else {
+            panic!("one box: {places:?}")
+        };
+        assert_eq!(at, 4);
+        assert!((x - TextLayout::caret(&shaped, 4).x).abs() < 0.01);
+        assert!(top.abs() < 0.01, "the tallest thing in its line: {top}");
+        // Wrapped where it doesn't fit, it starts the next line.
+        let narrow = TextLayout::caret(&shaped, 4).x + 20.;
+        let places = cache.inline_boxes(&mut fonts, &rich, Some(narrow));
+        assert!(places[0].1 < 0.01 && places[0].2 > 0., "{places:?}");
+    }
+
+    /// A font feature tag a script can write (`font_features =
+    /// "_ibw"`) on an ordinary padded span: it stays text, with its padding,
+    /// and no box.
+    #[test]
+    fn review_a_private_tag_on_text_is_no_box() {
+        use zgx::text_layout::FontFeatures;
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let padded = |features: FontFeatures| {
+            let mut run = TextRun {
+                range: 0..5,
+                font_size: 14.,
+                padding: [6., 0.],
+                ..Default::default()
+            };
+            run.font.features = features;
+            RichText::new("hello", vec![run]).unwrap()
+        };
+        let plain = padded(FontFeatures::default());
+        let tagged = padded(FontFeatures::new([(*b"_ibw", 1)]));
+        assert!(tagged.inline_boxes().is_empty(), "no box on text");
+        assert_eq!(
+            cache.measure(&mut fonts, &tagged, None),
+            cache.measure(&mut fonts, &plain, None),
+            "its padding kept"
+        );
+    }
+
+    /// Text starting with a combining mark right after a box. The
+    /// mark joins the box's grapheme; it mustn't become a second box glyph.
+    #[test]
+    fn review_a_combining_mark_after_a_box_is_not_a_second_box() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let rich = boxed(&[("", Some((40., 10., 10.))), ("\u{301}x", None)]);
+        let without = boxed(&[("", Some((40., 10., 10.))), ("x", None)]);
+        let (a, b) = (
+            cache.measure(&mut fonts, &rich, None),
+            cache.measure(&mut fonts, &without, None),
+        );
+        assert!((a.0 - b.0).abs() < 2., "one box's width: {a:?} {b:?}");
+        assert_eq!(cache.inline_boxes(&mut fonts, &rich, None).len(), 1);
+    }
+
+    /// Where a box is, in a right-to-left paragraph: after the first
+    /// word, so left of it.
+    #[test]
+    fn review_a_box_in_right_to_left_text_sits_between_its_words() {
+        use zgx::text_layout::TextLayout;
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let first = "\u{5E9}\u{5DC}\u{5D5}\u{5DD} ";
+        let rich = boxed(&[
+            (first, None),
+            ("", Some((40., 10., 10.))),
+            (" \u{5E2}\u{5D5}\u{5DC}\u{5DD}", None),
+        ]);
+        let shaped = ShapedText::with_runs(&mut fonts, &rich, None);
+        let places = cache.inline_boxes(&mut fonts, &rich, None);
+        assert_eq!(places, shaped.inline_boxes());
+        let [(at, x, _)] = places[..] else {
+            panic!("{places:?}")
+        };
+        assert_eq!(at, first.len());
+        let start_of_first = TextLayout::caret(&shaped, 0).x;
+        let width = shaped.size().0;
+        assert!(
+            start_of_first > width / 2.,
+            "starts at the right: {start_of_first} of {width}"
+        );
+        assert!(
+            x + 40. <= start_of_first + 0.5,
+            "left of the first word: {x}"
+        );
+        assert!(x > 0., "right of the last word: {x}");
+    }
+
+    /// boxes side by side keep their own sizes, and a box's offset
+    /// counts the lines before it.
+    #[test]
+    fn review_adjacent_boxes_and_a_later_line() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let rich = boxed(&[
+            ("a\n", None),
+            ("", Some((30., 10., 10.))),
+            ("", Some((50., 20., 20.))),
+        ]);
+        let places = cache.inline_boxes(&mut fonts, &rich, None);
+        let [(at0, x0, _), (at1, x1, _)] = places[..] else {
+            panic!("{places:?}")
+        };
+        assert_eq!((at0, at1), (2, 5));
+        assert!(x0.abs() < 0.01 && (x1 - 30.).abs() < 0.01, "{places:?}");
+    }
+
+    /// A line clamp leaves out a box past it, as the shaped text says.
+    #[test]
+    fn review_a_clamped_box_is_not_listed_by_the_cache() {
+        use zgx::text_layout::{TextLayout, TextOptions};
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let rich = boxed(&[("first\nsecond ", None), ("", Some((30., 10., 10.)))]).with_options(
+            TextOptions {
+                line_clamp: std::num::NonZeroU32::new(1),
+                ..Default::default()
+            },
+        );
+        let shaped = ShapedText::with_runs(&mut fonts, &rich, None);
+        assert_eq!(shaped.inline_boxes(), Vec::new());
+        assert_eq!(cache.inline_boxes(&mut fonts, &rich, None), Vec::new());
+    }
+
+    /// Two sizes whose padding marks match are still two texts.
+    #[test]
+    fn review_sizes_with_the_same_mark_are_apart() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let a = boxed(&[("x", None), ("", Some((1., 64., 64.)))]);
+        let b = boxed(&[("x", None), ("", Some((2., 0., 0.)))]);
+        assert_ne!(
+            cache.measure(&mut fonts, &a, None),
+            cache.measure(&mut fonts, &b, None)
+        );
+    }
+
+    /// A box resized is a new text: measured and laid out at its new size.
+    #[test]
+    fn a_box_resized_measures_at_its_new_size() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let small = boxed(&[("a ", None), ("", Some((20., 10., 10.))), (" b", None)]);
+        let large = small.with_box_sizes([(50., 10., 10.)]);
+        let (a, b) = (
+            cache.measure(&mut fonts, &small, None),
+            cache.measure(&mut fonts, &large, None),
+        );
+        assert!((b.0 - a.0 - 30.).abs() < 0.5, "{a:?} {b:?}");
+        assert_eq!(b, ShapedText::with_runs(&mut fonts, &large, None).size());
+    }
+
+    /// A box resized shapes no word again: those beside it come from the
+    /// run cache as they were, and it is no word of its own to cache.
+    #[test]
+    fn a_box_resized_shapes_no_word_again() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let start = boxed(&[
+            ("Ask about ", None),
+            ("", Some((20., 10., 10.))),
+            (" this change, and more words", None),
+        ]);
+        cache.layout(&mut fonts, &start, Some(200.));
+        let words = fonts.shape_run_cache.len();
+        assert!(words > 3, "{words}");
+        for width in [30., 45., 60., 20.] {
+            let resized = start.with_box_sizes([(width, 12., 9.)]);
+            cache.layout(&mut fonts, &resized, Some(200.));
+        }
+        assert_eq!(fonts.shape_run_cache.len(), words);
+    }
+
+    /// A stream of text with a box in an early line keeps that line's
+    /// shapes as it grows (the line moves to the grown text, not shaped
+    /// again), and a box added at its end leaves the lines before it too.
+    #[test]
+    fn a_stream_with_boxes_keeps_its_earlier_lines() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextCache::default();
+        let first_line = |cache: &TextCache, rich: &RichText| {
+            let entry = cache.entries.get(&Key::of(rich, false).hash()).unwrap();
+            let line = &entry.lines.as_ref().unwrap()[0];
+            line.shape_opt().unwrap().spans[0].words.as_ptr() as usize
+        };
+        let start = boxed(&[
+            ("Ask ", None),
+            ("", Some((40., 20., 16.))),
+            (" about this.\nIt grows", None),
+        ]);
+        cache.layout(&mut fonts, &start, Some(300.));
+        let kept = first_line(&cache, &start);
+        let grown = boxed(&[
+            ("Ask ", None),
+            ("", Some((40., 20., 16.))),
+            (" about this.\nIt grows as it streams", None),
+        ]);
+        cache.layout(&mut fonts, &grown, Some(300.));
+        assert_eq!(
+            first_line(&cache, &grown),
+            kept,
+            "its first line moved over"
+        );
+        let more = boxed(&[
+            ("Ask ", None),
+            ("", Some((40., 20., 16.))),
+            (" about this.\nIt grows as it streams ", None),
+            ("", Some((30., 20., 16.))),
+        ]);
+        cache.layout(&mut fonts, &more, Some(300.));
+        assert_eq!(first_line(&cache, &more), kept, "a box after it leaves it");
+        assert_eq!(
+            cache.measure(&mut fonts, &more, Some(300.)),
+            ShapedText::with_runs(&mut fonts, &more, Some(300.)).size()
+        );
     }
 
     /// A text of no words sits at its chunk's start: one made at a chunk's
@@ -3221,5 +3613,228 @@ mod tests {
             }
         }
         assert!(!cosmic_text::plain_line(""));
+    }
+
+    /// A stream's paragraph in `font` laid out by `cache` after each of
+    /// `chunks` appends to `start` from `more` (in turn its `sizes` in bytes,
+    /// to a character's end: splitting words), at `width`: each chunk's
+    /// work (`words::Work`), its runs checked against the same text laid
+    /// out and measured afresh.
+    fn stream_work(
+        fonts: &mut FontSystem,
+        font: &FontStyle,
+        (start, more): (&str, &str),
+        chunks: usize,
+        sizes: &[usize],
+        width: Option<f32>,
+        skips: bool,
+    ) -> Vec<words::Work> {
+        let glyphs = |runs: LayoutRunIter<'_>| -> Vec<_> {
+            runs.map(|run| {
+                let glyphs: Vec<_> = run
+                    .glyphs
+                    .iter()
+                    .map(|g| {
+                        let at = [g.x, g.y, g.w, g.font_size].map(f32::to_bits);
+                        (g.glyph_id, g.start..g.end, at, g.level.is_rtl())
+                    })
+                    .collect();
+                let geometry = [run.line_y, run.line_top, run.line_height, run.line_w];
+                (run.line_i, run.rtl, glyphs, geometry.map(f32::to_bits))
+            })
+            .collect()
+        };
+        // As a rich text node and a plain one are, each in a cache of its
+        // own (a paragraph supersedes the recent texts it extends, of either
+        // kind): measured (the plain one with its reach), then laid out.
+        let lay = |caches: &mut [TextCache; 2], fonts: &mut FontSystem, text: &str, draw: bool| {
+            let [rich_cache, plain_cache] = caches;
+            let rich = rich(text, &[(text.len(), font.clone(), 14.)]);
+            // Measured at its width and with none (a layout asks a text at
+            // more than one), and laid out only where `draw`: a chunk not
+            // drawn leaves its lines to the next.
+            let sizes = [width, None].map(|width| rich_cache.measure(fonts, &rich, width));
+            let rich_laid = draw.then(|| glyphs(rich_cache.layout(fonts, &rich, width).runs(None)));
+            let plain: Arc<str> = text.into();
+            let reaches = [width, None]
+                .map(|width| plain_cache.measure_plain_reach(fonts, &plain, 14., font, width));
+            let plain_laid = draw.then(|| {
+                glyphs(
+                    plain_cache
+                        .layout_plain(fonts, &plain, 14., font, width)
+                        .runs(None),
+                )
+            });
+            (sizes, rich_laid, reaches, plain_laid)
+        };
+        let mut caches = [TextCache::default(), TextCache::default()];
+        let mut text = start.to_string();
+        lay(&mut caches, fonts, &text, true);
+        let mut at = 0;
+        (0..chunks)
+            .map(|chunk| {
+                let mut end = (at + sizes[chunk % sizes.len()]).min(more.len());
+                while !more.is_char_boundary(end) {
+                    end += 1;
+                }
+                text.push_str(&more[at..end]);
+                at = if end == more.len() { 0 } else { end };
+                words::WORK.with(|work| work.set(words::Work::default()));
+                // One chunk in three not drawn (`skips`), its lines left.
+                let draw = !skips || chunk % 3 != 1;
+                let laid = lay(&mut caches, fonts, &text, draw);
+                let work = words::WORK.with(|work| work.get());
+                let fresh = lay(
+                    &mut [TextCache::default(), TextCache::default()],
+                    fonts,
+                    &text,
+                    draw,
+                );
+                assert_eq!(laid, fresh, "{text:?} at {width:?}, {:?}", font.align);
+                work
+            })
+            .collect()
+    }
+
+    /// A streamed paragraph's chunk lays out what it can change, not the
+    /// whole paragraph (`words::Words::lay_out`): its lines broken, glyphs
+    /// placed and words carried over cost the same at 10, 100 and 1,000
+    /// lines, and what it lays out is the paragraph laid out afresh.
+    /// Measuring it too: it packs no compact (`prepared_words`), and is
+    /// measured from the lines its new words change (`Words::measure`).
+    #[test]
+    fn a_streamed_chunk_lays_out_the_same_however_long_its_paragraph() {
+        const STILL_GROWING: [&str; 0] = [];
+        let mut fonts = FontSystem::new();
+        let words = "The reply arrives a few words at a time, each chunk an append. ";
+        let mut table = Vec::new();
+        for lines in [10, 100, 1000] {
+            // About 45 characters a line at 320.
+            let start = words.repeat(lines * 45 / words.len() + 1);
+            let font = FontStyle::default();
+            let work = stream_work(
+                &mut fonts,
+                &font,
+                (&start, words),
+                12,
+                &[24],
+                Some(320.),
+                false,
+            );
+            // The mean of the chunks after the first two.
+            let n = (work.len() - 2) as f64;
+            let mean =
+                |f: fn(&words::Work) -> usize| work[2..].iter().map(f).sum::<usize>() as f64 / n;
+            table.push((
+                lines,
+                [
+                    mean(|w| w.lines),
+                    mean(|w| w.placed),
+                    mean(|w| w.copied),
+                    mean(|w| w.compact),
+                    mean(|w| w.measured),
+                ],
+            ));
+        }
+        eprintln!("lines: [break, placed, copied, compact, measured] a chunk");
+        for row in &table {
+            eprintln!("  {row:?}");
+        }
+        let names = ["break", "placed", "copied", "compact", "measured"];
+        for (i, name) in names.iter().enumerate() {
+            let (short, long) = (table[0].1[i], table[2].1[i]);
+            let grows = long > 1.25 * short + 64.;
+            assert_eq!(
+                grows,
+                STILL_GROWING.contains(name),
+                "{name}: {short} a chunk at 10 lines, {long} at 1,000 (STILL_GROWING: {STILL_GROWING:?})"
+            );
+        }
+    }
+
+    /// A paragraph laid out from the lines of what it grew from is the
+    /// paragraph laid out afresh, chunk by chunk, wherever a chunk ends (in
+    /// a word, in spaces, after punctuation, a byte or thirty at a time):
+    /// words, doubled spaces and a word broken between its glyphs, Chinese
+    /// and Japanese, and right-to-left runs among left-to-right ones; with
+    /// no wrap width, wide and narrow, aligned at the start, centred and at
+    /// the right.
+    #[test]
+    fn a_streamed_paragraph_laid_out_from_its_lines_is_laid_out_afresh() {
+        use zgx::text_layout::TextAlign;
+        let mut fonts = FontSystem::new();
+        let texts = [
+            "Tokens stream into one paragraph, which grows (every frame)  and \"quoted\" 3.14x ok.  ",
+            "short words then averyveryverylongwordthatmustbreakbetweenitsglyphs and more ",
+            "流式传输的回复一次到达几个字，每一块都是追加。中文 English 混排，",
+            "ストリーミングの返信は数語ずつ届きます。それぞれの塊は追加です。",
+            "Hello שלום עולם world مرحبا بالعالم 123 and on ",
+        ];
+        let mut grown = 0;
+        for text in texts {
+            for align in [TextAlign::Start, TextAlign::Center, TextAlign::Right] {
+                let font = FontStyle {
+                    align,
+                    ..FontStyle::default()
+                };
+                for width in [None, Some(320.), Some(60.), Some(25.)] {
+                    let start = text.repeat(3);
+                    let work = stream_work(
+                        &mut fonts,
+                        &font,
+                        (&start, text),
+                        30,
+                        &[24, 7, 13, 1, 30],
+                        width,
+                        true,
+                    );
+                    grown += work.iter().map(|w| w.resumed).sum::<usize>();
+                }
+            }
+        }
+        assert!(grown > 0, "some chunks laid out from what they grew from");
+    }
+
+    /// A streamed paragraph whose words set different line heights (runs of
+    /// 14 and 20 points in turn) measures, chunk by chunk, as afresh: each
+    /// line as tall as its tallest word, wrapped, broken between glyphs, or
+    /// on one line with no wrap width.
+    #[test]
+    fn a_streamed_paragraph_of_mixed_sizes_measures_as_afresh() {
+        let mut fonts = FontSystem::new();
+        let piece = "tall short averyveryverylongword then more words ";
+        let mut cache = TextCache::default();
+        let mut text = String::new();
+        let mut grown = 0;
+        for chunk in 0..40 {
+            // Appended a few bytes at a time, splitting words.
+            let at = (chunk * 9) % piece.len();
+            text.push_str(&piece[at..(at + 9).min(piece.len())]);
+            // A run a word (with its space), sized 14 and 20 in turn.
+            let mut runs = Vec::new();
+            let mut start = 0;
+            for (n, (end, _)) in text.match_indices(' ').enumerate() {
+                let size = if n % 2 == 0 { 14. } else { 20. };
+                runs.push((end + 1, FontStyle::default(), size));
+                start = end + 1;
+            }
+            if start < text.len() {
+                let size = if runs.len() % 2 == 0 { 14. } else { 20. };
+                runs.push((text.len(), FontStyle::default(), size));
+            }
+            let rich = rich(&text, &runs);
+            words::WORK.with(|work| work.set(words::Work::default()));
+            for width in [Some(90.), Some(40.), None] {
+                let mut fresh = TextCache::default();
+                assert_eq!(
+                    cache.measure(&mut fonts, &rich, width),
+                    fresh.measure(&mut fonts, &rich, width),
+                    "{text:?} at {width:?}"
+                );
+            }
+            grown += usize::from(words::WORK.with(|work| work.get()).measured > 0);
+        }
+        assert!(cache.taken > 0, "grown from its words");
+        assert!(grown > 0);
     }
 }

@@ -43,7 +43,7 @@ use zgx::{
 #[cfg(target_os = "macos")]
 pub use macos::{BackdropReport, NativeDiagnostics, NativeViewReport};
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{disable_cursor_rects, set_cursor};
+pub(crate) use macos::{disable_cursor_rects, set_cursor, show_cursor};
 #[cfg(target_os = "macos")]
 pub(crate) type NativeDiagnosticsHandle = NativeDiagnostics;
 #[cfg(not(target_os = "macos"))]
@@ -130,6 +130,8 @@ impl NativeHost {
         #[cfg(not(all(windows, feature = "webview2")))]
         let supported = cfg!(target_os = "macos");
         natives.set_supported(supported);
+        #[cfg(target_os = "macos")]
+        natives.set_glass_supported(macos::glass_available());
         Self {
             natives,
             diagnostics: Default::default(),
@@ -206,6 +208,13 @@ impl NativeHost {
     /// Whether this window has native views to keep up (now or last frame).
     pub fn active(&self) -> bool {
         !self.natives.is_empty() || !self.split.is_empty()
+    }
+    /// Whether a native view now on show splits the window into planes. One
+    /// hidden with its tab, or its panel, keeps its place in `active` and splits
+    /// nothing. (Only macOS asks: its caret is Core Animation's.)
+    #[cfg(target_os = "macos")]
+    pub fn splits_planes(&self) -> bool {
+        !self.split.is_empty()
     }
     /// Whether `node` is a native view's node (pointer over the page: the
     /// platform view owns the cursor).

@@ -31,6 +31,8 @@ mod grid_tracks;
 mod held_modifiers;
 #[path = "../hit_target.rs"]
 mod hit_target;
+#[path = "../host_surfaces.rs"]
+mod host_surfaces;
 #[path = "../host_top_layer.rs"]
 mod host_top_layer;
 #[path = "../i18n_script.rs"]
@@ -49,8 +51,12 @@ mod layout_motion;
 mod layout_unsettled;
 #[path = "../lazy_ui.rs"]
 mod lazy_ui;
+#[path = "../list_drag_keeps_row.rs"]
+mod list_drag_keeps_row;
 #[path = "../list_edges.rs"]
 mod list_edges;
+#[path = "../list_estimate.rs"]
+mod list_estimate;
 #[path = "../list_failed_key.rs"]
 mod list_failed_key;
 #[path = "../list_focus_scroll.rs"]
@@ -61,14 +67,24 @@ mod list_in_easing_box;
 mod list_in_scroll;
 #[path = "../list_key_field.rs"]
 mod list_key_field;
+#[path = "../list_keys_read.rs"]
+mod list_keys_read;
 #[path = "../list_long_budget.rs"]
 mod list_long_budget;
+#[path = "../list_reindex.rs"]
+mod list_reindex;
 #[path = "../list_tab_rows.rs"]
 mod list_tab_rows;
+#[path = "../list_thin_rows.rs"]
+mod list_thin_rows;
 #[path = "../markdown_lazy.rs"]
 mod markdown_lazy;
 #[path = "../mentions.rs"]
 mod mentions;
+#[path = "../pointer_lock.rs"]
+mod pointer_lock;
+#[path = "../pointer_through.rs"]
+mod pointer_through;
 #[path = "../regions.rs"]
 mod regions;
 #[path = "../reload_focus.rs"]
@@ -83,18 +99,26 @@ mod scene3d;
 mod scene3d_off;
 #[path = "../script_crashes.rs"]
 mod script_crashes;
+#[path = "../scrollbar_style.rs"]
+mod scrollbar_style;
 #[path = "../sealed.rs"]
 mod sealed;
 #[path = "../selection.rs"]
 mod selection;
 #[path = "../size_calc.rs"]
 mod size_calc;
+#[path = "../small_element_nodes.rs"]
+mod small_element_nodes;
 #[path = "../stack.rs"]
 mod stack;
 #[path = "../sticky.rs"]
 mod sticky;
+#[path = "../stream_in_scroll_and_list.rs"]
+mod stream_in_scroll_and_list;
 #[path = "../sweep.rs"]
 mod sweep;
+#[path = "../text_fade.rs"]
+mod text_fade;
 #[path = "../text_props.rs"]
 mod text_props;
 #[path = "../theme.rs"]
@@ -103,6 +127,8 @@ mod theme;
 mod ui;
 #[path = "../variants.rs"]
 mod variants;
+#[path = "../wheel_across.rs"]
+mod wheel_across;
 #[path = "../wheel_phase.rs"]
 mod wheel_phase;
 #[path = "../z_order.rs"]

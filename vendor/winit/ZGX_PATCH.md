@@ -136,6 +136,16 @@ use, against a minimized one (WING-PC, medians of 4 rotated rounds).
     A window translucent by the undocumented accent API isn't recognised, and
     a window being captured while covered stops like any other.
 
+## Windows: a window's DPI read without a DC kept
+
+`hwnd_dpi` took the window's DC (`GetDC`) on every call, used it only on
+systems without `GetDpiForWindow` or `GetDpiForMonitor`, and never released
+it. The occlusion check above calls it twice a second while a window draws
+and each second while it's covered (an idle one not at all), so a process used up
+GDI's 10,000 handles in an hour or two and `GetDC`'s null panicked. The DC
+is taken only where it's read and released (`ReleaseDC`); a null reads as 96
+DPI (`dpi.rs`, tested by `hwnd_dpi_keeps_no_gdi_handles`).
+
 ## X11: no waiting on an input method that has gone
 
 libX11 learns that an input method's server went (ibus-x11 killed or
@@ -348,3 +358,64 @@ zgx's caption glyphs, which read `theme()`, white: unseen. It now sets
 `preferred_theme` and `current_theme`, as making a window with a theme does
 (`platform_impl/windows/window.rs`). `scripts/windows_caption_smoke.py` (zgx)
 checks the window, with its buttons drawn.
+
+## Windows: a timed wait arms its timer once per deadline
+
+A turn that waits with `ControlFlow::WaitUntil` set the high-resolution
+timer (`SetWaitableTimer`) again on every turn, even for the deadline it was
+already armed for. Under a burst of input (a 1000 Hz mouse: a turn a move)
+that is a kernel call a move for nothing: 9,938 in 10 s of a bare window
+under one deadline on WING-PC, none with this. (Its CPU time is below what
+Windows' 15.6 ms accounting can tell apart; a zgx window waiting with no
+deadline, as one idle under the pointer does, never arms it.) The timer now keeps the deadline it is armed for and is armed only
+for a new one; a wait that reaches its deadline (the timer's signal, which
+the wait consumes, or the wait's own timeout, which can beat the timer by a
+tick), or a failed wait, leaves it unarmed (`event_loop.rs`, `HighResolutionTimer`,
+tested by `a_deadline_already_armed_isnt_armed_again`).
+
+## X11: a choice of device events applies at once
+
+`EventLoop::listen_device_events` only stored the choice, which took effect
+at a window's next focus change. The loop selects XInput2's raw events on the
+root as it starts, as though focused, so until then (and for good, for a
+window that never took focus) the app heard every pointer move on the
+screen, in or out of its windows. A choice other than `WhenFocused`, which
+needs the focus, is now selected when it is made
+(`platform_impl/linux/x11/mod.rs`). zgx asks for none.
+
+## Windows: a mouse message's Shift and Control are the message's
+
+Every mouse message's `wParam` says whether Shift and Control were down when
+it was made (`MK_SHIFT`, `MK_CONTROL`), but winit read them from the
+thread's key state (`GetKeyState`) instead. The keyboard updates only the
+focused thread's, so over a window behind another (Windows sends the wheel to
+the window under the pointer) Shift with the wheel read as no Shift, and zgx
+scrolled down where browsers scroll across. Moves, buttons and both wheels now
+take Shift and Control from `wParam` (`update_mouse_modifiers` in
+`platform_impl/windows/event_loop.rs`; Alt and the Windows key are not in it,
+and are read as before). `a_wheel_with_shift_down_has_shift_without_focus`
+posts a wheel with `MK_SHIFT` to a hidden window.
+
+
+## X11: a pointer event's unchanged modifiers aren't worked out again
+
+Every XInput2 pointer event (each move of a 1000 Hz mouse) carries the
+keyboard's modifiers and group, which winit gave `xkb_state_update_mask`
+each time. That call sets the state from its masks alone, so the same masks
+again change nothing, yet xkbcommon worked out the effective modifiers and
+LEDs anew: about 400 instructions a move. `XkbState` keeps the masks it last
+gave and skips the call when they're the same
+(`platform_impl/linux/common/xkb/state.rs`).
+
+
+## Wayland: the loop doesn't sleep on an application's own queue
+
+An application with a queue of its own on winit's connection (zgx's popups:
+their `xdg_popup`, and a `wl_pointer` that hears their surfaces) depends on
+winit's loop: it reads the socket for all queues, and `poll_events_with_timeout`
+goes back to sleep, with no `AboutToWait`, if nothing came for winit's own
+windows. A pointer over a popup is on a surface winit doesn't know, so a click
+on a menu at rest stayed in zgx's queue until something else woke the loop.
+`platform::wayland::wake_for_own_queue` gives the loop a check, asked after a
+read when winit has heard nothing else, whose `true` runs a turn. No check, no
+cost. `scripts/wayland_popups_smoke.py` clicks a menu at rest.

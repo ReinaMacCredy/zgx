@@ -846,3 +846,131 @@ fn chinese_text_on_macos_draws() {
         assert!(han > latin, "{sample}: {han} pixels lit, Latin {latin}");
     }
 }
+
+/// Simplified Chinese after Japanese, in an English locale (a chat
+/// message's two sentences): the Han run is taken for Japanese, whose faces
+/// lack simplified forms (车, 见), and then went to every face in the
+/// system for them, loading each, and drew them in the first that had
+/// them. On an iOS simulator that was some 400 faces and 14 ms on the
+/// paragraph's first layout. A kana run's Han falls to the Chinese faces
+/// after the Japanese, as Core Text's cascade does.
+#[test]
+#[cfg(target_os = "macos")]
+fn simplified_han_after_kana_takes_a_chinese_face() {
+    let mut fonts = cosmic_text::FontSystem::new();
+    fonts.set_language(Some("en-CA"));
+    let has = |fonts: &cosmic_text::FontSystem, family: &str| {
+        (fonts.db().faces()).any(|face| face.families.iter().any(|(name, _)| name == family))
+    };
+    if !has(&fonts, "Hiragino Sans") || !(has(&fonts, "PingFang SC") || has(&fonts, "Heiti SC")) {
+        return;
+    }
+    let metrics = cosmic_text::Metrics::new(16., 20.);
+    let mut buffer = cosmic_text::Buffer::new(&mut fonts, metrics);
+    let attrs = cosmic_text::Attrs::new();
+    buffer.set_text(
+        "今日は駅で会いましょう。 明天在车站见面吧。",
+        &attrs,
+        cosmic_text::Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(&mut fonts, false);
+    let found = drawn(&fonts, &buffer);
+    assert_eq!(fonts.full_scans(), 0, "every face walked for {found:?}");
+    let simplified: Vec<&(char, String)> =
+        found.iter().filter(|(c, _)| "车见".contains(*c)).collect();
+    assert_eq!(simplified.len(), 2, "{found:?}");
+    for (c, family) in simplified {
+        assert!(
+            family == "PingFang SC" || family == "Heiti SC",
+            "{c} drawn in {family}, not a Chinese face: {found:?}"
+        );
+    }
+}
+
+/// Characters no listed fallback holds send a search to every face in
+/// turn, each loaded to look: once a character. Shaped again, in this text
+/// or another, they take the face found then, or none.
+#[test]
+fn every_face_is_looked_at_once_a_character() {
+    let mut fonts = cosmic_text::FontSystem::new();
+    let metrics = cosmic_text::Metrics::new(16., 20.);
+    let attrs = cosmic_text::Attrs::new();
+    let shape = |fonts: &mut cosmic_text::FontSystem, text: &str| {
+        let mut buffer = cosmic_text::Buffer::new(fonts, metrics);
+        buffer.set_text(text, &attrs, cosmic_text::Shaping::Advanced, None);
+        buffer.shape_until_scroll(fonts, false);
+        drawn(fonts, &buffer)
+    };
+    // A private-use character: no script's list names a face for it.
+    let first = shape(&mut fonts, "a \u{F8FF}\u{10FFFD} b");
+    let scans = fonts.full_scans();
+    assert!(scans <= 1, "{scans} scans: {first:?}");
+    let again = shape(&mut fonts, "a \u{F8FF}\u{10FFFD} b");
+    let other = shape(&mut fonts, "c \u{10FFFD}\u{F8FF}");
+    assert_eq!(fonts.full_scans(), scans, "looked at every face again");
+    assert_eq!(first, again, "drawn otherwise the second time");
+    assert_eq!(other.len(), 4, "{other:?}");
+}
+
+/// The fallback lists of `a_kana_runs_han_takes_the_chinese_list_on_every_platform`:
+/// ZgxKana for Japanese, ZgxHans for Chinese, nothing common.
+struct KanaHanFallback;
+
+impl cosmic_text::Fallback for KanaHanFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        &[]
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        &[]
+    }
+
+    fn script_fallback(&self, script: unicode_script::Script, locale: &str) -> &[&'static str] {
+        match script {
+            unicode_script::Script::Han if locale.starts_with("zh") => &["ZgxHans"],
+            unicode_script::Script::Hiragana | unicode_script::Script::Katakana => &["ZgxKana"],
+            _ => &[],
+        }
+    }
+}
+
+/// `simplified_han_after_kana_takes_a_chinese_face` in fonts of its own,
+/// so every platform runs it (`fonts/make_kana_han.py`): the kana run's
+/// Japanese face lacks 车 and 见, the Chinese list's face has them, and a
+/// face holding everything is the first a search of every face would find
+/// (Arial Unicode MS on macOS). The Chinese list after the Japanese takes
+/// them, and no face is searched.
+#[test]
+fn a_kana_runs_han_takes_the_chinese_list_on_every_platform() {
+    let mut db = cosmic_text::fontdb::Database::new();
+    db.load_font_data(include_bytes!("fonts/ZgxEvery.ttf").to_vec());
+    db.load_font_data(include_bytes!("fonts/ZgxKana.ttf").to_vec());
+    db.load_font_data(include_bytes!("fonts/ZgxHans.ttf").to_vec());
+    let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db_and_fallback(
+        "en-CA".into(),
+        db,
+        KanaHanFallback,
+    );
+    let metrics = cosmic_text::Metrics::new(16., 20.);
+    let mut buffer = cosmic_text::Buffer::new(&mut fonts, metrics);
+    let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("ZgxKana"));
+    buffer.set_text(
+        "今日は駅で会いましょう。 明天在车站见面吧。",
+        &attrs,
+        cosmic_text::Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(&mut fonts, false);
+    let found = drawn(&fonts, &buffer);
+    for (c, family) in &found {
+        let expected = if "车见".contains(*c) {
+            "ZgxHans"
+        } else {
+            "ZgxKana"
+        };
+        assert_eq!(family, expected, "{c}: {found:?}");
+    }
+    assert_eq!(found.len(), 22, "{found:?}");
+    assert_eq!(fonts.full_scans(), 0, "every face searched for {found:?}");
+}

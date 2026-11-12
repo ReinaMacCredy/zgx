@@ -665,6 +665,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "combine"
 version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1276,6 +1282,7 @@ version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
+ "color_quant",
  "weezl",
 ]
 
@@ -3519,17 +3526,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "swash"
-version = "0.2.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
-dependencies = [
- "skrifa",
- "yazi",
- "zeno",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3954,9 +3950,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
 dependencies = [
  "arrayvec",
- "bitflags 2.13.2",
- "cursor-icon",
- "log",
  "memchr",
 ]
 
@@ -5047,8 +5040,10 @@ dependencies = [
  "icu_plurals",
  "icu_provider",
  "icu_segmenter",
+ "libc",
  "objc2-core-foundation",
  "objc2-core-video",
+ "psm",
  "rustc-hash 2.1.3",
  "smallvec",
  "stacker",
@@ -5074,7 +5069,7 @@ dependencies = [
 
 [[package]]
 name = "zgx-alacritty-terminal"
-version = "0.26.1"
+version = "0.26.4"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.2",
@@ -5089,9 +5084,11 @@ dependencies = [
  "rustix 1.1.5",
  "rustix-openpty",
  "signal-hook",
+ "smallvec",
+ "unicode-segmentation",
  "unicode-width",
- "vte",
  "windows-sys 0.59.0",
+ "zgx-vte",
 ]
 
 [[package]]
@@ -5104,7 +5101,7 @@ dependencies = [
 
 [[package]]
 name = "zgx-cosmic-text"
-version = "0.19.10"
+version = "0.19.14"
 dependencies = [
  "bitflags 2.13.2",
  "fontdb",
@@ -5115,13 +5112,14 @@ dependencies = [
  "self_cell",
  "skrifa",
  "smol_str 0.3.6",
- "swash",
  "sys-locale",
  "unicode-bidi",
  "unicode-linebreak",
  "unicode-script",
  "unicode-segmentation",
+ "unicode-width",
  "zgx-harfrust",
+ "zgx-swash",
 ]
 
 [[package]]
@@ -5197,6 +5195,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zgx-fx"
+version = "0.1.10"
+dependencies = [
+ "image",
+ "zgx",
+ "zgx-gpu",
+ "zgx-script",
+]
+
+[[package]]
 name = "zgx-ghostty-sys"
 version = "0.1.10"
 
@@ -5204,12 +5212,14 @@ version = "0.1.10"
 name = "zgx-gpu"
 version = "0.1.10"
 dependencies = [
+ "ash",
  "block2 0.6.2",
  "bytemuck",
  "fontconfig-parser",
  "gif",
  "hypher",
  "image",
+ "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -5223,13 +5233,19 @@ dependencies = [
  "rustc-hash 2.1.3",
  "smallvec",
  "tiny-skia",
+ "unicode-script",
  "unicode-segmentation",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "wgpu",
  "wgpu-hal",
  "windows",
  "winit",
+ "x11rb",
  "zgx",
  "zgx-cosmic-text",
+ "zgx-fx",
  "zgx-harfrust",
  "zgx-zune-jpeg",
 ]
@@ -5247,7 +5263,7 @@ dependencies = [
 
 [[package]]
 name = "zgx-mlua"
-version = "0.12.7"
+version = "0.12.8"
 dependencies = [
  "bstr",
  "either",
@@ -5283,11 +5299,15 @@ dependencies = [
  "icu_plurals",
  "libc",
  "memchr",
+ "objc2-core-foundation",
+ "objc2-core-video",
  "png 0.18.1",
  "pulldown-cmark",
  "rustc-hash 2.1.3",
+ "serde",
  "serde_json",
  "smallvec",
+ "unicase",
  "windows",
  "zgx",
  "zgx-3d",
@@ -5296,6 +5316,15 @@ dependencies = [
  "zgx-gpu",
  "zgx-mlua",
  "zgx-workload",
+]
+
+[[package]]
+name = "zgx-swash"
+version = "0.2.11"
+dependencies = [
+ "skrifa",
+ "yazi",
+ "zeno",
 ]
 
 [[package]]
@@ -5312,11 +5341,43 @@ dependencies = [
 name = "zgx-terminal"
 version = "0.1.10"
 dependencies = [
+ "base64 0.22.1",
+ "flate2",
  "libc",
+ "memchr",
+ "png 0.18.1",
  "polling",
+ "wgpu",
  "windows-sys 0.59.0",
  "zgx",
  "zgx-alacritty-terminal",
+ "zgx-gpu",
+ "zgx-workload",
+]
+
+[[package]]
+name = "zgx-video"
+version = "0.1.10"
+dependencies = [
+ "gif",
+ "png 0.18.1",
+ "serde_json",
+ "wgpu",
+ "zgx",
+ "zgx-gpu",
+ "zgx-run",
+ "zgx-script",
+]
+
+[[package]]
+name = "zgx-vte"
+version = "0.15.0"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.13.2",
+ "cursor-icon",
+ "log",
+ "memchr",
 ]
 
 [[package]]

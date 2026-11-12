@@ -10,7 +10,9 @@
 //! are an overlay renderer's (`GpuRenderer::for_overlay_visual`) drawing the
 //! popup root alone, in a swap chain with alpha. A menu or popover that is
 //! one rounded panel gets DWM's rounded corners, rim and shadow, as Windows
-//! 11's menus do (`corner_of`).
+//! 11's menus do (`corner_of`). One whose panel is translucent gets the
+//! acrylic blur of what is behind it, as Windows 11's menus are made of
+//! (`system_glass`).
 //!
 //! The parent window is subclassed while it has popups: an owned window does
 //! not follow its owner, so popups move with it (`WM_WINDOWPOSCHANGED`), and
@@ -36,7 +38,8 @@ use windows::{
                 IDCompositionVisual,
             },
             Dwm::{
-                DWM_WINDOW_CORNER_PREFERENCE, DWMWA_CLOAKED, DWMWA_WINDOW_CORNER_PREFERENCE,
+                DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_CLOAKED,
+                DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE,
                 DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL, DwmGetWindowAttribute,
                 DwmSetWindowAttribute,
             },
@@ -55,10 +58,12 @@ use windows::{
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GA_ROOT,
-                GW_HWNDNEXT, GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_USERDATA, GetAncestor,
-                GetClientRect, GetCursorPos, GetWindow, GetWindowLongPtrW, GetWindowRect, HTCLIENT,
-                HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer,
-                LoadCursorW, MA_NOACTIVATE, RegisterClassExW, SPI_SETWORKAREA, SW_HIDE,
+                GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_USERDATA,
+                GetAncestor, GetClientRect, GetCursorPos, GetWindow, GetWindowLongPtrW,
+                GetWindowRect, HTCLIENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_APPSTARTING,
+                IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO, IDC_SIZEALL,
+                IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_WAIT, IsWindowVisible,
+                KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassExW, SPI_SETWORKAREA, SW_HIDE,
                 SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
                 SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos,
                 ShowWindow, WINDOWPOS, WM_ACTIVATEAPP, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK,
@@ -68,13 +73,14 @@ use windows::{
                 WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
                 WM_TIMER, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
                 WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-                WS_POPUP, WindowFromPoint,
+                WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
             },
         },
     },
-    core::{BOOL, w},
+    core::{BOOL, PCWSTR, w},
 };
 use winit::event::{MouseButton, MouseScrollDelta, TouchPhase};
+use winit::window::CursorIcon;
 use zgx::{
     scene::{NodeId, NodeKind, Rect, Scene},
     semantics::Semantics,
@@ -87,6 +93,34 @@ const SUBCLASS_ID: usize = 0x7a67_7570; // "zgup"
 /// A mouse message's buttons still down (`MK_LBUTTON | MK_RBUTTON |
 /// MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2`).
 const BUTTONS: usize = 0x01 | 0x02 | 0x10 | 0x20 | 0x40;
+
+/// The system cursor for `cursor`, as winit's own windows pick it
+/// (`to_windows_cursor`, which it doesn't export).
+fn system_cursor(cursor: CursorIcon) -> PCWSTR {
+    match cursor {
+        CursorIcon::Pointer => IDC_HAND,
+        CursorIcon::Text | CursorIcon::VerticalText => IDC_IBEAM,
+        CursorIcon::Crosshair => IDC_CROSS,
+        CursorIcon::Move | CursorIcon::AllScroll | CursorIcon::Grab | CursorIcon::Grabbing => {
+            IDC_SIZEALL
+        }
+        CursorIcon::NotAllowed | CursorIcon::NoDrop => IDC_NO,
+        CursorIcon::Wait => IDC_WAIT,
+        CursorIcon::Progress => IDC_APPSTARTING,
+        CursorIcon::Help => IDC_HELP,
+        CursorIcon::EResize
+        | CursorIcon::WResize
+        | CursorIcon::EwResize
+        | CursorIcon::ColResize => IDC_SIZEWE,
+        CursorIcon::NResize
+        | CursorIcon::SResize
+        | CursorIcon::NsResize
+        | CursorIcon::RowResize => IDC_SIZENS,
+        CursorIcon::NeResize | CursorIcon::SwResize | CursorIcon::NeswResize => IDC_SIZENESW,
+        CursorIcon::NwResize | CursorIcon::SeResize | CursorIcon::NwseResize => IDC_SIZENWSE,
+        _ => IDC_ARROW,
+    }
+}
 
 /// How many windows stay made while hidden: a menu, its submenu and a
 /// tooltip open together without making one. `ZGX_POPUP_POOL` sets
@@ -113,6 +147,9 @@ struct Target {
     send: RefCell<Option<Sink>>,
     parent: Cell<usize>,
     tracking: Cell<bool>,
+    /// What to show when Windows asks: each window under the pointer answers
+    /// for itself, and winit answers only for the parent.
+    cursor: Cell<CursorIcon>,
 }
 impl Target {
     fn send(&self, input: PopupInput) {
@@ -155,9 +192,17 @@ unsafe extern "system" fn popup_proc(
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_NCHITTEST => return LRESULT(HTCLIENT as isize),
         WM_SETCURSOR => {
-            // SAFETY: a system cursor, set while over our window.
+            // The one its window's zgx chose for what is under the pointer
+            // (`PopupHost::set_cursor`), as over the window itself: a menu
+            // row's hand, a field's I-beam.
+            // SAFETY: our window's slot, as below; a system cursor, set while
+            // over our window.
             unsafe {
-                if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
+                let target = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Target;
+                let chosen = target
+                    .as_ref()
+                    .map_or(CursorIcon::Default, |t| t.cursor.get());
+                if let Ok(cursor) = LoadCursorW(None, system_cursor(chosen)) {
                     SetCursor(Some(cursor));
                 }
             }
@@ -352,26 +397,20 @@ struct Panel {
     /// Whether what it shows blurs what's behind it (`blurs`), as of
     /// `revision`.
     glass: bool,
+    /// Whether its window has the accent's blur behind it (`system_glass`).
+    accent: bool,
 }
 
-/// Whether anything in `node`'s subtree blurs what's behind it.
-fn blurs(scene: &Scene, node: NodeId) -> bool {
-    scene.effects(node).blur_radius > 0.
-        || scene
-            .children(node)
-            .iter()
-            .any(|child| blurs(scene, *child))
-}
 /// How DWM frames popup root `root`'s window at `rect`: as Windows 11 frames
 /// its menus, with rounded corners, a rim and a shadow, when what it shows is
 /// one rounded panel filling it; otherwise not at all, zgx drawing all of it
 /// (DWM's shadow would double one of zgx's, past the panel).
 ///
-/// Not with a menu's acrylic: DWM draws a never-activated window's system
-/// backdrop as a flat colour, and a popup must not take activation (its
-/// window keeps the keyboard).
+/// Its acrylic is the accent's (`system_glass`), not a system backdrop:
+/// DWM draws a never-activated window's system backdrop as a flat colour,
+/// and a popup must not take activation (its window keeps the keyboard).
 fn corner_of(scene: &Scene, root: NodeId, rect: Rect) -> DWM_WINDOW_CORNER_PREFERENCE {
-    let Some(&panel) = scene.children(root).first() else {
+    let Some(panel) = super::panel_of(scene, root) else {
         return DWMWCP_DONOTROUND;
     };
     let (NodeKind::Quad(quad) | NodeKind::Panel { quad, .. }) = scene.kind(panel) else {
@@ -387,6 +426,30 @@ fn corner_of(scene: &Scene, root: NodeId, rect: Rect) -> DWM_WINDOW_CORNER_PREFE
         r if r > 0. => DWMWCP_ROUNDSMALL,
         _ => DWMWCP_DONOTROUND,
     }
+}
+/// What popup `root` shows the acrylic blur behind, as macOS's popups show
+/// AppKit's material: its panel (`super::panel_of`) and the panel's box, in
+/// its window's coordinates, when the panel is a box with a translucent fill (a clear
+/// one is no glass, but what lays its content out) and the root holds
+/// nothing past it but its shadow.
+///
+/// Its window is then that box and no more, so the blur, which fills the
+/// window, stops at the panel's edge: DWM rounds it with the panel
+/// (`corner_of`) and shadows it, as it frames Windows 11's own menus, and
+/// the panel's own shadow is not drawn: the window cuts it past the panel,
+/// and under a translucent fill it darkened the blur (`GpuRenderer::
+/// set_unshadowed`). A popover's arrow past the panel
+/// would be cut too, so a root holding more has none. The blur can't fade
+/// as AppKit's material does: through a popup's fade (a tooltip's, a menu's
+/// opening) it shows whole, rather than the window changing its box and
+/// shadow as the fade ends.
+fn system_glass(scene: &Scene, root: NodeId) -> Option<(NodeId, Rect)> {
+    let panel = super::panel_of(scene, root)?;
+    let (NodeKind::Quad(quad) | NodeKind::Panel { quad, .. }) = scene.kind(panel) else {
+        return None;
+    };
+    let translucent = (1..255).contains(&quad.fill.3);
+    (translucent && scene.children(root).len() == 1).then(|| (panel, scene.bounds(panel)))
 }
 impl Panel {
     fn new() -> Result<Self, String> {
@@ -440,6 +503,7 @@ impl Panel {
                 preview: None,
                 corner: None,
                 glass: false,
+                accent: false,
             })
         }
     }
@@ -455,6 +519,30 @@ impl Panel {
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &corner as *const _ as *const _,
                 size_of_val(&corner) as u32,
+            )
+        };
+    }
+    /// The accent's blur behind its window, or not (`system_glass`). DWM's
+    /// rim goes with it: the panel draws its own edge, and DWM's, at its own
+    /// radius, would outline the corners again.
+    fn set_accent(&mut self, on: bool) {
+        if self.accent == on {
+            return;
+        }
+        self.accent = on;
+        crate::window_chrome::blur_behind(self.hwnd, on);
+        let border = if on {
+            DWMWA_COLOR_NONE
+        } else {
+            DWMWA_COLOR_DEFAULT
+        };
+        // SAFETY: an attribute of our own window, from a local of its type.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_BORDER_COLOR,
+                &border as *const _ as *const _,
+                size_of_val(&border) as u32,
             )
         };
     }
@@ -514,7 +602,11 @@ impl Panel {
             let _ = EnableWindow(self.hwnd, !preview);
             let _ = SetWindowPos(
                 self.hwnd,
-                Some(if preview { HWND_TOPMOST } else { HWND_TOP }),
+                Some(if preview {
+                    HWND_TOPMOST
+                } else {
+                    above_owner(self.hwnd, parent)
+                }),
                 0,
                 0,
                 0,
@@ -557,6 +649,27 @@ impl Panel {
             renderer.trim();
         }
     }
+}
+/// What to place popup `hwnd` under for it to lie just above its owner and the
+/// popups it already shows: at the top of the order an owned window takes its
+/// owner with it, over the app's other windows and other apps'. (Under a topmost
+/// window it would turn topmost itself; the owner is the top of the rest then.)
+///
+/// SAFETY: `hwnd` and `owner` are live windows of this thread.
+unsafe fn above_owner(hwnd: HWND, owner: HWND) -> HWND {
+    let mut window = owner;
+    // SAFETY: as this function's; a window gone meanwhile only ends the walk.
+    unsafe {
+        while let Ok(above) = GetWindow(window, GW_HWNDPREV) {
+            let own = above == hwnd || GetWindow(above, GW_OWNER).is_ok_and(|o| o == owner);
+            if !own {
+                let topmost = GetWindowLongPtrW(above, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+                return if topmost { HWND_TOP } else { above };
+            }
+            window = above;
+        }
+    }
+    HWND_TOP
 }
 impl Drop for Panel {
     fn drop(&mut self) {
@@ -987,8 +1100,15 @@ fn follow(parent: HWND) {
 pub(crate) struct PopupHost {
     shown: Vec<(NodeId, Panel)>,
     send: Sink,
+    /// The cursor its window's zgx last chose (`set_cursor`).
+    cursor: CursorIcon,
     /// The window they show over, once any has.
     parent: Option<usize>,
+    /// Whether popups can have the accent's blur now: Windows 11, with
+    /// Transparency effects on (off, Windows shows the accent's tint, black,
+    /// for its blur). Read as the first of them shows: a menu open as the
+    /// setting changes closes with the app's deactivation first.
+    accent: bool,
 }
 impl PopupHost {
     pub fn new(send: impl Fn(PopupInput) + 'static) -> Self {
@@ -996,7 +1116,17 @@ impl PopupHost {
         Self {
             shown: Vec::new(),
             send: Rc::new(send),
+            cursor: CursorIcon::Default,
             parent: None,
+            accent: false,
+        }
+    }
+    /// Show `cursor` over these popups too: Windows asks each window under
+    /// the pointer for its own.
+    pub fn set_cursor(&mut self, cursor: CursorIcon) {
+        self.cursor = cursor;
+        for (_, panel) in &self.shown {
+            panel.target.cursor.set(cursor);
         }
     }
     /// Whether any popup shows.
@@ -1050,6 +1180,10 @@ impl PopupHost {
             .iter()
             .filter_map(|root| scene.popup_bounds(*root).map(|bounds| (*root, bounds)))
             .collect();
+        if self.shown.is_empty() && !wanted.is_empty() {
+            self.accent = crate::window_chrome::popup_blur_behind()
+                && !crate::system_colors::windows_transparency_off();
+        }
         let mut index = 0;
         while index < self.shown.len() {
             if wanted.iter().any(|(root, _)| *root == self.shown[index].0) {
@@ -1107,9 +1241,16 @@ impl PopupHost {
             if panel.revision != Some(revision) {
                 // (A preview goes where the drag puts it, not over its box.)
                 panel.glass =
-                    drag.is_none_or(|drag| drag.preview != Some(root)) && blurs(scene, root);
+                    drag.is_none_or(|drag| drag.preview != Some(root)) && super::blurs(scene, root);
             }
             panel.revision = Some(revision);
+            let dragged = drag.is_some_and(|drag| drag.preview == Some(root));
+            // The accent's blur behind its panel, its window that box alone.
+            let system = (self.accent && !dragged)
+                .then(|| system_glass(scene, root))
+                .flatten()
+                .and_then(|(panel, rect)| Some((panel, rect.intersection(bounds)?)));
+            changed |= system.is_some() != panel.accent;
             // At its window's scale (see `screens_in`).
             let renderer = match panel.renderer(context, scale) {
                 Ok(renderer) => renderer,
@@ -1118,13 +1259,16 @@ impl PopupHost {
                     return Ok(());
                 }
             };
-            renderer.set_popup(root, bounds);
+            renderer.set_popup(root, system.map_or(bounds, |(_, rect)| rect));
+            renderer.set_unshadowed(system.map(|(panel, _)| panel));
             let rect = renderer.plane_rect().unwrap_or(bounds);
             let resized = panel
                 .rect
                 .is_none_or(|old| (old.width, old.height) != (rect.width, rect.height));
-            // Glass shows the window's new pixels under it.
-            let glass = panel.glass;
+            // Glass shows the window's new pixels under it; over the accent's
+            // blur it blurs nothing of its own (its own target, empty), the
+            // system's blur under it showing through its fill.
+            let glass = panel.glass && system.is_none();
             changed |= glass && damage.iter().any(|at| at.intersection(rect).is_some());
             if changed || resized {
                 let renderer = panel.renderer.as_mut().expect("made above");
@@ -1164,10 +1308,12 @@ impl PopupHost {
             };
             panel.place(origin, frame);
             panel.set_corner(corner_of(scene, root, rect));
+            panel.set_accent(system.is_some());
             if new {
                 // Its first frame is in its visual before it shows.
                 // SAFETY: our device, on its thread.
                 let _ = unsafe { panel.device.Commit() };
+                panel.target.cursor.set(self.cursor);
                 panel.show(parent, &self.send);
             }
         }
@@ -1321,7 +1467,72 @@ impl Drop for PopupHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zgx::scene::{Layout, QuadStyle, Style};
+    use zgx::scene::{BoxShadow, Color, Layout, QuadStyle, Style, Transform};
+
+    /// A popup answers Windows with the cursor its own window's zgx chose, not
+    /// always the arrow, and two windows' popups each keep their own. A window
+    /// of the class that shows nothing, asked as Windows would ask.
+    #[test]
+    fn a_popup_shows_the_cursor_its_window_chose() {
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursor, SendMessageW};
+        // SAFETY: windows of our class, never shown, made and destroyed here,
+        // their targets outliving them; system cursors, compared by handle.
+        unsafe {
+            let window = || {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    class(),
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    None,
+                    None,
+                    Some(GetModuleHandleW(None).unwrap_or_default().into()),
+                    None,
+                )
+                .unwrap()
+            };
+            let shows = |hwnd: HWND, cursor| {
+                SetCursor(None);
+                assert_eq!(SendMessageW(hwnd, WM_SETCURSOR, None, None), LRESULT(1));
+                assert_eq!(GetCursor(), LoadCursorW(None, cursor).unwrap());
+            };
+            let (first, second) = (window(), window());
+            shows(first, IDC_ARROW);
+            let (a, b) = (Target::default(), Target::default());
+            SetWindowLongPtrW(first, GWLP_USERDATA, &a as *const Target as isize);
+            SetWindowLongPtrW(second, GWLP_USERDATA, &b as *const Target as isize);
+            shows(first, IDC_ARROW);
+            a.cursor.set(CursorIcon::Pointer);
+            b.cursor.set(CursorIcon::Text);
+            shows(first, IDC_HAND);
+            shows(second, IDC_IBEAM);
+            for hwnd in [first, second] {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+
+    /// Named as winit's own windows name them, so a cursor reads the same
+    /// over a popup as over its window, unknown ones the arrow.
+    #[test]
+    fn a_popups_cursors_are_winits() {
+        for (cursor, system) in [
+            (CursorIcon::Default, IDC_ARROW),
+            (CursorIcon::Pointer, IDC_HAND),
+            (CursorIcon::Text, IDC_IBEAM),
+            (CursorIcon::ColResize, IDC_SIZEWE),
+            (CursorIcon::RowResize, IDC_SIZENS),
+            (CursorIcon::Grabbing, IDC_SIZEALL),
+            (CursorIcon::Cell, IDC_ARROW),
+        ] {
+            assert_eq!(system_cursor(cursor), system, "{cursor:?}");
+        }
+    }
 
     /// A popup root holding one panel `size` points square, rounded `radius`.
     fn popup(size: f32, radius: f32) -> (Scene, NodeId) {
@@ -1359,6 +1570,109 @@ mod tests {
         // Painting past its panel (a shadow of its own), zgx draws it all.
         let (scene, root) = popup(80., 8.);
         assert_eq!(corner_of(&scene, root, window), DWMWCP_DONOTROUND);
+    }
+
+    /// A popup root holding, 40 points in, a 100-point panel rounded 8 and
+    /// filled `fill`, with a shadow past it if `shadow`, and an arrow beside
+    /// it if `arrow`; and the root's ink, where its window goes without the
+    /// accent.
+    fn glass(fill: Color, shadow: bool, arrow: bool) -> (Scene, NodeId, Rect) {
+        let mut scene = Scene::new(400., 300.);
+        let root = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Column),
+            Style {
+                padding: 40.,
+                ..Default::default()
+            },
+        );
+        scene.append(
+            root,
+            NodeKind::Quad(QuadStyle {
+                fill,
+                radius: 8.,
+                shadow: shadow.then_some(BoxShadow {
+                    color: Color(0, 0, 0, 128),
+                    offset: Transform { x: 0., y: 8. },
+                    blur_radius: 16.,
+                    spread: 0.,
+                }),
+                ..Default::default()
+            }),
+            Style {
+                width: Some(100.),
+                height: Some(100.),
+                ..Default::default()
+            },
+        );
+        if arrow {
+            scene.append(
+                root,
+                NodeKind::Quad(QuadStyle {
+                    fill,
+                    ..Default::default()
+                }),
+                Style {
+                    width: Some(10.),
+                    height: Some(10.),
+                    ..Default::default()
+                },
+            );
+        }
+        let _ = scene.flush();
+        let ink = scene.popup_bounds(root).expect("it shows");
+        (scene, root, ink)
+    }
+
+    /// A menu's translucent panel gets the system's blur behind its box
+    /// alone, past which its shadow reaches, and DWM rounds it there: the
+    /// blur fills the window, so the window is the panel. An opaque or clear
+    /// panel has none, nor one with an arrow beside it, which that window
+    /// would cut.
+    #[test]
+    fn a_translucent_panel_takes_the_blur_behind_its_box_alone() {
+        let tint = Color(30, 30, 30, 160);
+        let (scene, root, ink) = glass(tint, true, false);
+        let (_, panel) = system_glass(&scene, root).expect("the panel's blur");
+        assert_eq!(panel, Rect::new(40., 40., 100., 100.));
+        assert!(
+            ink.width > panel.width && ink.height > panel.height,
+            "{ink:?}"
+        );
+        assert_eq!(corner_of(&scene, root, panel), DWMWCP_ROUND);
+        // Over its whole ink, DWM frames none of it (zgx draws the shadow).
+        assert_eq!(corner_of(&scene, root, ink), DWMWCP_DONOTROUND);
+        let (scene, root, ink) = glass(tint, false, false);
+        assert_eq!(system_glass(&scene, root).map(|(_, rect)| rect), Some(ink));
+        for (fill, arrow) in [
+            (Color(30, 30, 30, 255), false),
+            (Color(0, 0, 0, 0), false),
+            (tint, true),
+        ] {
+            let (scene, root, _) = glass(fill, true, arrow);
+            assert_eq!(system_glass(&scene, root), None, "{fill:?}, arrow {arrow}");
+        }
+    }
+
+    /// Windows takes the accent's blur on a popup's window, which is never
+    /// activated, and takes it off again: what a system backdrop would not
+    /// show there. (Windows reads an accent back to no one, so this is all
+    /// a test can see of it.)
+    #[test]
+    fn a_never_activated_popup_window_takes_the_accent() {
+        if !crate::window_chrome::popup_blur_behind() {
+            return;
+        }
+        let mut panel = Panel::new().expect("a popup window");
+        // SAFETY: reads our own window's extended style.
+        let style = unsafe { GetWindowLongPtrW(panel.hwnd, GWL_EXSTYLE) } as u32;
+        assert_ne!(style & WS_EX_NOACTIVATE.0, 0);
+        assert!(crate::window_chrome::blur_behind(panel.hwnd, true));
+        panel.set_accent(true);
+        assert!(panel.accent);
+        panel.set_accent(false);
+        assert!(!panel.accent);
+        assert!(crate::window_chrome::blur_behind(panel.hwnd, false));
     }
 
     fn area(left: i32, top: i32, right: i32, bottom: i32) -> RECT {

@@ -492,6 +492,226 @@ fn an_orbit_turns_by_keyboard_focused_and_a_flick_coasts_to_a_stop() {
     assert_eq!(frame_id(&mut h, "scene"), settled, "still once stopped");
 }
 
+/// This thread's frames drawn whole, as a video's are, while it lives.
+#[cfg(feature = "gltf")]
+struct WholeFrames(bool);
+#[cfg(feature = "gltf")]
+impl WholeFrames {
+    fn on() -> Self {
+        Self(zgx::image::set_whole_frames_on_this_thread(true))
+    }
+}
+#[cfg(feature = "gltf")]
+impl Drop for WholeFrames {
+    fn drop(&mut self) {
+        zgx::image::set_whole_frames_on_this_thread(self.0);
+    }
+}
+
+/// A model that hears a click at its middle, saying so in `clicked`.
+#[cfg(feature = "gltf")]
+const CLICKED_MODEL: &str = r#"
+local clicked = ui.state("clicked", "none")
+return ui.column {
+    ui.text { id = "clicked", "{clicked}" },
+    ui.scene3d {
+        id = "scene", w = 200, h = 200,
+        camera = { position = { 0, 0, 3 } },
+        ui.model { src = "square.glb", fit = 2, on_click = function() clicked:set("clicked") end },
+    },
+}
+"#;
+
+#[cfg(feature = "gltf")]
+#[test]
+fn a_whole_frame_has_its_model_from_its_first_frame() {
+    let _whole = WholeFrames::on();
+    let mut h = beside_a_model("whole", CLICKED_MODEL);
+    assert_eq!(h.error(), None);
+    // No waiting: a video's frame doesn't wait for another thread.
+    h.frame();
+    press(&mut h, "scene", (100., 100.), 0.);
+    assert_eq!(h.text("clicked"), "clicked", "{}", h.tree());
+}
+
+/// Its buffer a named pipe, which a read of it waits on until the test writes
+/// there: read on the main thread, making the window would wait (until the
+/// writer gives up waiting for the test, and then it would show at once).
+#[cfg(all(feature = "gltf", unix))]
+#[test]
+fn a_window_reads_its_model_off_its_main_thread() {
+    unsafe extern "C" {
+        fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> i32;
+    }
+    // Under macOS's temporary directory, a link: found through it all the same.
+    let dir = std::env::temp_dir().join(format!("zgx-model-pipe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pipe = dir.join("buffer.bin");
+    let name = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+    // SAFETY: A path that lives through the call.
+    assert_eq!(unsafe { mkfifo(name.as_ptr(), 0o600) }, 0);
+    std::fs::write(
+        dir.join("square.gltf"),
+        r#"{"asset":{"version":"2.0"},"buffers":[{"uri":"buffer.bin","byteLength":60}],
+        "bufferViews":[{"buffer":0,"byteLength":48},{"buffer":0,"byteOffset":48,"byteLength":12}],
+        "accessors":[{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3"},
+            {"bufferView":1,"componentType":5123,"count":6,"type":"SCALAR"}],
+        "meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],
+        "nodes":[{"mesh":0}],"scenes":[{"nodes":[0]}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.luau"),
+        CLICKED_MODEL.replace("square.glb", "square.gltf"),
+    )
+    .unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        let _ = released.recv_timeout(std::time::Duration::from_secs(5));
+        let positions: [f32; 12] = [-0.5, -0.5, 0., 0.5, -0.5, 0., 0.5, 0.5, 0., -0.5, 0.5, 0.];
+        let mut bin: Vec<u8> = positions.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bin.extend([0_u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()));
+        std::fs::write(pipe, bin).unwrap();
+    });
+    let mut h = Harness::new(|runtime| zgx_script::ScriptHost::new(runtime, dir.join("app.luau")));
+    assert_eq!(h.error(), None);
+    // The read is waiting on the pipe: a window goes on without its model.
+    h.frame();
+    press(&mut h, "scene", (100., 100.), 0.);
+    assert_eq!(h.text("clicked"), "none", "read on the main thread");
+    release.send(()).unwrap();
+    let heard = h.wait_until(|h| {
+        h.frame();
+        press(h, "scene", (100., 100.), 0.);
+        h.text("clicked") != "none"
+    });
+    assert!(heard, "never read: {} {:?}", h.tree(), h.error());
+    writer.join().unwrap();
+}
+
+#[cfg(feature = "gltf")]
+#[test]
+fn a_file_that_is_no_model_says_so_whichever_way_it_is_read() {
+    for whole in [true, false] {
+        let _whole = whole.then(WholeFrames::on);
+        let dir =
+            std::env::temp_dir().join(format!("zgx-model-bad-{whole}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bad.glb"), b"not a model").unwrap();
+        std::fs::write(
+            dir.join("app.luau"),
+            r#"return ui.scene3d { w = 100, h = 100, ui.model { src = "bad.glb" } }"#,
+        )
+        .unwrap();
+        let mut h =
+            Harness::new(|runtime| zgx_script::ScriptHost::new(runtime, dir.join("app.luau")));
+        if whole {
+            // Told by the time it's mounted, with nothing to wait for.
+            assert!(h.error().is_some(), "said nothing: {}", h.tree());
+        } else {
+            assert!(
+                h.wait_until(|h| {
+                    h.frame();
+                    h.error().is_some()
+                }),
+                "said nothing"
+            );
+        }
+    }
+}
+
+/// A model sliding a unit a second (`animation = "slide"`) posed at `time`,
+/// the state `t` starting at T, counting the clicks that land on it. The
+/// camera 6 back sees x 1 at 40 points right of the middle.
+#[cfg(feature = "gltf")]
+const POSED_MODEL: &str = r#"
+local t = ui.state("t", T)
+local hits = ui.state("hits", 0)
+return ui.column {
+    ui.text { id = "hits", "{hits}" },
+    ui.button { id = "on", w = 10, h = 10, on_click = function() t:set(t:get() + 0.5) end },
+    ui.scene3d {
+        id = "scene", w = 200, h = 200,
+        camera = { position = { 0, 0, 6 } },
+        ui.model {
+            src = "square.glb",
+            animation = "slide",
+            time = t,
+            on_click = function() hits:set(hits:get() + 1) end,
+        },
+    },
+}
+"#;
+
+/// Whether a click at `x` in the scene lands on the model.
+#[cfg(feature = "gltf")]
+fn lands(h: &mut zgx_script::testing::TestApp, x: f32) -> bool {
+    let px = 100. + x / (6. * 22.5_f32.to_radians().tan()) * 100.;
+    let before = h.text("hits");
+    press(h, "scene", (px, 100.), 0.);
+    h.text("hits") != before
+}
+
+#[cfg(feature = "gltf")]
+#[test]
+fn time_poses_the_clip_follows_its_state_and_does_not_play() {
+    // Both ways of reading: a frame drawn whole, and a window's off its thread.
+    for whole in [true, false] {
+        let _whole = whole.then(WholeFrames::on);
+        let mut h = beside_a_model(&format!("time-{whole}"), &POSED_MODEL.replace("T)", "1)"));
+        assert_eq!(h.error(), None);
+        // At 1 s it is a unit along (the square 0.5 either side of x 1)...
+        assert!(
+            h.wait_until(|h| {
+                h.frame();
+                lands(h, 1.3)
+            }),
+            "not at its time: {}",
+            h.tree()
+        );
+        assert!(!lands(&mut h, 0.3), "still where it starts");
+        // ...and stays there however many frames go by: nothing plays it.
+        h.frames(120);
+        assert!(lands(&mut h, 1.2), "it played on");
+        assert!(!lands(&mut h, 2.2), "it played on");
+        // Half a second more on the state: half a unit along.
+        h.click("on");
+        h.frame();
+        assert!(lands(&mut h, 1.8), "didn't follow its state");
+        assert!(!lands(&mut h, 0.8), "didn't follow its state");
+    }
+}
+
+#[cfg(feature = "gltf")]
+#[test]
+fn the_same_time_gives_the_same_pose_however_it_got_there() {
+    // A chunk of a render starting at 1.5 s, and one that came there through
+    // 0.5 s and 1 s: where each edge lies, to a hair either side of it.
+    let edges = |h: &mut Harness| [1.9, 1.95, 2.05, 2.1].map(|x| lands(h, x));
+    let _whole = WholeFrames::on();
+    let mut direct = beside_a_model("same-direct", &POSED_MODEL.replace("T)", "1.5)"));
+    direct.frame();
+    let mut stepped = beside_a_model("same-stepped", &POSED_MODEL.replace("T)", "0.5)"));
+    stepped.frame();
+    stepped.click("on");
+    stepped.frame();
+    stepped.click("on");
+    stepped.frame();
+    assert_eq!(edges(&mut direct), edges(&mut stepped));
+    assert_eq!(edges(&mut direct), [true, true, false, false]);
+}
+
+#[cfg(feature = "gltf")]
+#[test]
+fn time_without_an_animation_says_so() {
+    let error = raised(r#"ui.scene3d { ui.model { src = "a.glb", time = 1 } }"#);
+    assert!(
+        error.contains("`time`") && error.contains("animation"),
+        "{error}"
+    );
+}
+
 /// A square of two triangles facing the camera at z = 0.5, its own
 /// geometry (`FACES` its per-triangle form), clicked as a box is.
 const OWN: &str = r##"

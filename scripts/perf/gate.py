@@ -19,7 +19,8 @@ instructions would swamp zgx's, so heavy, lab and animate run with
 RENDER=0 (update, layout and damage, text measured as a renderer would). They
 run as a desktop with no screen reader does (`ZGX_ASSISTIVE=0`: labels and
 names made for assistive technology wait for one), which is what most
-users get; `heavy-stream-at` keeps one listening, to guard that work.
+users get; `heavy-stream-at` and `terminal-reader` keep one listening, to
+guard that work.
 The app scenes count their canvases' CPU work too (`HeadlessCanvases`):
 found as shapes the GPU draws, or rasterized where they cannot be. Each
 run has one environment, addresses not randomized, and a clock and hash
@@ -31,7 +32,9 @@ written at a first launch is not charged to whichever scene runs first.
 A cold launch is the startup scene's to measure.
 
 With `ZGX_GATE_FUNCTIONS=DIR` (CI's perf job sets it), each cell that grew
-more than 0.01% (the largest ten, `ZGX_GATE_FUNCTIONS_MAX`) runs once more
+at least 0.02% and past its scene's spread (`ZGX_GATE_FUNCTIONS_FLOOR`; the
+largest ten, `ZGX_GATE_FUNCTIONS_MAX`; within `ZGX_GATE_FUNCTIONS_BUDGET`
+seconds, after the table and the verdict are out) runs once more
 on each side writing what it counted by function, and its difference
 (`cgdiff.py`) goes to the log and DIR, with totals by whose code it is
 (zgx's, Luau's, the C library's, other Rust) under the table: what the
@@ -55,6 +58,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -80,6 +84,13 @@ WORK = work_dir(ROOT)
 # cells explained, the largest first, each two more runs.
 FUNCTIONS = os.environ.get('ZGX_GATE_FUNCTIONS')
 FUNCTIONS_MAX = int(os.environ.get('ZGX_GATE_FUNCTIONS_MAX', '10'))
+# A cell is explained by function only past what the gate can see at all:
+# +0.02%, or a scene's own spread with no change. Each takes minutes (both
+# sides run again under cachegrind writing every function), and all of them
+# stop at a budget: a job printing them for every scene that moved ran into
+# its time limit after the table and ended with no verdict (#1534, #1586).
+FUNCTIONS_FLOOR = float(os.environ.get('ZGX_GATE_FUNCTIONS_FLOOR', '0.02'))
+FUNCTIONS_BUDGET = float(os.environ.get('ZGX_GATE_FUNCTIONS_BUDGET', '600'))
 
 # name, package, example, environment: sized to a few billion instructions.
 # The windowed scenes' headless twins run with RENDER=0: update, layout and
@@ -131,19 +142,82 @@ SCENES = [
     ('spans-follow', 'zgx-script', 'span_bench', {'SCENE': 'spans-follow', 'N': '10', 'REPS': '80'}),
     ('spans-md', 'zgx-script', 'span_bench', {'SCENE': 'spans-md', 'N': '10', 'REPS': '14'}),
     ('list-state', 'zgx-script', 'list_state_bench', {}),
+    # A 400-section Markdown reply streaming in a chunk at a time, parsed
+    # by a keyed `ui.markdown` in a computed and drawn by `ui.each`.
+    ('md-stream', 'zgx-script', 'md_stream_bench', {}),
+    # The same reply measured as a window measures it: its paragraphs
+    # shaped by zgx-gpu's text cache (`TextServices`, on the CPU, in the
+    # bundled font), each section's paragraph growing over 40 chunks. What a
+    # growing paragraph's chunks cost the text cache; the bench asserts the
+    # cache shaped them.
+    ('md-stream-text', 'zgx-script', 'md_stream_text_bench', {}),
     ('style', 'zgx', 'style_bench', {}),
+    # A terminal streaming a build log (16, 256 and true colours, styles,
+    # wrapping, a progress line rewritten), its output replayed on the
+    # main thread a 4 KB read at a time: parsed, rows worked out, laid out
+    # and measured, undrawn. Built apart (`ALONE`): its dev-dependencies
+    # would otherwise join the other benches' build. Without fastbins, as
+    # script-update: with them, a change moving where the heap lay made
+    # `malloc_consolidate` run or not, and one binary counted 2.2 M (0.3%)
+    # apart (arm64), where the change itself was 0.05%.
+    ('terminal', 'zgx-terminal', 'terminal_bench', {'GLIBC_TUNABLES': 'glibc.malloc.mxfast=0'}),
+    # The same with a screen reader listening (as `heavy-stream-at`): each
+    # read's output is worked out as news for it, which every other cell
+    # leaves out (`ZGX_ASSISTIVE=0`).
+    ('terminal-reader', 'zgx-terminal', 'terminal_bench', {'GLIBC_TUNABLES': 'glibc.malloc.mxfast=0',
+                                                           'ZGX_ASSISTIVE': '1'}),
+    # Pictures in that terminal, drawn by wgpu's no-op backend: placed (RGBA
+    # in chunks, a PNG), scrolled, replaced under their ids and deleted;
+    # sixel images placed over one another. What `terminal` guards having no
+    # cost, this measures. The output it makes beforehand (pixels, PNGs,
+    # base64) and its count of pictures drawn each frame are the bench's own
+    # and uncounted (`gate_marks`), since 0.1.11: before, they were a tenth
+    # of the cell (a re-baseline, not a saving).
+    ('terminal-pictures', 'zgx-terminal', 'terminal_pictures_bench', {'GLIBC_TUNABLES': 'glibc.malloc.mxfast=0',
+                                                                      'ZGX_GPU_NOOP': '1'}),
     # 3D frames' CPU work, drawn by wgpu's no-op backend (no driver, no JIT):
     # textured meshes alone, what a feature costs those not using it, then
     # those among skinned, morphing, cut-out and placed ones.
     ('3d-textured', 'zgx-3d', 'world_bench', {'SCENE': 'textured', 'MESHES': '2000', 'FRAMES': '30'}),
     ('3d-mixed', 'zgx-3d', 'world_bench', {'SCENE': 'mixed', 'MESHES': '2000', 'FRAMES': '30'}),
     ('widgets', 'zgx', 'widget_bench', {}),
+    # A split between six panes dragged, a width a frame: nested panes of
+    # wrapping text, text areas and measured lists laid out again, undrawn.
+    ('layout-drag', 'zgx', 'layout_drag_bench', {}),
+    # A pointer moving over a deep page with hover styles, undrawn.
+    ('pointer-move', 'zgx', 'pointer_bench', {}),
+    # Effects' CPU work through the whole renderer, drawn by wgpu's no-op
+    # backend: a scene of boxes as they are, then the same with an animated
+    # layer shader painting past its box, and with one reading what's behind
+    # it (damage, the backdrop's copy and a pass of its own): what zero can
+    # be told from, what an effect costs the frame that has one.
+    ('fx-none', 'zgx-3d', 'fx_bench', {'SCENE': 'none', 'ZGX_GPU_NOOP': '1'}),
+    ('fx-layer', 'zgx-3d', 'fx_bench', {'SCENE': 'layer', 'ZGX_GPU_NOOP': '1'}),
+    ('fx-reader', 'zgx-3d', 'fx_bench', {'SCENE': 'reader', 'ZGX_GPU_NOOP': '1'}),
+    ('fx-passes', 'zgx-3d', 'passes_bench', {'ZGX_GPU_NOOP': '1'}),
+    # A video's frames (zgx-video's `examples/bench`): its script, animations,
+    # timers and shader clock stepped on a virtual clock (`zgx::clock`), each
+    # frame drawn whole by wgpu's no-op backend. What making video costs;
+    # every other cell runs without a virtual clock, which must cost them
+    # nothing.
+    ('video', 'zgx-video', 'video_bench', {'ZGX_GPU_NOOP': '1'}),
     # The example apps' common interactions (`support/apps.rs`), small and
     # undrawn but for their canvases' CPU work, run by list_state_bench (no
     # binary of their own to link): the
     # same paths at a sixth of the work (`suite.py` runs `apps_bench` full
     # size).
     ('app-mail', 'zgx-script', 'list_state_bench', {'APP': 'mail', 'REPS': '2'}),
+    # A list with an estimate (`ui.list { estimate = … }`): it runs per row.
+    ('list-estimate', 'zgx-script', 'estimate_bench', {}),
+    # New text mounting, cold: a word's first shape.
+    ('mount-text', 'zgx-script', 'mount_text_bench', {}),
+    # An app's cold start: a chat feed decoded from the script's source into
+    # a state, a keyed list of measured rows built and the first frame laid
+    # out and shaped (Expo Exact's heavy-list shape, made by the bench, not
+    # kept). A change that slows startup shows here. 1,000 messages, a few
+    # percent of the gate's run: the bench's own 10,000 counted 2.8 G, 12%,
+    # and decoding and state cost the same by the message at either size.
+    ('startup', 'zgx-script', 'startup_bench', {'N': '1000'}),
     # A reply's token streamed in, a composer keystroke, a switch.
     ('app-chat', 'zgx-script', 'list_state_bench', {'APP': 'chat', 'REPS': '4'}),
     # A sort with no order kept (the honest whole sort) on its own, as the
@@ -167,9 +241,25 @@ SCENES = [
 # app-code's drift: main against itself now counts it the same): app-chat's
 # test waits for its fake server's timer thread, a handoff between threads
 # that real time decides.
-SPREAD = {'app-chat': 0.2, '3d-textured': 0.06, '3d-mixed': 0.08, 'spans-md': 0.08}
-# Built alone: see `build`.
-ALONE = 'zgx-3d'
+#
+# spans-follow: zgx-script's watchdog thread is woken (`Watchdog::wake_by`,
+# an unpark) by an outermost script call that finds it parked, and whether
+# it is parked when a call starts is a race between the two threads: under
+# `--fair-sched=yes` (`FAIR`) most runs count the same, the rest one of a
+# few others up to 0.06% away. The fix is the product's: no unpark per
+# call after idle (a Luau lane's), after which this entry goes.
+SPREAD = {'app-chat': 0.2, '3d-textured': 0.06, '3d-mixed': 0.08, 'spans-md': 0.08, 'spans-follow': 0.06}
+# Counted under valgrind's `--fair-sched=yes` (`count`), which hands its lock
+# to threads in the order they asked: the Luau scenes where the main thread
+# and the script watchdog took turns by where the watchdog had got to, and
+# which then count the same each run (spans-follow, micro-state-luau,
+# startup and app-dashboard all but one run in ten). Not every Luau scene:
+# under it list-estimate's runs spread 15,227 instructions (1,319 without)
+# and app-mail's 6,421 (828).
+FAIR = ('spans-plain', 'spans-md', 'spans-follow', 'micro-state-luau', 'script-update', 'md-stream', 'md-stream-text',
+        'startup', 'app-dashboard', 'app-dashboard-sort')
+# Built apart from the rest, each: see `build`.
+ALONE = ('zgx-3d', 'zgx-video', 'zgx-terminal')
 
 # A Luau scene's count follows where the heap places things (the value
 # cache and Luau's tables hash by address, its collector marks in their
@@ -264,9 +354,13 @@ def build(checkout, target, into):
     env = dict(os.environ, CARGO_TARGET_DIR=str(target), CARGO_INCREMENTAL='0',
                CARGO_PROFILE_RELEASE_DEBUG='0')
     # Cargo turns a feature on for everything one build selects, and
-    # zgx-3d's bench takes wgpu's no-op backend: built apart, the other
-    # benches link the wgpu they always did.
-    for part in ([s for s in scenes if s[1] != ALONE], [s for s in scenes if s[1] == ALONE]):
+    # zgx-3d's and zgx-video's benches take wgpu's no-op backend: each built
+    # apart, the other benches link the wgpu they always did. zgx-terminal's
+    # benches bring dev-dependencies of their own, that backend among them,
+    # apart for the same reason.
+    parts = [[s for s in scenes if s[1] not in ALONE]]
+    parts += [[s for s in scenes if s[1] == alone] for alone in ALONE]
+    for part in parts:
         if not part:
             continue
         command = ['cargo', 'build', '--release', '--locked', '--quiet']
@@ -360,14 +454,16 @@ def warm(binary, env, checkout):
     WARM.add(binary)
 
 
-def count(binary, env, checkout=None, placement=None, out='/dev/null'):
+def count(binary, env, checkout=None, placement=None, out='/dev/null', fair=False):
     """The run's instructions (and cachegrind's file of them by function in
     `out`), the binary warmed first (`warm`). A run that fails is the gate's
     failure, not the change's: under cachegrind a script's time budget
     (`ZGX_GATE` lifts it in the benches) or a missing GPU would otherwise
-    look like a result."""
+    look like a result. `fair`: valgrind hands its lock to threads in the
+    order they asked (`--fair-sched=yes`, the scenes in `FAIR`)."""
     warm(binary, env, checkout)
-    command = ['valgrind', '--tool=cachegrind', '--cache-sim=no', f'--cachegrind-out-file={out}', str(binary)]
+    command = ['valgrind', '--tool=cachegrind', '--cache-sim=no', *(['--fair-sched=yes'] if fair else []),
+               f'--cachegrind-out-file={out}', str(binary)]
     result = subprocess.run(
         ['setarch', '-R', *command] if shutil.which('setarch') else command,
         env=environment(binary, env, checkout, placement), capture_output=True, text=True)
@@ -385,19 +481,31 @@ def compared(name, package, env, base, head):
     for a scene new in the head) and the head, the change in percent, and
     every change counted: one, or for a Luau scene that moved more than
     `RECOUNT`%, one under each heap placement, the change their median."""
-    after = count(head[0], env, head[1])
+    fair = name in FAIR
+    after = count(head[0], env, head[1], fair=fair)
     if base is None:
         return None, after, None, []
-    before = count(base[0], env, base[1])
+    before = count(base[0], env, base[1], fair=fair)
     deltas = [(after - before) / before * 100]
     if scripted(name, package) and abs(deltas[0]) > RECOUNT:
         for placement in PLACEMENTS:
-            placed = count(base[0], env, base[1], placement)
-            deltas.append((count(head[0], env, head[1], placement) - placed) / placed * 100)
+            placed = count(base[0], env, base[1], placement, fair=fair)
+            deltas.append((count(head[0], env, head[1], placement, fair=fair) - placed) / placed * 100)
     return before, after, statistics.median(deltas), deltas
 
 
-def by_function(rows, scenes, base):
+def worth_explaining(rows, floor=None, spread=None, most=None):
+    """The cells to explain by function: those that grew past the floor and
+    their scene's spread with no change, largest first, at most `most`."""
+    floor = FUNCTIONS_FLOOR if floor is None else floor
+    spread = SPREAD if spread is None else spread
+    most = FUNCTIONS_MAX if most is None else most
+    grew = [row for row in rows
+            if row[3] is not None and row[3] >= max(floor, spread.get(row[0], 0.0))]
+    return sorted(grew, key=lambda row: -row[3])[:most]
+
+
+def by_function(rows, scenes, base, budget=None, clock=time.monotonic):
     """For the cells that grew most, each side run again writing what it
     counted by function, and the difference (`cgdiff.py`) in the log and in
     `ZGX_GATE_FUNCTIONS`, with its totals by whose code it is for the
@@ -407,14 +515,21 @@ def by_function(rows, scenes, base):
     import cgdiff
     into = pathlib.Path(FUNCTIONS)
     into.mkdir(parents=True, exist_ok=True)
-    grew = sorted((row for row in rows if row[3] is not None and row[3] > 0.01), key=lambda row: -row[3])
+    budget = FUNCTIONS_BUDGET if budget is None else budget
+    start = clock()
     summary = []
-    for name, *_ in grew[:FUNCTIONS_MAX]:
+    chosen = worth_explaining(rows)
+    for at, (name, *_) in enumerate(chosen):
+        if clock() - start > budget:
+            left = ', '.join(row[0] for row in chosen[at:])
+            print(f'=== out of time ({budget:g} s) for: {left}', flush=True)
+            summary.append(f'| {left} | (out of time) |' + ' |' * len(cgdiff.GROUPS))
+            break
         _, package, example, env = scenes[name]
         try:
             for side, binary, checkout in (('base', WORK / 'gate-bin-base' / example, base),
                                            ('head', WORK / 'gate-bin-head' / example, ROOT)):
-                count(binary, env, checkout, out=str(into / f'{name}.{side}.cg'))
+                count(binary, env, checkout, out=str(into / f'{name}.{side}.cg'), fair=name in FAIR)
             report, groups, total = cgdiff.diff(into / f'{name}.base.cg', into / f'{name}.head.cg')
         except (Infra, OSError, ValueError) as error:
             print(f'=== {name}: no functions ({error})', flush=True)
@@ -542,12 +657,19 @@ def main():
                 spread += (f' (median of {", ".join(f"{d:+.3f}%" for d in deltas)} under '
                            f'{len(deltas)} heap placements{layout_of(deltas)})')
             table.append(f'| {name} | {before / 1e6:,.1f} M | {after / 1e6:,.1f} M | {delta:+.2f}%{flag}{spread} |')
-    if FUNCTIONS:
-        table += by_function(rows, {scene[0]: scene for scene in SCENES}, base)
+    # The table and the verdict first, whatever explaining the cells takes.
+    verdict = (f'GATE FAIL: more than +{args.threshold:g}% instructions: {", ".join(failed)}'
+               if failed else f'GATE PASS: no scene more than +{args.threshold:g}%')
+    print(verdict, flush=True)
     if args.markdown:
         args.markdown.write_text('\n'.join(table) + '\n')
+    if FUNCTIONS:
+        explained = by_function(rows, {scene[0]: scene for scene in SCENES}, base)
+        if args.markdown and explained:
+            with args.markdown.open('a') as out:
+                out.write('\n'.join(explained) + '\n')
     if failed:
-        sys.exit(f'more than +{args.threshold:g}% instructions: {", ".join(failed)}')
+        sys.exit(verdict)
 
 
 if __name__ == '__main__':

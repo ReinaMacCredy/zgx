@@ -65,6 +65,23 @@ type function Item(t)
 	return types.never
 end
 
+-- What a function taking a string or the state holding one answers:
+-- `text` given a string, `state` given a state, `any` given `any`. (Not two
+-- overloads: luau-lsp checks a table literal against neither, so
+-- `ui.markdown(s, { key = "reply" })` would fail either way.)
+type function TextOrState(given, text, state)
+	if given:is("any") or given:is("unknown") then
+		return types.any
+	end
+	if given:is("string") or (given:is("singleton") and type(given:value()) == "string") then
+		return text
+	end
+	if given:is("table") and given:readproperty(types.singleton("get")) then
+		return state
+	end
+	error("takes a string or a State<string> holding one")
+end
+
 -- What a `ui.variants` definition's axes accept, the choosing table its
 -- recipe is called with: each axis its options' names (a boolean for an
 -- on-off axis, `[true]` / `[false]`), or `extra` (a state or a function
@@ -193,6 +210,15 @@ export type ColorToken =
 	| "$selection.text.inactive"
 	| "$find.match"
 	| "$find.current"
+	| "$caption.text"
+	| "$caption.text.hover"
+	| "$caption.text.inactive"
+	| "$caption.hover"
+	| "$caption.pressed"
+	| "$caption.close"
+	| "$caption.close.pressed"
+	| "$caption.close.text"
+	| "$caption.close.text.pressed"
 	| "$terminal.foreground"
 	| "$terminal.background"
 	| "$terminal.cursor"
@@ -347,6 +373,15 @@ export type TokenName =
 	| "find.match"
 	| "find.current"
 	| "mark.radius"
+	| "caption.text"
+	| "caption.text.hover"
+	| "caption.text.inactive"
+	| "caption.hover"
+	| "caption.pressed"
+	| "caption.close"
+	| "caption.close.pressed"
+	| "caption.close.text"
+	| "caption.close.text.pressed"
 	| "terminal.foreground"
 	| "terminal.background"
 	| "terminal.cursor"
@@ -398,6 +433,23 @@ export type Tokens = {
 		bg: string,
 		hover: string,
 		pressed: string,
+	},
+	caption: {
+		close: {
+			pressed: string,
+			text: {
+				pressed: string,
+				value: string,
+			},
+			value: string,
+		},
+		hover: string,
+		pressed: string,
+		text: {
+			hover: string,
+			inactive: string,
+			value: string,
+		},
 	},
 	control: {
 		height: string,
@@ -784,6 +836,22 @@ declare extern type Bitmap with
 end
 declare extern type Shader with
 end
+export type ShaderPass = {
+	name: string,
+	shader: string,
+	size: { number }?,
+	scale: number?,
+	format: ("rgba8" | "rgba16float")?,
+	feedback: boolean?,
+	steps: number?,
+	once: boolean?,
+}
+export type LayerShaderOptions = {
+	fps: number?,
+	passes: { ShaderPass }?,
+	images: { [string]: Bitmap }?,
+	geometry: string?,
+}
 declare extern type LayerShader with
 end
 declare extern type Brush with
@@ -904,12 +972,14 @@ export type Promise<T = unknown> = {
 -- nil while it is fine; `values.other` reads another field), and what
 -- submitting does (in a task: it may await, and raises what went wrong).
 -- `ui.router`'s spec: each route's name and path (`"/thread/:id"`), the
--- path it starts at ("/" by default), and the scheme of the deep links it
--- follows (`"mail"` for `mail://thread/42`).
+-- path it starts at ("/" by default), the scheme of the deep links it
+-- follows (`"mail"` for `mail://thread/42`), and how many places behind its
+-- history keeps (100 by default, the oldest let go; `math.huge` for all).
 export type RouterSpec = {
 	routes: { [string]: string },
 	initial: string?,
 	scheme: string?,
+	history: number?,
 }
 -- Where the router is: the route's name, its path and its params.
 export type Route = { name: string, path: string, params: { [string]: string } }
@@ -1144,6 +1214,15 @@ declare extern type Element with
 	function overlaid(self): boolean
 	-- Clear keyboard focus if it is on the element or inside it.
 	function blur(self): ()
+	-- Lock the pointer to the element, as the DOM's `requestPointerLock`
+	-- (a game's look about, a 3D view's orbit): hidden and held, every
+	-- press and wheel goes to it, and its `on_pointer_move` hears the
+	-- mouse's motion as `dx`, `dy`. Only in a press's, a release's or a
+	-- key's handler (or within a second of one); whether it holds it.
+	-- Escape always lets it go, as does the window losing focus.
+	function lock_pointer(self): boolean
+	-- Let the pointer go, if the element holds its lock.
+	function unlock_pointer(self): ()
 end
 
 -- `ref = r` on a node. Reading it in an effect or computed follows it: the
@@ -1209,6 +1288,55 @@ export type LineOptions = { cap: LineCap?, join: LineJoin?, dash: { number }?, d
 -- What a scroll view keeps clear (`scroll_padding`): points on every side,
 -- or by side.
 export type ScrollPadding = number | { top: number?, bottom: number?, left: number?, right: number? }
+-- A scrollbar drawn and timed as the app's own, over the platform's (each
+-- field set replaces the platform's), in points and milliseconds: an app's
+-- floating rail, thin, clear of a card's corners, gone with no track.
+export type Scrollbar = {
+	-- `false`: over zgx's own look on every platform (no arrow buttons, no
+	-- widening delay), the same bar wherever the app runs.
+	platform: boolean?,
+	-- The thumb across, and under the pointer or dragged.
+	thickness: number?,
+	active_thickness: number?,
+	-- The strip that takes the pointer, and the thumb from the view's edge
+	-- (otherwise centred in the strip).
+	strip: number?,
+	side: number?,
+	-- How far its track stops short of each end, the thumb whole within it;
+	-- how far the thumb's drawing is inset from its place; the shortest.
+	ends: number?,
+	inset: number?,
+	min: number?,
+	-- How long it stays once the view stops scrolling, how long it fades,
+	-- whether it fades in too, and on which curve.
+	linger: number?,
+	fade: number?,
+	fade_in: boolean?,
+	ease: ("linear" | "outQuad" | "outCubic")?,
+	-- How long its track is, from the view's start (a transcript's, stopping
+	-- above a composer over its foot); read as it changes.
+	track: (State<number> | () -> number)?,
+	-- Shown while this holds (what can't be seen to scroll until tried).
+	hint: (State<boolean> | () -> boolean)?,
+	-- Under the pointer or dragged, the theme's `scrollbar.thumb.active`;
+	-- whether its track is drawn.
+	active_color: boolean?,
+	track_fill: boolean?,
+	-- A press beside the thumb: a page, or the thumb's middle to the pointer,
+	-- dragged from there.
+	press: ("page" | "jump")?,
+	-- Let go (the pointer leaves, a hint ends): it lingers from then, or
+	-- from the last scroll.
+	linger_from: ("release" | "scroll")?,
+	-- Whether a press focuses it, for its keys.
+	focusable: boolean?,
+	-- An overlay (shown as it scrolls) even where scrollbars always show.
+	always_overlay: boolean?,
+	-- Whether assistive technology has it, a scrollbar whose value is the
+	-- offset (`false`: left out, as an app's rail may be; the view scrolls
+	-- for it as before).
+	accessible: boolean?,
+}
 export type MarkdownOptions = {
 	-- Names a text that grows (a streaming reply): parsed incrementally.
 	key: string?,
@@ -1238,7 +1366,7 @@ export type MarkdownBlock =
 	| { t: "ol", start: number, items: { { MarkdownBlock } } }
 	| { t: "quote", b: { MarkdownBlock } }
 	| { t: "hr" }
-	| { t: "table", head: { { MarkdownRun } }, rows: { { { MarkdownRun } } } }
+	| { t: "table", head: { { MarkdownRun } }, rows: { { { MarkdownRun } } }, align: { "start" | "center" | "end" | "" }? }
 	| { t: "img", src: string, alt: string }
 	-- A block `lazy` has not parsed yet: what it is by its first line
 	-- (`hint`), its lines and its bytes in the text (`from`, `to`, as
@@ -1591,6 +1719,9 @@ declare extern type WindowApi with
 	-- lights moves over as they go.
 	full_screen: State<boolean>
 	full_screen_transition: State<FullScreenTransition?>
+	-- Whether the window is maximized, read-only and followed. False in full
+	-- screen unless the system keeps it maximized under it.
+	maximized: State<boolean>
 	-- The window's size in points, read-only and followed: for decisions
 	-- layout can't make (a sidebar collapsing to icons below a width).
 	-- Sizes themselves are layout's: percentages, `grow`, `max_w`.
@@ -1621,6 +1752,9 @@ export type Child = Node | string | (() -> TextValue) | Message | { read [number
 export type Handler = () -> ...unknown
 -- `clicks` (on_press): the press's count, 2 for a double click's second, 3
 -- for a triple's, and on past it.
+-- `dx`, `dy` (on_pointer_move): how far it moved since the last move, in
+-- the window's points; while the pointer is locked (`locked`), the
+-- mouse's own motion, `x` and `y` staying where it locked.
 -- `shift`, `ctrl`, `alt`, `meta`: the keys held; `cmd`: the platform's
 -- command key (Command on macOS, Ctrl elsewhere), as `cmd` in keys.
 export type PointerEvent = {
@@ -1629,6 +1763,9 @@ export type PointerEvent = {
 	local_x: number,
 	local_y: number,
 	clicks: number?,
+	dx: number?,
+	dy: number?,
+	locked: boolean?,
 	shift: boolean,
 	ctrl: boolean,
 	alt: boolean,
@@ -1915,6 +2052,9 @@ export type Styles = {
 	underline_offset: Num?,
 	-- The language its text is in (HTML's `lang`): "ja", "zh-TW".
 	lang: string?,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: string?,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: number?,
 	y: number?,
@@ -2102,6 +2242,9 @@ export type StyleProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Reactive<string>?,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: string?,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Reactive<number>?,
 	y: Reactive<number>?,
@@ -2173,6 +2316,11 @@ export type NodeProps = {
 	variants: (Variants | ((choice: any) -> Variants))?,
 	ref: (Ref | { Ref })?,
 	focusable: boolean?,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: boolean?,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -2194,14 +2342,21 @@ export type NodeProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: ("polite" | "assertive" | "off")?,
-	-- Read after its name, as a hint (`aria-description`).
-	description: string?,
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
+	description: (string | ReadOnlyState<string> | (() -> string))?,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Reactive<string>?,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: (string | Readable<string?> | (() -> string?))?,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: boolean?,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: boolean?,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -2280,7 +2435,17 @@ export type NodeProps = {
 	-- the box passes through its `layer` function.
 	layer_shader: LayerShader?,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
-	layer_params: { read [number]: Color | { number } }?,
+	layer_params: ({ read [number]: Color | { number } } | (() -> { read [number]: Color | { number } }))?,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: number?,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: number?,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: boolean?,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: boolean?,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Reactive<boolean>?,
 	-- Events.
 	on_click: (ClickHandler | Handler | Action)?,
 	-- Primary pointer down and up.
@@ -2305,6 +2470,9 @@ export type NodeProps = {
 	on_file_hover: ((over: boolean) -> ...unknown)?,
 	on_hover: (((inside: boolean) -> ...unknown) | Action)?,
 	on_pointer_move: (((e: PointerEvent) -> ...unknown) | Action)?,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: ((locked: boolean) -> ...unknown)?,
 	-- Return true to consume the key.
 	on_key: (((e: KeyEvent) -> ...boolean?) | Action)?,
 	on_key_up: (((key: string, code: string?) -> ...unknown) | Action)?,
@@ -2322,6 +2490,10 @@ export type NodeProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: ((visible: boolean, element: Element) -> ...unknown)?,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: number?,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -2399,21 +2571,43 @@ export type ContainerProps = Merge<Props, {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
+}>
+-- `ui.glass`'s look, over a container's props (merged, as a scroll's are: an
+-- intersection made a plain `h = 84` fail against the reactive forms).
+export type GlassProps = Merge<ContainerProps, {
+	-- The more see-through of the system's glasses.
+	clear: Reactive<boolean>?,
+	-- A colour it takes on.
+	tint: Reactive<Color>?,
+	-- Its corners' radius in points.
+	radius: Reactive<number>?,
+	-- Each corner's own, over `radius`: `{ tl, tr, br, bl }` or four numbers
+	-- (the drawn glass; macOS's system glass takes `radius`).
+	corners: Reactive<Corners>?,
 }>
 export type ScrollProps = Merge<ContainerProps, {
 	-- The scroll position in points, both ways.
 	offset: State<number>?,
 	-- Stays at the end while the content grows, until scrolled away.
-	-- An interactive scrollbar over the trailing edge (none by default).
-	scrollbar: boolean?,
+	-- An interactive scrollbar over the trailing edge (none by default):
+	-- the platform's (`true`), or drawn and timed as `Scrollbar` says.
+	scrollbar: (boolean | Scrollbar)?,
 	follow: boolean?,
 	-- "contain": a wheel or trackpad gesture over it stays with it at its
 	-- edges (CSS's overscroll-behavior), the scroll views around it never
 	-- moving; "auto" (the default) hands what it can't scroll on to them.
 	overscroll: ("auto" | "contain")?,
+	-- `ui.scroll_x`: a mouse wheel, which has no sideways axis, moves it: with
+	-- Shift always (never the page), and without once the pointer has been
+	-- moved onto it, going on to the views around it at its edge after a
+	-- pause or once the pointer moves. A trackpad's
+	-- swipe mostly down leaves it still.
+	wheel_across: boolean?,
+	-- Comes to rest only on whole pages, each its own length along the way it
+	-- scrolls, as UIKit's paging scroll views.
+	paging: boolean?,
 	-- What a focused control or a find keeps clear of scrolling into view
 	-- (CSS's scroll-padding): a composer or a bar floating over its edges.
 	-- Points: one number for every side, or { top, bottom, left, right };
@@ -2470,13 +2664,24 @@ export type SpanProps = {
 	underline_style: ("solid" | "double" | "dotted" | "dashed" | "wavy")?,
 	underline_color: Color?,
 	underline_thickness: number?,
+	-- Its text fading in: from clear at `start` (`ui.now()`'s milliseconds)
+	-- to its colour `ms` later, its alpha `1 - (1 - t)^power` (power 2 if
+	-- not given). Drawn in Rust a frame at a time: no script per frame.
+	fade_in: {
+		start: number,
+		ms: number,
+		power: number?,
+	}?,
 	-- A link (`on_click`) under the pointer: underlined, recoloured. With
 	-- it, the link isn't underlined at rest unless `underline` says so.
 	hover: { underline: boolean?, color: Color? }?,
 	-- An icon before the text, in the line (a file chip's file type):
 	-- `src` (a file, `https://…`) or `code` (SVG markup), `size` square
 	-- (12), `gap` from the text (4), centred on the line; `tint` a colour,
-	-- or `"currentColor"` for the span's. A span of no text with an icon
+	-- or `"currentColor"` for the span's. `bg` sets it on a well of its own
+	-- (a colour or token), `pad` larger than it on every side (0), its
+	-- corner `radius` (0), drawn over the span's background and under the
+	-- icon; the line keeps the well's room. A span of no text with an icon
 	-- is the icon alone: nothing of it is copied or read out.
 	icon: {
 		src: string?,
@@ -2484,6 +2689,9 @@ export type SpanProps = {
 		size: number?,
 		gap: number?,
 		tint: Color?,
+		bg: Color?,
+		radius: number?,
+		pad: number?,
 	}?,
 	-- A click (and a middle click, which passes as a ⌘-click) on the run,
 	-- a link: told the keys held. Returning `true` handled it: its `href`
@@ -2501,8 +2709,10 @@ export type SpanProps = {
 	-- Its text as it is, not a template (see TextProps).
 	literal: boolean?,
 	-- Room around it: across (before and after it, taking space in the
-	-- line), or `{ across, down }`; with `bg`, the background hugs the text
-	-- plus this (an inline code chip) instead of filling the line.
+	-- line), or `{ across, down }`, or `{ before, after, down }` (a chip
+	-- whose icon sits near its edge, its name with more room after it);
+	-- with `bg`, the background hugs the text plus this (an inline code
+	-- chip) instead of filling the line.
 	padding: (number | { number })?,
 	-- The background's corner radius.
 	radius: number?,
@@ -2627,6 +2837,10 @@ export type ModelProps = {
 	-- The animation it plays, round and round: a clip's name, or its place
 	-- in the file (from 1).
 	animation: (string | number)?,
+	-- Seconds into `animation` to pose it at, in place of playing it: a
+	-- video's frame, a slider's or a scrubbed timeline's says where it is.
+	-- The same time gives the same pose. Requires `animation`.
+	time: Reactive<number>?,
 	-- As a group's: it hears its meshes'.
 	on_click: ((hit: Hit3D) -> ())?,
 	on_hover: ((over: boolean) -> ())?,
@@ -3122,14 +3336,54 @@ export type SplitProps = Merge<ContainerProps, {
 	-- The other pane's smallest size: the divider stops short of it.
 	min_rest: number?,
 }>
+-- A text in a row, for `ListEstimate`.
+export type ListEstimateText = {
+	-- The field holding it.
+	field: string,
+	-- Its font's size (14), and a line's height (1.4 times that).
+	size: number?,
+	line: number?,
+	-- A narrow character's average width in ems (0.5); wide ones count an em.
+	char: number?,
+	-- An average word's length in characters (5): wrapping leaves about half of
+	-- one unused on each line.
+	word: number?,
+	-- Its column: `share` of (the list less `inset`, at most `most`, less `minus`).
+	inset: number?,
+	most: number?,
+	minus: number?,
+	share: number?,
+	-- Clamped to this many lines, and what shows beyond them then.
+	most_lines: number?,
+	beyond: number?,
+	-- It's Markdown: what each kind of source line adds to its wrapped lines.
+	markdown: { paragraph: number?, heading: number?, item: number?, code: number?, table: number? }?,
+}
+-- How a row's data makes its height (`ui.list`'s `estimate`), or a part of it.
+export type ListEstimate = {
+	-- Points it always adds.
+	height: number?,
+	-- Its text, or several.
+	text: ListEstimateText | { ListEstimateText }?,
+	-- A part for each item of a list field.
+	each: string?,
+	item: ListEstimate?,
+	-- A part by a field's value.
+	by: string?,
+	cases: { [string]: ListEstimate }?,
+	default: ListEstimate?,
+	-- A part for each field that holds anything.
+	has: { [string]: ListEstimate }?,
+}
 -- A virtualized list: only visible rows are built.
 export type ListProps = Merge<Props, {
 	-- The name assistive technology reads for it: "Messages".
 	label: Label?,
 	-- The row count (with `heights`, their length).
 	count: Reactive<number>?,
-	-- An interactive scrollbar over the trailing edge (none by default).
-	scrollbar: boolean?,
+	-- An interactive scrollbar over the trailing edge (none by default):
+	-- the platform's (`true`), or drawn and timed as `Scrollbar` says.
+	scrollbar: (boolean | Scrollbar)?,
 	-- Its rows are one Tab stop, and the arrows, Page Up and Down, Home and
 	-- End move focus through every row (mounting it), as a list box's do.
 	keyboard: boolean?,
@@ -3163,6 +3417,10 @@ export type ListProps = Merge<Props, {
 	-- stay put as estimates are measured. With `key`, heights go with
 	-- their items.
 	measured: boolean?,
+	-- With `measured`, `data` and `key`: how a row's data makes its height, so
+	-- rows out of view stand at about what they will be and the scrollbar
+	-- tells the truth. Declared once; no script runs per row.
+	estimate: ListEstimate?,
 	-- Row `index`'s plain text: what copying a selection over rows the list
 	-- has not mounted takes. Without it, a row's text is what its row's
 	-- description shows (its texts, a row's side by side with tabs).
@@ -3205,6 +3463,10 @@ export type ListProps = Merge<Props, {
 	-- where they are (a measured list's, by key).
 	on_start: (() -> ())?,
 	start_distance: number?,
+	-- Viewports of rows built ahead of each edge of its view in time frames
+	-- leave over, and kept as it scrolls away: 1 unless set; 0, it builds
+	-- what shows and its `overscan` alone.
+	ahead: number?,
 	-- Kept saying whether it rests at its end (within a few points): a
 	-- "jump to the latest" button shows while it does not.
 	at_end: State<boolean>?,
@@ -3409,6 +3671,23 @@ export type CaseKey = string | number | boolean
 export type TweenEnd = number | string | { number }
 export type TweenOptions = { duration: number?, ease: Easing?, from: TweenEnd?, to: TweenEnd?, [number]: never }
 export type SpringOptions = { stiffness: number?, damping: number?, from: TweenEnd?, to: TweenEnd?, [number]: never }
+export type SpringToOptions = {
+	response: number?,
+	bounce: number?,
+	stiffness: number?,
+	damping: number?,
+	-- Points a second to start from, for what a gesture hands over.
+	velocity: number?,
+	-- Where the spring itself begins, if not at the state: the state stays where it
+	-- is until the spring has passed it.
+	from: number?,
+	-- Ms before it moves.
+	delay: number?,
+	-- Ms, by when it lands whatever the spring says.
+	most: number?,
+	-- When it arrives.
+	done: (() -> ())?,
+}
 export type LoopOptions = {
 	duration: number?,
 	ease: Easing?,
@@ -3590,7 +3869,7 @@ declare ui: {
 	-- from its uses, which misfires). A row whose item changes is built
 	-- again; a `build` taking a third parameter gets the row's item as
 	-- state instead, kept current, and its row updates in place.
-	each: (list: State<{ any }> | { any }, build: (item: any, index: number, row: State<any>) -> Node, opts: EachOptions?) -> Node,
+	each: (list: State<{ any }> | ReadOnlyState<{ any }> | { any }, build: (item: any, index: number, row: State<any>) -> Node, opts: EachOptions?) -> Node,
 	-- What `build` makes of the value, entering and exiting as it changes;
 	-- nil shows nothing. The value is `any`, as `each`'s item is.
 	presence: (value: string | Readable<unknown> | (() -> unknown), build: (value: any) -> Node, opts: PresenceOptions?) -> Node,
@@ -3649,7 +3928,7 @@ declare ui: {
 	-- table, img; runs `{ x, b?, i?, c?, s?, a?, f? }`). With `key` (a
 	-- reply's id), text growing under it parses only its new end, and its
 	-- earlier blocks are the same tables as before.
-	markdown: (text: string, opts: MarkdownOptions?) -> { MarkdownBlock },
+	markdown: <T>(text: T, opts: MarkdownOptions?) -> TextOrState<T, { MarkdownBlock }, ReadOnlyState<{ MarkdownBlock }>>,
 	-- Markdown drawn: paragraphs, headings, lists, quotes, tables, and code
 	-- blocks with a Copy button, in the theme's colours and sizes,
 	-- selectable. As its text changes it parses only what changed and
@@ -3733,8 +4012,10 @@ declare ui: {
 	paged: <T, C>(load: (cursor: C?) -> { items: { T }, next: C? }) -> Paged<T>,
 	-- `state` once it has stayed unchanged for `ms` (a search box's query):
 	-- read-only (as `ui.computed`'s: a write is an error), its timer begun
-	-- again on each change, gone with its owner.
-	debounced: <T>(state: State<T>, ms: number) -> State<T>,
+	-- again on each change, gone with its owner. `every`: what reads it is
+	-- told at each rest, even when the value is the one it already held (a
+	-- view's offset come back to where it last rested).
+	debounced: <T>(state: State<T>, ms: number, opts: { every: boolean? }?) -> State<T>,
 	-- A connection kept open to `url` (a WebSocket) through the host's
 	-- connector, as `useWebSocket`: messages to `on_message`, `send` queued
 	-- while it is not open and sent in order once it is, opened again after
@@ -3820,6 +4101,9 @@ declare ui: {
 	tween: (state: State<any>, opts: TweenOptions?) -> Binding,
 	spring: (state: State<any>, opts: SpringOptions?) -> Binding,
 	loop: (opts: LoopOptions?) -> Binding,
+	-- Run a state to `target` on a spring now, in Rust. The function it returns
+	-- stops it and says how fast it was going.
+	spring_to: (state: State<number>, target: number, opts: SpringToOptions?) -> () -> number,
 	-- White pixels with the alpha `alpha(x, y)` gives (0 to 1), for masks.
 	bitmap: (w: number, h: number, alpha: (x: number, y: number) -> number) -> Bitmap,
 	-- A WGSL fill: `fn fill(input: FillInput) -> vec4<f32>`, with input.p,
@@ -3827,9 +4111,12 @@ declare ui: {
 	shader: (source: string, opts: { fps: number? }?) -> Shader,
 	-- A WGSL layer shader: `fn layer(input: LayerInput) -> vec4<f32>`, with
 	-- input.color (the layer's pixel, straight alpha), input.p, input.size,
-	-- input.time, input.scale and input.params; `zgx_sample(p)` reads the
-	-- layer at another point of the box.
-	layer_shader: (source: string, opts: { fps: number? }?) -> LayerShader,
+	-- input.time, input.scale, input.params and input.radii (the box's corners);
+	-- `zgx_sample(p)` reads the layer at another point, and `zgx_backdrop(p)`
+	-- what lies behind the node there.
+	layer_shader: (source: string, opts: LayerShaderOptions?) -> LayerShader,
+	-- A box of glass: macOS 26's own where it can be, drawn elsewhere.
+	glass: (opts: GlassProps) -> Node,
 	-- Sorts `list` in place, stably, by a field of each item (`"price"`) or
 	-- a function of it (called once an item); returns it. Use it over
 	-- `table.sort` with a comparator for long lists: that calls Luau some

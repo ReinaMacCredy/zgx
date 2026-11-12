@@ -253,6 +253,68 @@ fn script_scrolls_fade_only_where_content_runs_past() {
 }
 
 #[test]
+fn truncate_means_one_line_only_where_lines_does_not_say() {
+    use zgx::text_layout::TextOverflow;
+    let mut h = Harness::inline(
+        r##"local on = ui.state("on", true)
+        local two = ui.state("two", 2)
+        local text = "The quick brown fox jumps over the lazy dog, and on and on it goes"
+        return ui.column {
+            ui.button { id = "flip", on_click = function()
+                on:set(not on:get())
+                two:set(3)
+            end, "flip" },
+            ui.text { id = "alone", w = 120, truncate = true, text },
+            ui.text { id = "both", w = 120, lines = 2, truncate = true, text },
+            ui.text { id = "both-backwards", w = 120, truncate = true, lines = 2, text },
+            ui.text { id = "lines-only", w = 120, wrap = true, lines = 2, text },
+            ui.text { id = "state-truncate", w = 120, lines = 2, truncate = on, text },
+            ui.text { id = "state-lines", w = 120, truncate = true, lines = two, text },
+            ui.text { id = "function-truncate", w = 120, lines = 2,
+                truncate = function() return on:get() end, text },
+        }"##,
+    );
+    h.ui.prepare_frame();
+    assert_eq!(h.host.error().get(), None);
+    let of = |h: &mut Harness, id: &str| {
+        let mut stack = vec![h.find(id).unwrap()];
+        let scene = h.ui.scene.borrow();
+        while let Some(node) = stack.pop() {
+            if let zgx::scene::NodeKind::Text { .. } = scene.kind(node) {
+                let options = scene.style(node).text_options;
+                return (options.line_clamp.map_or(0, |n| n.get()), options.overflow);
+            }
+            stack.extend(scene.children(node).iter().copied());
+        }
+        panic!("{id} has no text");
+    };
+    let ellipsis = TextOverflow::Ellipsis;
+    assert_eq!(of(&mut h, "both"), (2, ellipsis));
+    assert_eq!(of(&mut h, "both-backwards"), (2, ellipsis));
+    // `truncate` alone is one line, half as tall as two.
+    assert_eq!(of(&mut h, "alone").1, ellipsis);
+    let (one, two) = (h.bounds("alone").height, h.bounds("both").height);
+    assert!(
+        (two - 2. * one).abs() < 1.,
+        "one line {one}, two lines {two}"
+    );
+    assert_eq!(of(&mut h, "lines-only").0, 2);
+    assert_ne!(of(&mut h, "lines-only").1, ellipsis);
+    assert_eq!(of(&mut h, "state-truncate"), (2, ellipsis));
+    assert_eq!(of(&mut h, "state-lines"), (2, ellipsis));
+    assert_eq!(of(&mut h, "function-truncate"), (2, ellipsis));
+
+    h.click("flip");
+    h.frames(2);
+    // Off, the clamp stays and the ellipsis goes; a changed `lines` is kept.
+    assert_eq!(of(&mut h, "state-truncate").0, 2);
+    assert_ne!(of(&mut h, "state-truncate").1, ellipsis);
+    assert_eq!(of(&mut h, "function-truncate").0, 2);
+    assert_ne!(of(&mut h, "function-truncate").1, ellipsis);
+    assert_eq!(of(&mut h, "state-lines"), (3, ellipsis));
+}
+
+#[test]
 fn inputs_take_letter_spacing() {
     let mut h = Harness::inline(
         r##"local v = ui.state("v", "Weekly dependency updates")
@@ -409,6 +471,32 @@ fn a_pixelated_image_draws_its_picture_pixelated() {
             "{id}"
         );
     }
+}
+
+/// `paging = true` on a scroll view: a wheel goes for the next page, on a spring,
+/// rather than moving it by the wheel's distance at once.
+#[test]
+fn a_scroll_view_takes_paging() {
+    let scrolled = |paging: &str| {
+        let mut h = Harness::inline(&format!(
+            r##"return ui.scroll_x {{ id = "pager", w = 100, h = 50, {paging}
+                ui.div {{ w = 500, h = 50 }} }}"##
+        ));
+        h.ui.prepare_frame();
+        h.ui.dispatch(zgx::input::InputEvent::Scroll {
+            x: 10.,
+            y: 10.,
+            delta_x: 30.,
+            delta_y: 0.,
+        });
+        h.ui.prepare_frame();
+        let pager = h.find("pager").unwrap();
+        let (offset, ..) = h.ui.scroll_report(pager).unwrap();
+        (offset, h.ui.next_interaction_deadline().is_some())
+    };
+    assert_eq!(scrolled(""), (30., false));
+    assert_eq!(scrolled("paging = true,"), (0., true));
+    assert_eq!(scrolled("paging = false,"), (30., false));
 }
 
 /// `border_style = "dotted"` dots the border; `outline_style` and
@@ -660,6 +748,55 @@ fn a_key_let_go_carries_its_physical_code() {
 }
 
 #[test]
+fn a_press_inside_what_keeps_focus_leaves_it_where_it_is() {
+    let mut h = Harness::inline(
+        r##"local n = ui.state("n", 0)
+        return ui.column {
+            ui.input { id = "field", w = 120, value = ui.state("v", "hello") },
+            ui.column { id = "list", focus_on_press = false, w = 120, gap = 4,
+                ui.button { id = "row", w = 120, h = 20, on_click = function() n:set(n:peek() + 1) end, "row" },
+                ui.div { id = "blank", w = 120, h = 20 },
+            },
+            ui.text { id = "count", function() return tostring(n:get()) end },
+            ui.button { id = "elsewhere", w = 120, h = 20, "elsewhere" },
+            -- A press layer under a row the pointer passes through.
+            ui.div { relative = true, w = 120, h = 20,
+                ui.div { absolute = true, left = 0, right = 0, top = 0, bottom = 0,
+                    focus_on_press = false, on_press = function() end },
+                ui.row { id = "over", pointer_events = "none", w = 120, h = 20 },
+            },
+        }"##,
+    );
+    h.frames(2);
+    h.click("field");
+    assert_eq!(h.ui.input.focused(), h.find("field"));
+    // A row in the list: its click comes, the field keeps the keys.
+    h.click("row");
+    h.frames(1);
+    assert_eq!(h.text("count"), "1", "the row's click came");
+    assert_eq!(
+        h.ui.input.focused(),
+        h.find("field"),
+        "the field kept the keys"
+    );
+    // Its blank room: the same.
+    h.click("blank");
+    assert_eq!(h.ui.input.focused(), h.find("field"));
+    // A press layer under a row the pointer passes through: the press is
+    // the layer's, and focus stays.
+    h.click("field");
+    h.click("over");
+    assert_eq!(
+        h.ui.input.focused(),
+        h.find("field"),
+        "the layer under kept it"
+    );
+    // Outside it, a press moves focus as ever.
+    h.click("elsewhere");
+    assert_eq!(h.ui.input.focused(), h.find("elsewhere"));
+}
+
+#[test]
 fn focus_styles_show_for_the_keyboard_not_a_click() {
     use zgx::input::{InputEvent, Key, Modifiers};
     let mut h = Harness::inline(
@@ -735,6 +872,30 @@ fn a_hover_style_underlines_the_label_it_reaches() {
     h.ui.dispatch(zgx::input::InputEvent::PointerLeave);
     h.frames(2);
     assert_eq!(underline(&mut h), None);
+}
+
+/// A script's `font_features` can name any four bytes: those an inline box
+/// is said in make no box on its text.
+#[test]
+fn a_script_font_feature_makes_no_inline_box() {
+    let mut h = Harness::inline(
+        r##"return ui.rich { id = "p", font_features = "_ibw=1 _ibh=1 liga=0",
+            ui.span { "text", padding = { 6, 0 } } }"##,
+    );
+    h.frames(2);
+    let p = h.find("p").unwrap();
+    let scene = h.ui.scene.borrow();
+    let paragraph = scene.children(p)[0];
+    let zgx::scene::NodeKind::RichText { text } = scene.kind(paragraph) else {
+        panic!("a paragraph")
+    };
+    assert!(!text.has_inline_boxes());
+    assert!(text.inline_boxes().is_empty());
+    let features = text.runs()[0].font.features.settings();
+    assert!(
+        features.contains(&(*b"liga", 0)),
+        "the rest kept: {features:?}"
+    );
 }
 
 #[test]
@@ -824,6 +985,147 @@ fn an_icon_alone_in_a_span_is_drawn_and_never_copied() {
     assert!(h.ui.select_all_text(p));
     assert_eq!(h.ui.selected_text(), "see parse.rs and main.rs");
     assert_eq!(h.error(), None);
+}
+
+#[test]
+fn a_span_icon_sits_on_its_well_behind_it_and_the_wash_spans_the_chip() {
+    use zgx::scene::{Color, NodeKind};
+    let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><rect width='12' height='12'/></svg>"#;
+    let measure = |extra: &str| {
+        let mut h = Harness::inline(&format!(
+            r##"return ui.column {{ w = 300, ui.rich {{ id = "p",
+                ui.span {{ "notes.rs", literal = true, bg = "#ff0000", padding = {{ 2, 2 }}, radius = 5{extra} }} }} }}"##
+        ));
+        h.frames(2);
+        let p = h.find("p").unwrap();
+        let scene = h.ui.scene.borrow();
+        let origin = scene.bounds(p);
+        let (mut well, mut glyph, mut width, mut runs) = (None, None, 0., Vec::new());
+        let mut stack = vec![p];
+        while let Some(n) = stack.pop() {
+            match scene.kind(n) {
+                NodeKind::Panel { quad: q, .. } => {
+                    let b = scene.bounds(n);
+                    well = Some((b.x - origin.x, b.width, b.height, q.fill, q.radius));
+                    // The icon its child: drawn over it.
+                    let inside = scene.children(n);
+                    assert_eq!(inside.len(), 1, "the icon in the well");
+                    let g = scene.bounds(inside[0]);
+                    glyph = Some((g.x - b.x, g.y - b.y, g.width));
+                }
+                NodeKind::Svg(_) => {
+                    // (One outside a well: the icon alone.)
+                    glyph = glyph.or(Some((-1., -1., scene.bounds(n).width)));
+                }
+                NodeKind::RichText { text } => {
+                    width = scene.bounds(n).width;
+                    runs = text
+                        .runs()
+                        .iter()
+                        .map(|r| (r.background, r.radius))
+                        .collect();
+                }
+                _ => {}
+            }
+            stack.extend(scene.children(n).iter().copied());
+        }
+        (well, glyph, width, runs)
+    };
+    let icon = format!("icon = {{ code = \"{svg}\", size = 12, gap = 3");
+    let (no_well, alone, plain, _) = measure(&format!(", {icon} }}"));
+    assert!(no_well.is_none(), "no bg: no well, as before");
+    assert_eq!(alone.map(|g| g.0), Some(-1.), "the icon alone");
+    let (well, glyph, chip, runs) = measure(&format!(
+        ", {icon}, bg = \"#00ff00\", radius = 4, pad = 2 }}"
+    ));
+    let (x, w, h, fill, radius) = well.expect("the well drawn");
+    assert_eq!(
+        (x.round(), w, h),
+        (2., 16., 16.),
+        "at the padding, the icon and its room round it"
+    );
+    assert_eq!(fill, Color(0, 255, 0, 255));
+    assert_eq!(radius, 4.);
+    assert_eq!(
+        glyph,
+        Some((2., 2., 12.)),
+        "the icon `pad` in from the well's corner"
+    );
+    assert!(
+        (chip - plain - 4.).abs() < 0.5,
+        "the line keeps room for the well (2 × pad): {plain} → {chip}"
+    );
+    // The span's wash on every run of the chip (the well's room, the
+    // text, the padding after): joined, one wash under the well and text.
+    assert!(!runs.is_empty());
+    assert!(
+        runs.iter()
+            .all(|(bg, r)| *bg == Some(Color(255, 0, 0, 255)) && *r == 5.),
+        "{runs:?}"
+    );
+}
+
+#[test]
+fn a_span_takes_other_room_before_and_after_its_text() {
+    use zgx::scene::NodeKind;
+    let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><rect width='12' height='12'/></svg>"#;
+    let measure = |extra: &str| {
+        let mut h = Harness::inline(&format!(
+            r##"return ui.column {{ w = 300, ui.rich {{ id = "p",
+                ui.span {{ "notes.rs", literal = true, bg = "#ff0000"{extra} }} }} }}"##
+        ));
+        h.frames(2);
+        let p = h.find("p").unwrap();
+        let scene = h.ui.scene.borrow();
+        let (mut well_x, mut width, mut washed) = (None, 0., true);
+        let mut stack = vec![p];
+        while let Some(n) = stack.pop() {
+            match scene.kind(n) {
+                NodeKind::Panel { .. } => well_x = Some(scene.bounds(n).x - scene.bounds(p).x),
+                NodeKind::RichText { text } => {
+                    width = scene.bounds(n).width;
+                    washed = text.runs().iter().all(|r| r.background.is_some());
+                }
+                _ => {}
+            }
+            stack.extend(scene.children(n).iter().copied());
+        }
+        (well_x, width, washed)
+    };
+    let (_, plain, _) = measure("");
+    // `{ start, end, y }` with an icon on a well: the well `start` in, the
+    // line its room, then the text, then `end`.
+    let (well_x, chip, washed) = measure(&format!(
+        ", padding = {{ 1, 7, 2 }}, icon = {{ code = \"{svg}\", size = 12, gap = 2, bg = \"#00ff00\", pad = 2 }}"
+    ));
+    assert_eq!(
+        well_x.map(f32::round),
+        Some(1.),
+        "a point in from the start"
+    );
+    assert!(
+        (chip - plain - (1. + 16. + 2. + 7.)).abs() < 0.5,
+        "1 + well 16 + 2 + text + 7: {plain} → {chip}"
+    );
+    assert!(washed, "one wash across every run");
+    // No icon: the room before and after, apart.
+    let (_, apart, washed) = measure(", padding = { 3, 9, 0 }");
+    assert!(
+        (apart - plain - 12.).abs() < 0.5,
+        "3 + text + 9: {plain} → {apart}"
+    );
+    assert!(washed);
+    // The old forms as they were: `{ x, y }` and `x`, the same both sides.
+    let (_, both, _) = measure(", padding = { 4, 2 }");
+    assert!(
+        (both - plain - 8.).abs() < 0.5,
+        "4 + text + 4: {plain} → {both}"
+    );
+    let (_, one, _) = measure(", padding = 5");
+    assert!(
+        (one - plain - 10.).abs() < 0.5,
+        "5 + text + 5: {plain} → {one}"
+    );
 }
 
 #[test]
@@ -1416,9 +1718,10 @@ fn tooltips_show_after_a_rest_and_at_once_after_another() {
             y: b.y + 5.,
         });
     };
+    let (delay, reshow) = tooltip_waits();
     to(&mut h, "b");
     assert!(!visible(&mut h, "bee"), "not at once");
-    wait_ms(&mut h, 350);
+    wait_ms(&mut h, delay + 50);
     // (It fades in over 140 ms.)
     wait_ms(&mut h, 200);
     assert!(visible(&mut h, "bee"), "after a rest");
@@ -1429,6 +1732,8 @@ fn tooltips_show_after_a_rest_and_at_once_after_another() {
         "gone as the pointer leaves (after its fade)"
     );
     to(&mut h, "b");
+    // At once (GTK's: after its short wait), just after another.
+    wait_ms(&mut h, reshow);
     h.frames(1);
     assert!(visible(&mut h, "bee"), "at once just after another");
 }
@@ -1471,7 +1776,7 @@ fn a_key_closes_a_tooltip_and_escape_an_interactive_card() {
         h.frames(1);
     };
     to(&mut h, "a");
-    wait_ms(&mut h, 550);
+    wait_ms(&mut h, tooltip_waits().0 + 300);
     assert!(visible(&mut h, "tip"));
     press(&mut h, Key::Character("x".into()));
     assert!(!visible(&mut h, "tip"), "a key closes it, at once");
@@ -1479,7 +1784,7 @@ fn a_key_closes_a_tooltip_and_escape_an_interactive_card() {
     to(&mut h, "away");
     wait_ms(&mut h, 1100);
     to(&mut h, "b");
-    wait_ms(&mut h, 550);
+    wait_ms(&mut h, tooltip_waits().0 + 300);
     assert!(visible(&mut h, "card"));
     press(&mut h, Key::Character("x".into()));
     assert!(visible(&mut h, "card"), "an interactive card takes typing");
@@ -1496,6 +1801,18 @@ fn wait_ms(h: &mut Harness, ms: u64) {
         h.settle();
         h.frames(1);
     }
+}
+
+/// The platform's tooltip waits (`TooltipTiming::default`): zgx's 300 ms
+/// and at once just after another; GTK's 500 and 60 on Linux. A reshow that
+/// waits is given a frame's grace past its timer.
+fn tooltip_waits() -> (u64, u64) {
+    let timing = zgx::compose::TooltipTiming::default();
+    let reshow = timing.reshow_delay.as_millis() as u64;
+    (
+        timing.delay.as_millis() as u64,
+        if reshow > 0 { reshow + 50 } else { 0 },
+    )
 }
 
 #[test]
@@ -1854,13 +2171,15 @@ fn one_tooltip_shows_at_a_time() {
         });
         h.frames(1);
     };
+    let (delay, reshow) = tooltip_waits();
     to(&mut h, "a");
-    wait_ms(&mut h, 350);
+    wait_ms(&mut h, delay + 50);
     wait_ms(&mut h, 200);
     assert!(visible(&mut h, "ca"));
-    // Straight to the next: its card opens at once, and the last one goes
-    // (not left showing out its grace).
+    // Straight to the next: its card opens at once (GTK's: after its short
+    // wait), and the last one goes (not left showing out its grace).
     to(&mut h, "b");
+    wait_ms(&mut h, reshow);
     assert!(visible(&mut h, "cb"), "the next opens at once");
     assert!(!visible(&mut h, "ca"), "and the last one closes");
 }
@@ -2294,10 +2613,11 @@ fn keyed_sticky_rows_follow_their_sections() {
     // Row 5 ("b", 60 down) has passed the top: its section holds it.
     h.click("down");
     assert_eq!(tops(&mut h), vec!["b@5".to_string()]);
-    // A section in front: the same row, its index moved on.
+    // A section in front: the view stays on it (the rows in view keep
+    // their place), the same row, its index moved on.
     let built = h.text("built");
     h.click("first");
-    assert_eq!(tops(&mut h), vec!["a@5".to_string()]);
+    assert_eq!(tops(&mut h), vec!["b@9".to_string()]);
     h.click("down");
     // Its section gone, the next takes over.
     h.click("drop");
@@ -3089,6 +3409,288 @@ fn on_visible_handlers_that_move_layout_settle() {
     h.ui.prepare_frame();
     wait_ms(&mut h, 30);
     h.ui.prepare_frame();
+}
+
+/// Its calls so far, as `on_visible` wrote them: "name:true name:false …".
+fn margin_calls(h: &mut common::Harness) -> Vec<String> {
+    h.text("seen")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn scroll_to(h: &mut common::Harness, offset: f64) {
+    h.host
+        .set_state("off", zgx_script::Value::Num(offset))
+        .unwrap();
+    h.ui.prepare_frame();
+    wait_ms(h, 15);
+}
+
+#[test]
+fn visible_margin_reports_a_node_within_it_on_a_scroll_alone() {
+    // A view 100 tall over a row at 1,000: within 300 of it once the view's
+    // bottom passes 700 (offset 600), well before it shows (offset 900); out
+    // again once the view's top passes 1,400. A scroll alone moves it:
+    // nothing lays out again.
+    let mut h = common::Harness::inline(
+        r##"local off = ui.state("off", 0)
+        local seen = ui.state("seen", "")
+        return ui.column { w = 200,
+            ui.scroll { h = 100, offset = off,
+                ui.div { h = 1000 },
+                ui.div { id = "row", h = 100, visible_margin = 300,
+                    on_visible = function(on) seen:set(seen:get() .. "row:" .. tostring(on) .. " ") end },
+                ui.div { h = 1000 },
+            },
+            ui.text { "{seen}", id = "seen" },
+        }"##,
+    );
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 20);
+    assert_eq!(
+        margin_calls(&mut h),
+        ["row:false"],
+        "told once at first layout"
+    );
+    let row = h.find("row").unwrap();
+    for (offset, calls) in [
+        (500., 1),
+        (590., 1),
+        (610., 2),
+        (850., 2),
+        (1000., 2),
+        (1390., 2),
+        (1410., 3),
+        (1300., 4),
+    ] {
+        scroll_to(&mut h, offset);
+        assert_eq!(margin_calls(&mut h).len(), calls, "at {offset}");
+    }
+    assert_eq!(
+        margin_calls(&mut h),
+        ["row:false", "row:true", "row:false", "row:true"],
+        "once each way per crossing"
+    );
+    // Told it's in view while it doesn't show yet.
+    scroll_to(&mut h, 0.);
+    scroll_to(&mut h, 650.);
+    assert_eq!(margin_calls(&mut h).last().unwrap(), "row:true");
+    assert!(
+        h.ui.scene.borrow().visible_bounds(row).is_none(),
+        "not shown yet"
+    );
+}
+
+#[test]
+fn visible_margin_flips_ahead_of_a_fast_fling() {
+    // Forty rows of 100 under a view of 400, each in view within 600; the
+    // view flung down 500 a frame. Each frame's calls come after it, so a
+    // row that shows has to have been told a frame before: within 600 of
+    // the view one 500-point step earlier.
+    let mut h = common::Harness::inline(
+        r##"local off = ui.state("off", 0)
+        local seen = ui.state("seen", "")
+        local rows = {}
+        for i = 1, 40 do
+            rows[i] = ui.div { id = "r" .. i, h = 100, visible_margin = 600,
+                on_visible = function(on) seen:set(seen:get() .. i .. ":" .. tostring(on) .. " ") end }
+        end
+        return ui.column { w = 200,
+            ui.scroll { h = 400, offset = off, rows },
+            ui.text { "{seen}", id = "seen" },
+        }"##,
+    );
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 20);
+    let near = |calls: &[String]| {
+        let mut near = std::collections::BTreeSet::new();
+        for call in calls {
+            let (row, on) = call.split_once(':').unwrap();
+            let row: usize = row.parse().unwrap();
+            if on == "true" {
+                near.insert(row);
+            } else {
+                near.remove(&row);
+            }
+        }
+        near
+    };
+    let rows: Vec<_> = (1..=40)
+        .map(|i| h.find(&format!("r{i}")).unwrap())
+        .collect();
+    let mut offset = 0.;
+    while offset < 3600. {
+        let told = near(&margin_calls(&mut h));
+        offset += 500.;
+        scroll_to(&mut h, offset);
+        for (i, row) in rows.iter().enumerate() {
+            if h.ui.scene.borrow().visible_bounds(*row).is_some() {
+                assert!(
+                    told.contains(&(i + 1)),
+                    "row {} showed at {offset} untold",
+                    i + 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn visible_margin_jumps_tell_each_row_once() {
+    // A jump from the top to far down in one step: the rows near the top
+    // leave, those near the new place come, each told once; the rows the
+    // view jumped over, never near, are told nothing.
+    let mut h = common::Harness::inline(
+        r##"local off = ui.state("off", 0)
+        local seen = ui.state("seen", "")
+        local rows = {}
+        for i = 1, 60 do
+            rows[i] = ui.div { id = "r" .. i, h = 100, visible_margin = 200,
+                on_visible = function(on) seen:set(seen:get() .. i .. ":" .. tostring(on) .. " ") end }
+        end
+        return ui.column { w = 200,
+            ui.scroll { h = 300, offset = off, rows },
+            ui.text { "{seen}", id = "seen" },
+        }"##,
+    );
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 20);
+    let first = margin_calls(&mut h);
+    // Rows 1-5 (0 to 500) are within 200 of a view 0 to 300.
+    let near_top: Vec<String> = (1..=5).map(|i| format!("{i}:true")).collect();
+    assert!(near_top.iter().all(|c| first.contains(c)), "{first:?}");
+    scroll_to(&mut h, 4000.);
+    let calls = margin_calls(&mut h)[first.len()..].to_vec();
+    let mut told = std::collections::BTreeMap::new();
+    for call in &calls {
+        *told.entry(call.clone()).or_insert(0) += 1;
+    }
+    assert!(told.values().all(|n| *n == 1), "each once: {calls:?}");
+    for i in 1..=5 {
+        assert!(
+            told.contains_key(&format!("{i}:false")),
+            "row {i} left: {calls:?}"
+        );
+    }
+    // The view 4,000 to 4,300, within 200 (3,800 to 4,500): rows 39 to 45;
+    // row 46 starts at 4,500, only touching it.
+    for i in 39..=45 {
+        assert!(
+            told.contains_key(&format!("{i}:true")),
+            "row {i} came: {calls:?}"
+        );
+    }
+    assert!(
+        calls.iter().all(|c| {
+            let i: usize = c.split_once(':').unwrap().0.parse().unwrap();
+            i <= 5 || (39..=45).contains(&i)
+        }),
+        "nothing for the rows jumped over: {calls:?}"
+    );
+}
+
+#[test]
+fn on_visible_tells_a_node_mounted_in_a_frame_within_that_frame() {
+    // A row that mounts as the view jumps (a list's new rows): its first
+    // report comes in the frame that shows it, so what it builds lays out
+    // before that frame is drawn, not a frame later.
+    let mut h = common::Harness::inline(
+        r##"local shown = ui.state("shown", false)
+        local seen = ui.state("seen", "")
+        return ui.column { w = 200,
+            ui.show(shown,
+                ui.div { h = 20, visible_margin = 100,
+                    on_visible = function(on) seen:set(seen:get() .. "row:" .. tostring(on) .. " ") end }),
+            ui.text { "{seen}", id = "seen" },
+        }"##,
+    );
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 20);
+    assert!(margin_calls(&mut h).is_empty());
+    h.host
+        .set_state("shown", zgx_script::Value::Bool(true))
+        .unwrap();
+    h.frame();
+    assert_eq!(
+        margin_calls(&mut h),
+        ["row:true"],
+        "told in its first frame"
+    );
+}
+
+#[test]
+fn visible_margin_goes_with_its_node() {
+    // Removed, a node's margin goes too, at the next frame that looks at
+    // visibility: removal itself does nothing more for it.
+    let mut h = common::Harness::inline(
+        r##"local shown = ui.state("shown", true)
+        return ui.column { w = 200,
+            ui.show(shown,
+                ui.div { h = 20, visible_margin = 100, on_visible = function() end }),
+            ui.div { h = 20, on_visible = function() end },
+        }"##,
+    );
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 20);
+    assert_eq!(h.ui.visibility_margin_count(), 1);
+    h.host
+        .set_state("shown", zgx_script::Value::Bool(false))
+        .unwrap();
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 20);
+    assert_eq!(h.ui.visibility_margin_count(), 0, "gone with its node");
+    assert_eq!(h.ui.observer_counts()[3], 1, "the other still observed");
+}
+
+#[test]
+fn visible_margin_is_judged_inside_nested_scroll_views() {
+    // A row across a view 200 wide that scrolls sideways, inside a view
+    // that scrolls down: the chip 350 to the right is within its margin of
+    // 200 only once the inner view has scrolled 100 its way, and only
+    // while the outer one shows the row.
+    let mut h = common::Harness::inline(
+        r##"local off = ui.state("off", 0)
+        local across = ui.state("across", 0)
+        local seen = ui.state("seen", "")
+        return ui.column { w = 200,
+            ui.scroll { h = 100, offset = off,
+                ui.scroll_x { w = 200, h = 40, offset = across,
+                    ui.row { w = 1000, h = 40,
+                        ui.div { w = 550, h = 40 },
+                        ui.div { id = "chip", w = 40, h = 40, visible_margin = 200,
+                            on_visible = function(on) seen:set(seen:get() .. "chip:" .. tostring(on) .. " ") end },
+                    },
+                },
+                ui.div { h = 2000 },
+            },
+            ui.text { "{seen}", id = "seen" },
+        }"##,
+    );
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 20);
+    assert_eq!(
+        margin_calls(&mut h),
+        ["chip:false"],
+        "350 to the right of the inner view"
+    );
+    h.host
+        .set_state("across", zgx_script::Value::Num(200.))
+        .unwrap();
+    h.ui.prepare_frame();
+    wait_ms(&mut h, 15);
+    assert_eq!(
+        margin_calls(&mut h),
+        ["chip:false", "chip:true"],
+        "150 away: within 200"
+    );
+    // The outer view scrolls the row 300 above it: within 200 no longer.
+    scroll_to(&mut h, 340.);
+    assert_eq!(
+        margin_calls(&mut h),
+        ["chip:false", "chip:true", "chip:false"],
+        "out of the outer view's margin"
+    );
 }
 
 #[test]
@@ -5377,4 +5979,275 @@ fn a_theme_tables_font_families_reach_its_text() {
     h.ui.prepare_frame();
     assert_eq!(family(&mut h, "plain"), plain);
     assert_eq!(family(&mut h, "mono"), mono);
+}
+
+#[test]
+fn ui_glass_is_a_box_that_holds_children_drawn_with_no_system_glass() {
+    let mut h = Harness::inline(
+        r##"return ui.glass { id = "pane", w = 200, h = 100, clear = false, radius = 16,
+            ui.text { id = "inside", "Over it" } }"##,
+    );
+    h.frames(2);
+    assert_eq!(h.host.error().get(), None);
+    assert!(h.find("inside").is_some());
+    let pane = h.find("pane").unwrap();
+    let scene = h.ui.scene.borrow();
+    // Its material drawn: a layer shader reading what's behind it, under its children.
+    let backing = scene.children(pane)[0];
+    assert!(
+        scene
+            .layer_shader(backing)
+            .is_some_and(|l| l.reads_backdrop())
+    );
+}
+
+#[test]
+fn ui_glass_rounds_each_corner_it_is_given() {
+    let mut h = Harness::inline(
+        r##"return ui.glass { id = "pane", w = 200, h = 100,
+            corners = { tl = 56, tr = 56, br = 38, bl = 38 } }"##,
+    );
+    h.frames(2);
+    assert_eq!(h.host.error().get(), None);
+    let pane = h.find("pane").unwrap();
+    let scene = h.ui.scene.borrow();
+    let backing = scene.children(pane)[0];
+    let corners = match scene.kind(backing) {
+        zgx::scene::NodeKind::Quad(quad) | zgx::scene::NodeKind::Panel { quad, .. } => {
+            quad.decoration.as_deref().and_then(|d| d.corners)
+        }
+        _ => None,
+    }
+    .expect("the backing's corners");
+    assert_eq!(
+        (
+            corners.top_left,
+            corners.top_right,
+            corners.bottom_right,
+            corners.bottom_left
+        ),
+        (56., 56., 38., 38.)
+    );
+}
+
+#[test]
+fn a_shaders_passes_and_tagged_boxes_are_read_from_the_script() {
+    let mut h = zgx_script::testing::TestApp::inline(
+        r##"
+        local shader = ui.layer_shader("fn layer(input: LayerInput) -> vec4<f32> { return zgx_state(input.p / input.size); }", {
+            geometry = "cards",
+            passes = {
+                { name = "state", shader = "fn run(input: PassInput) -> vec4<f32> { return zgx_state(input.uv); }", size = { 8, 8 }, format = "rgba16float", feedback = true, steps = 2 },
+            },
+        })
+        return ui.div {
+            ui.div { id = "fx", w = 40, h = 20, layer_shader = shader },
+            ui.div { id = "card", w = 30, h = 10, rounded = 4, bg = "#222222", geometry = "cards" },
+        }
+        "##,
+    );
+    let fx = h.target("fx").unwrap();
+    let scene = h.ui.scene.borrow();
+    let inputs = scene
+        .layer_shader(fx)
+        .and_then(|layer| layer.shader.clone())
+        .unwrap();
+    let inputs = inputs.inputs().unwrap();
+    assert_eq!(inputs.passes[0].name, "state");
+    assert_eq!(inputs.passes[0].steps, 2);
+    assert!(inputs.passes[0].feedback);
+    let mut boxes = Vec::new();
+    scene.geometry_of(inputs.geometry.unwrap(), &mut boxes);
+    assert_eq!(boxes.len(), 1);
+    assert_eq!((boxes[0].0.width, boxes[0].1[0]), (30., 4.));
+}
+#[test]
+fn the_lava_list_runs_no_script_per_frame_and_a_row_dropped_in_is_gone() {
+    use zgx::input::{InputEvent, Modifiers, PointerButton};
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lava/app.luau");
+    let mut app =
+        zgx_script::testing::TestApp::new(|runtime| zgx_script::ScriptHost::new(runtime, path));
+    // Its window's size, which places the floor's line.
+    app.ui.scene.borrow_mut().resize(900., 800.);
+    app.frames(10);
+    let before = app.calls();
+    app.frames(120);
+    assert_eq!(app.calls(), before, "the fire and floor run with no script");
+    assert!(app.texts().iter().any(|text| text.starts_with("5 tasks")));
+    // Picked up, carried past the line, let go.
+    let button = PointerButton::Primary;
+    let send = |app: &mut zgx_script::testing::TestApp, event| {
+        app.ui.dispatch_with_modifiers(event, Modifiers::default());
+        app.settle();
+    };
+    let row = app.bounds("task2");
+    let (x, y) = (row.x + row.width / 2., row.y + row.height / 2.);
+    send(&mut app, InputEvent::PointerMove { x, y });
+    send(&mut app, InputEvent::PointerDown { x, y, button });
+    for step in 1..=20 {
+        let y = y + (600. - y) * step as f32 / 20.;
+        send(&mut app, InputEvent::PointerMove { x, y });
+        app.frames(2);
+    }
+    send(&mut app, InputEvent::PointerUp { x, y: 600., button });
+    app.frames(200);
+    let texts = app.texts();
+    assert!(
+        texts.iter().any(|text| text.starts_with("4 tasks")),
+        "{texts:?} {row:?}"
+    );
+}
+#[test]
+fn a_pass_that_does_not_compile_is_the_scripts_error_naming_it() {
+    let error = zgx_script::testing::TestApp::try_new(|runtime| {
+        zgx_script::ScriptHost::inline(
+            runtime,
+            "app",
+            r#"
+            local shader = ui.layer_shader("fn layer(input: LayerInput) -> vec4<f32> { return input.color; }", {
+                passes = { { name = "broken", shader = "fn run(input: PassInput) -> vec4<f32> { return nope; }" } },
+            })
+            return ui.div { layer_shader = shader }
+            "#,
+        )
+    })
+    .err()
+    .expect("it fails");
+    assert!(error.contains("pass `broken`"), "{error}");
+}
+#[test]
+fn each_call_with_inputs_is_its_own_effect() {
+    let mut h = zgx_script::testing::TestApp::inline(
+        r#"
+        local function fx()
+            return ui.layer_shader("fn layer(input: LayerInput) -> vec4<f32> { return zgx_a(vec2<f32>(0.0)); }", {
+                passes = { { name = "a", shader = "fn run(input: PassInput) -> vec4<f32> { return vec4<f32>(1.0); }" } },
+            })
+        end
+        return ui.div {
+            ui.div { id = "one", w = 4, h = 4, layer_shader = fx() },
+            ui.div { id = "two", w = 4, h = 4, layer_shader = fx() },
+        }
+        "#,
+    );
+    let (one, two) = (h.target("one").unwrap(), h.target("two").unwrap());
+    let scene = h.ui.scene.borrow();
+    let id = |node| {
+        scene
+            .layer_shader(node)
+            .and_then(|layer| layer.shader.clone())
+            .unwrap()
+            .id()
+    };
+    assert_ne!(id(one), id(two));
+}
+#[test]
+fn the_engine_keeps_a_layer_shader_up_with_no_script_per_frame() {
+    let mut h = Harness::inline(
+        r##"local on = ui.state("on", false)
+        local level = ui.state("level", 0.25)
+        local shader = ui.layer_shader("fn layer(input: LayerInput) -> vec4<f32> { return input.color; }")
+        return ui.column {
+            ui.button { id = "switch", w = 40, h = 20, on_click = function() on:set(true) end, "On" },
+            ui.button { id = "raise", w = 40, h = 20, on_click = function() level:set(0.75) end, "Up" },
+            ui.div { id = "pane", w = 40, h = 20, bg = "#222222", layer_shader = shader,
+                layer_bleed = 8, layer_clock = true, layer_on = on,
+                layer_params = function() return { { level:get(), 0, 0, 0 } } end },
+        }"##,
+    );
+    h.frames(2);
+    assert_eq!(h.host.error().get(), None);
+    let pane = h.find("pane").unwrap();
+    assert!(!h.ui.scene.borrow().is_layer(pane), "off, no layer");
+    h.click("switch");
+    h.frames(2);
+    {
+        let scene = h.ui.scene.borrow();
+        let layer = scene.layer_shader(pane).expect("its shader");
+        assert!(layer.shader.is_some());
+        assert_eq!(layer.bleed, 8.);
+        assert_eq!(layer.uniforms.params[0][0], 0.25);
+    }
+    h.click("raise");
+    h.frames(2);
+    let scene = h.ui.scene.borrow();
+    assert_eq!(
+        scene.layer_shader(pane).unwrap().uniforms.params[0][0],
+        0.75
+    );
+}
+
+/// A pointer event's table has every field a handler reads, as Lua
+/// values of their kinds, a table of its own for each event, and the
+/// extras a press, a wheel and a pinch add: however it's built.
+#[test]
+fn a_pointer_event_says_where_and_the_keys_held() {
+    use zgx::input::{InputEvent, PointerButton};
+    let script = r##"
+    local said = ui.state("said", "")
+    local last = nil
+    local function note(name)
+        return function(e)
+            local fresh = e ~= last
+            last = e
+            e.mine = true
+            local fields = {}
+            for k, v in e do
+                table.insert(fields, `{k}={typeof(v)}`)
+            end
+            table.sort(fields)
+            said:set(said:peek() .. string.format("%s %.1f %.1f %.1f %.1f %s %s %s %s %s %s [%s];", name,
+                e.x, e.y, e.local_x, e.local_y, tostring(e.shift), tostring(e.ctrl), tostring(e.alt),
+                tostring(e.meta), tostring(e.cmd), tostring(fresh), table.concat(fields, ",")))
+            return false
+        end
+    end
+    return ui.column {
+        ui.text { id = "said", said },
+        ui.div { id = "box", w = 100, h = 80, bg = "#334",
+            on_pointer_move = note("move"), on_press = note("press"), on_wheel = note("wheel") } }"##;
+    let mut h = Harness::inline(script);
+    h.frames(2);
+    let laid = h.bounds("box");
+    let (x, y) = (laid.x + 30., laid.y + 20.);
+    h.ui.dispatch(InputEvent::PointerMove { x, y });
+    h.ui.dispatch(InputEvent::PointerMove { x: x + 1., y });
+    h.ui.dispatch(InputEvent::PointerDown {
+        x,
+        y,
+        button: PointerButton::Primary,
+    });
+    h.ui.dispatch(InputEvent::PointerUp {
+        x,
+        y,
+        button: PointerButton::Primary,
+    });
+    h.ui.dispatch(InputEvent::Scroll {
+        x,
+        y,
+        delta_x: 0.,
+        delta_y: 3.,
+    });
+    h.frames(2);
+    let said = h.text("said");
+    // A move says how far it went (`dx`, `dy`) too, in its one table.
+    let moved = "alt=boolean,cmd=boolean,ctrl=boolean,dx=number,dy=number,local_x=number,local_y=number,meta=boolean,mine=boolean,shift=boolean,x=number,y=number";
+    let at = format!(
+        "{:.1} {:.1} 30.0 20.0 false false false false false true",
+        x, y
+    );
+    assert!(said.contains(&format!("move {at} [{moved}];")), "{said}");
+    assert!(
+        said.contains(&format!(
+            "move {:.1} {:.1} 31.0 20.0 false false false false false true [{moved}];",
+            x + 1.,
+            y
+        )),
+        "{said}"
+    );
+    assert!(said.contains(&format!("press {at} [alt=boolean,clicks=number,cmd=boolean,ctrl=boolean,local_x=number,local_y=number,meta=boolean,mine=boolean,shift=boolean,x=number,y=number];")), "{said}");
+    assert!(
+        said.contains("wheel ") && said.contains("dx=number,dy=number"),
+        "{said}"
+    );
 }

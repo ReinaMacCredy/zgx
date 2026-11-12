@@ -77,24 +77,55 @@ pub(crate) struct GeometryPacer {
     last: Option<std::time::Instant>,
     held: Option<std::time::Instant>,
 }
+/// What an update of the tree at a given moment does (`GeometryPacer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeUpdateKind {
+    /// Everything that changed, geometry included.
+    Full,
+    /// Only what a reader hears changed (names, values, focus), while a
+    /// geometry change waits its turn: nodes that only moved keep what was
+    /// sent (`AccessibilityTree::update_names`).
+    Names,
+}
 impl GeometryPacer {
-    /// Whether to update the tree at `now`.
+    /// Whether to update the tree at `now` (`update_kind`, either kind).
+    #[cfg(test)]
     pub(crate) fn update_now(
         &mut self,
         now: std::time::Instant,
         changed: bool,
         geometry: bool,
     ) -> bool {
+        self.update_kind(now, changed, geometry).is_some()
+    }
+    /// How to update the tree at `now`, if at all: a change a reader hears
+    /// goes at once, but while geometry isn't due it goes alone (`Names`),
+    /// so a name changing every frame (a timer, a status) doesn't send
+    /// every frame's geometry too, nor put geometry off.
+    pub(crate) fn update_kind(
+        &mut self,
+        now: std::time::Instant,
+        changed: bool,
+        geometry: bool,
+    ) -> Option<TreeUpdateKind> {
         let due = self.last.is_none_or(|last| now >= last + GEOMETRY_EVERY);
-        if changed || ((geometry || self.held.is_some()) && due) {
+        let pending = geometry || self.held.is_some();
+        if (changed && !pending) || (pending && due) {
             self.last = Some(now);
             self.held = None;
-            return true;
+            return Some(TreeUpdateKind::Full);
         }
         if geometry && let Some(last) = self.last {
             self.held.get_or_insert(last + GEOMETRY_EVERY);
         }
-        false
+        changed.then_some(TreeUpdateKind::Names)
+    }
+    /// A full update at `now`, whatever is held (a reveal, which moves what
+    /// it shows).
+    pub(crate) fn full(&mut self, now: std::time::Instant) -> TreeUpdateKind {
+        self.last = Some(now);
+        self.held = None;
+        TreeUpdateKind::Full
     }
     /// When a held geometry change goes out, if one is held.
     pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
@@ -105,6 +136,7 @@ impl GeometryPacer {
 /// Projects a scene's semantics into AccessKit tree updates, keeping each
 /// node's accessible ID for as long as the node lives.
 #[derive(Default)]
+#[cfg_attr(debug_assertions, derive(Clone))]
 pub struct AccessibilityTree {
     ids: HashMap<NodeId, AccessibleId>,
     next: u64,
@@ -123,9 +155,82 @@ pub struct AccessibilityTree {
     /// The scene's `language_revision` at the last update: changed, every
     /// node is projected again, its language perhaps an ancestor's.
     language_revision: u64,
+    /// What the last whole walk found: an update that changes none of it
+    /// looks only at the nodes that changed (`dirty_nodes`).
+    walk: Option<Walk>,
+    /// What the scene's flushes changed since (`note_flush`).
+    changes: FlushChanges,
+    /// The semantics' `revision` at the last update.
+    seen_revision: u64,
+    /// The node focused at the last update.
+    last_focused: Option<NodeId>,
+    /// The last update looked only at what changed: checked in debug builds.
+    #[cfg(debug_assertions)]
+    looked_at_changes: bool,
 }
+/// What a whole walk of the scene found: which nodes are in the accessible
+/// tree and how they hang together. Nothing here changes unless a flush says
+/// children changed or something composites differently, or a node's
+/// [`Shape`] does.
+#[cfg_attr(debug_assertions, derive(Clone))]
+struct Walk {
+    /// Each node in the tree: its place in paint order and its shape.
+    nodes: HashMap<NodeId, (u32, Shape)>,
+    /// Those nodes and the root.
+    visible: HashSet<NodeId>,
+    children: HashMap<NodeId, Vec<AccessibleId>>,
+    list_items: HashMap<NodeId, (usize, usize)>,
+    /// Nodes painted at no opacity: shown again, the tree has more in it.
+    faded_out: HashSet<NodeId>,
+    scale: f64,
+}
+/// What of a node's information decides the tree around it: changed, the
+/// update walks the whole scene.
+#[derive(Clone, Copy, PartialEq)]
+struct Shape {
+    role: Role,
+    hidden: bool,
+    disabled: bool,
+    logical_parent: Option<NodeId>,
+    /// A label saying nothing is left out.
+    empty: bool,
+}
+impl Shape {
+    fn of(semantic: &SemanticNode) -> Self {
+        Self {
+            role: semantic.role,
+            hidden: semantic.hidden,
+            disabled: semantic.disabled,
+            logical_parent: semantic.logical_parent,
+            empty: semantic
+                .value
+                .as_deref()
+                .unwrap_or(&semantic.label)
+                .is_empty(),
+        }
+    }
+}
+/// What flushes changed since the last update looked (`note_flush`).
+#[derive(Clone, Default)]
+struct FlushChanges {
+    /// The last flush heard of; none yet: nothing is known of what came before.
+    flush: Option<u64>,
+    /// Children changed, something composites differently, or a flush went
+    /// unheard: a walk is due.
+    structure: bool,
+    /// As `structure`, for where nodes are: a whole update is due (an update
+    /// of names alone leaves it due).
+    geometry: bool,
+    /// Nodes placed elsewhere.
+    moved: Vec<NodeId>,
+    /// Nodes painted differently, which may be shown or hidden now.
+    painted: Vec<NodeId>,
+}
+/// More changes than this since the last update: a walk is as quick.
+const CHANGES_KEPT: usize = 4096;
 /// A line of a long field, as text runs: kept while its text is, so an edit
 /// sends the runs of the lines it changed, and a scroll those it shows.
+#[cfg_attr(debug_assertions, derive(Clone))]
 struct LineRuns {
     /// The line, with its break.
     text: String,
@@ -136,6 +241,46 @@ struct LineRuns {
     offsets: Vec<Vec<usize>>,
 }
 impl AccessibilityTree {
+    /// Its line of a memory report: the nodes projected for assistive
+    /// technology and the tables mapping them to the scene's (each node's
+    /// own properties, and the platform's copy of the tree a client reads,
+    /// are not counted). Worked out only as a report asks.
+    #[cold]
+    pub(crate) fn memory(&self, report: &mut zgx::memory::Report) {
+        use zgx::memory::{map_bytes, set_bytes, vec_bytes};
+        let long: usize = self
+            .long_runs
+            .values()
+            .map(|lines| {
+                map_bytes(lines)
+                    + lines
+                        .values()
+                        .map(|line| line.text.capacity() + vec_bytes(&line.ids))
+                        .sum::<usize>()
+            })
+            .sum();
+        let bytes = map_bytes(&self.ids)
+            + map_bytes(&self.cache)
+            + map_bytes(&self.projection_revisions)
+            + map_bytes(&self.text_runs)
+            + self.text_runs.values().map(vec_bytes).sum::<usize>()
+            + map_bytes(&self.text_positions)
+            + self
+                .text_positions
+                .values()
+                .map(|(_, at)| vec_bytes(at))
+                .sum::<usize>()
+            + set_bytes(&self.blocks)
+            + map_bytes(&self.long_runs)
+            + long
+            + map_bytes(&self.run_boxes);
+        report.add(
+            "accessibility",
+            "nodes projected (their properties uncounted)",
+            Some(self.cache.len()),
+            Some(bytes),
+        );
+    }
     /// An empty tree: the first update is a complete snapshot.
     pub fn new() -> Self {
         Self::default()
@@ -144,6 +289,114 @@ impl AccessibilityTree {
     pub fn reset(&mut self) {
         self.cache.clear();
         self.projection_revisions.clear();
+        self.walk = None;
+        self.changes = FlushChanges::default();
+    }
+    /// Hear what the flush just done changed, which an update can then look
+    /// at alone. Until the first call every update walks the whole scene.
+    pub fn note_flush(&mut self, scene: &Scene) {
+        use zgx::scene::repaint;
+        let (flushes, repainted) = scene.repaints();
+        let changes = &mut self.changes;
+        if changes
+            .flush
+            .is_none_or(|last| last + 1 != *flushes.start())
+        {
+            changes.structure = true;
+            changes.geometry = true;
+        }
+        changes.flush = Some(*flushes.end());
+        for (id, flags) in repainted {
+            if flags & (repaint::CHILDREN | repaint::COMPOSITE) != 0 {
+                changes.structure = true;
+                changes.geometry = true;
+            }
+            if flags & repaint::MOVED != 0 {
+                changes.moved.push(*id);
+            }
+            if flags & repaint::PAINT != 0 {
+                changes.painted.push(*id);
+            }
+        }
+        if changes.moved.len() + changes.painted.len() > CHANGES_KEPT {
+            changes.structure = true;
+            changes.geometry = true;
+            changes.moved = Vec::new();
+            changes.painted = Vec::new();
+        }
+    }
+    /// The nodes to look at, in paint order, if an update need look at no
+    /// others: nothing has changed which nodes are in the tree or how they
+    /// hang together, and each of the rest reads nothing that changed. `None`:
+    /// the whole scene.
+    fn dirty_nodes(
+        &mut self,
+        scene: &Scene,
+        semantics: &Semantics,
+        focused: Option<NodeId>,
+        scale: f64,
+        geometry: bool,
+    ) -> Option<Vec<NodeId>> {
+        let walk = self.walk.as_ref()?;
+        let changes = &self.changes;
+        if changes.flush.is_none()
+            || changes.structure
+            || (geometry && changes.geometry)
+            || walk.scale != scale
+            || scene.has_inert()
+            || semantics.has_errors()
+        {
+            return None;
+        }
+        // Painted differently, it may have been hidden or shown.
+        for id in &changes.painted {
+            if walk.faded_out.contains(id) || (scene.contains(*id) && !scene.layout_visible(*id)) {
+                return None;
+            }
+        }
+        let mut dirty = Vec::new();
+        if semantics.revision() != self.seen_revision {
+            for (id, semantic) in semantics.changed_since(self.seen_revision) {
+                if walk.nodes.get(&id)?.1 != Shape::of(semantic) {
+                    return None;
+                }
+                dirty.push(id);
+            }
+            // Something changed no node's own information says.
+            if dirty.is_empty() {
+                return None;
+            }
+        }
+        if geometry {
+            for id in &changes.moved {
+                // A node without its own is its nearest around it, which may
+                // read where it is (the text showing its name).
+                let shown = std::iter::once(*id)
+                    .chain(scene.ancestors(*id))
+                    .find(|node| walk.nodes.contains_key(node));
+                dirty.extend(shown);
+            }
+        }
+        for node in [focused, self.last_focused].into_iter().flatten() {
+            if walk.nodes.contains_key(&node) {
+                dirty.push(node);
+            }
+        }
+        dirty.sort_unstable_by_key(|id| walk.nodes[id].0);
+        dirty.dedup();
+        // Most of the tree: as quick to walk it.
+        (dirty.len() * 2 <= walk.nodes.len()).then_some(dirty)
+    }
+    /// A window at rest: the room its tables took for what has gone.
+    pub fn rest(&mut self) {
+        self.ids.shrink_to_fit();
+        self.cache.shrink_to_fit();
+        self.projection_revisions.shrink_to_fit();
+        self.text_runs.shrink_to_fit();
+        self.text_positions.shrink_to_fit();
+        self.blocks.shrink_to_fit();
+        self.long_runs.shrink_to_fit();
+        self.run_boxes.shrink_to_fit();
     }
     fn id(&mut self, node: NodeId) -> AccessibleId {
         *self.ids.entry(node).or_insert_with(|| {
@@ -332,134 +585,118 @@ impl AccessibilityTree {
         title: &str,
         scale: f64,
     ) -> TreeUpdate {
+        self.project(scene, semantics, focused, title, scale, true)
+    }
+    /// `update` for what a reader hears alone (names, values, focus, nodes
+    /// added and gone), while geometry waits its turn: a node whose
+    /// semantics are as sent, its children and state too, keeps what was
+    /// sent though it moved, its box and runs coming with the next `update`.
+    pub fn update_names(
+        &mut self,
+        scene: &Scene,
+        semantics: &Semantics,
+        focused: Option<NodeId>,
+        title: &str,
+        scale: f64,
+    ) -> TreeUpdate {
+        self.project(scene, semantics, focused, title, scale, false)
+    }
+    fn project(
+        &mut self,
+        scene: &Scene,
+        semantics: &Semantics,
+        focused: Option<NodeId>,
+        title: &str,
+        scale: f64,
+        geometry: bool,
+    ) -> TreeUpdate {
+        #[cfg(debug_assertions)]
+        let before = (self.walk.is_some() && self.changes.flush.is_some()).then(|| self.clone());
+        let update = self.project_nodes(scene, semantics, focused, title, scale, geometry);
+        #[cfg(debug_assertions)]
+        if self.looked_at_changes
+            && let Some(mut whole) = before
+        {
+            whole.walk = None;
+            let sent = whole.project_nodes(scene, semantics, focused, title, scale, geometry);
+            self.assert_same_as(&whole, &update, &sent);
+        }
+        update
+    }
+    /// What looking at the nodes that changed made is what walking them all
+    /// makes: what a client would be told, and what's kept to tell it next.
+    #[cfg(debug_assertions)]
+    fn assert_same_as(&self, whole: &Self, update: &TreeUpdate, sent: &TreeUpdate) {
+        let sorted = |update: &TreeUpdate| {
+            let mut nodes: Vec<_> = update.nodes.iter().map(|(id, node)| (id.0, node)).collect();
+            nodes.sort_by_key(|(id, _)| *id);
+            format!("{nodes:#?} focus {:?}", update.focus)
+        };
+        assert_eq!(
+            sorted(update),
+            sorted(sent),
+            "an update of what changed told a client what a whole walk wouldn't"
+        );
+        assert!(
+            self.cache == whole.cache,
+            "the nodes as sent differ from a whole walk's"
+        );
+        assert!(
+            self.text_runs == whole.text_runs,
+            "text runs differ from a whole walk's"
+        );
+        assert!(self.ids == whole.ids, "ids differ from a whole walk's");
+        assert!(
+            self.blocks == whole.blocks,
+            "blocks differ from a whole walk's"
+        );
+        assert!(
+            self.run_boxes == whole.run_boxes,
+            "run boxes differ from a whole walk's"
+        );
+        assert!(
+            self.projection_revisions == whole.projection_revisions,
+            "revisions differ from a whole walk's"
+        );
+    }
+    fn project_nodes(
+        &mut self,
+        scene: &Scene,
+        semantics: &Semantics,
+        focused: Option<NodeId>,
+        title: &str,
+        scale: f64,
+        geometry: bool,
+    ) -> TreeUpdate {
         let root = self.id(scene.root());
         if scene.language_revision() != self.language_revision {
             self.language_revision = scene.language_revision();
             self.projection_revisions.clear();
+            self.walk = None;
         }
-        let mut children: HashMap<NodeId, Vec<AccessibleId>> = HashMap::default();
-        // Scene order, not hash-map iteration order, determines accessible traversal.
-        let mut ordered: Vec<_> = scene
-            .paint_items()
-            .filter(|p| p.effects.opacity > 0.0)
-            .filter_map(|p| semantics.get(p.id).map(|s| (p.id, s)))
-            // Text with nothing in it (a count at zero) says nothing: it
-            // joins the tree when it has something to say.
-            .filter(|(_, s)| {
-                s.role != Role::Label || !s.value.as_deref().unwrap_or(&s.label).is_empty()
-            })
-            .collect();
-        // What is hidden from assistive technology (`aria-hidden`) goes with
-        // its subtree, and a control's unnamed images are its own (ARIA's
-        // presentational children: its name says what it is, and a reader
-        // hears no bare "image" inside a button). Only a tree with either
-        // looks.
-        let mut hidden = Vec::new();
-        let mut bare_image = false;
-        for (id, s) in &ordered {
-            if s.hidden {
-                hidden.push(*id);
-            }
-            bare_image |= s.role == Role::Image && s.label.is_empty();
+        let dirty = self.dirty_nodes(scene, semantics, focused, scale, geometry);
+        #[cfg(debug_assertions)]
+        {
+            self.looked_at_changes = dirty.is_some();
         }
-        if !hidden.is_empty() {
-            ordered.retain(|(id, _)| !hidden.iter().any(|h| scene.is_within(*id, *h)));
-        }
-        // Inert content (a row playing its exit, gone from its data) is not
-        // there to act on: a reader doesn't offer it.
-        if scene.has_inert() {
-            ordered.retain(|(id, _)| scene.inert_around(*id).is_none());
-        }
-        if bare_image {
-            ordered.retain(|(id, s)| {
-                !(s.role == Role::Image
-                    && s.label.is_empty()
-                    && within_control(scene, semantics, *id))
-            });
-        }
-        let visible: HashSet<_> = ordered
+        // Before anything is projected: its runs may go, for this update alone
+        // to clear up (`ids`, `cache`, `text_positions` are whole walks' to).
+        let runs_before: Vec<AccessibleId> = dirty
             .iter()
-            .map(|(id, _)| *id)
-            .chain(std::iter::once(scene.root()))
+            .flatten()
+            .flat_map(|id| self.text_runs.get(id).into_iter().flatten().copied())
             .collect();
-        self.ids.retain(|id, _| visible.contains(id));
-        self.projection_revisions
-            .retain(|id, _| visible.contains(id));
-        let mut parents = HashMap::default();
-        for (id, _) in &ordered {
-            if *id == scene.root() {
-                continue;
+        let (ordered, walk) = match dirty.as_deref() {
+            Some(dirty) => {
+                let ordered: Vec<_> = dirty
+                    .iter()
+                    .filter_map(|id| semantics.get(*id).map(|s| (*id, s)))
+                    .collect();
+                (ordered, self.walk.take().expect("dirty_nodes found one"))
             }
-            let mut parent = scene.parent(*id);
-            while let Some(p) = parent {
-                if visible.contains(&p) {
-                    break;
-                }
-                parent = scene.parent(p);
-            }
-            parents.insert(*id, parent.unwrap_or(scene.root()));
-        }
-        // Apply logical ownership without changing physical clipping or bounds.
-        // Each accepted edge keeps the graph acyclic; invalid overrides retain
-        // their physical parent and never introduce duplicate native children.
-        for (id, semantic) in &ordered {
-            if *id == scene.root() {
-                continue;
-            }
-            let Some(parent) = semantic.logical_parent.filter(|p| visible.contains(p)) else {
-                continue;
-            };
-            let mut ancestor = parent;
-            let valid = loop {
-                if ancestor == *id {
-                    break false;
-                }
-                if ancestor == scene.root() {
-                    break true;
-                }
-                let Some(next) = parents.get(&ancestor) else {
-                    break false;
-                };
-                ancestor = *next;
-            };
-            if valid {
-                parents.insert(*id, parent);
-            }
-        }
-        for (id, _) in &ordered {
-            if *id == scene.root() {
-                continue;
-            }
-            let child = self.id(*id);
-            children.entry(parents[id]).or_default().push(child);
-        }
-        // Where each list's items are in it ("3 of 5", as a browser's
-        // `<li>` reads), for items the app doesn't say it of: only a tree
-        // with a list counts.
-        let mut list_items: HashMap<NodeId, (usize, usize)> = HashMap::default();
-        if ordered.iter().any(|(_, s)| s.role == Role::List) {
-            let mut counts: HashMap<NodeId, usize> = HashMap::default();
-            let mut lists: Vec<(NodeId, NodeId, usize)> = Vec::new();
-            for (id, semantic) in &ordered {
-                let Some(&list) = parents.get(id) else {
-                    continue;
-                };
-                if semantic.role == Role::ListItem
-                    && semantics.get(list).is_some_and(|s| s.role == Role::List)
-                {
-                    let count = counts.entry(list).or_default();
-                    *count += 1;
-                    lists.push((*id, list, *count));
-                }
-            }
-            for (item, list, position) in lists {
-                list_items.insert(item, (position, counts[&list]));
-            }
-        }
-        self.text_runs.retain(|owner, _| visible.contains(owner));
-        self.run_boxes.retain(|owner, _| visible.contains(owner));
-        self.blocks.retain(|owner| visible.contains(owner));
-        self.long_runs.retain(|owner, _| visible.contains(owner));
+            None => self.walk_scene(scene, semantics, scale),
+        };
+        let (visible, children, list_items) = (&walk.visible, &walk.children, &walk.list_items);
         // Fields saying what is wrong with them, and the text that shows it
         // (most trees have none: no node is looked up for one).
         let any_errors = semantics.has_errors();
@@ -474,7 +711,7 @@ impl AccessibilityTree {
         let mut documents = Vec::new();
         let mut window = Node::new(accesskit::Role::Window);
         window.set_label(title);
-        window.set_children(children.remove(&scene.root()).unwrap_or_default());
+        window.set_children(children.get(&scene.root()).cloned().unwrap_or_default());
         let bounds = scene.bounds(scene.root());
         window.set_bounds(accesskit::Rect::new(
             0.,
@@ -498,20 +735,38 @@ impl AccessibilityTree {
                 || scene
                     .ancestors(id)
                     .any(|ancestor| semantics.get(ancestor).is_some_and(|s| s.disabled));
+            let revision = semantics
+                .node_revision(id)
+                .expect("projected semantic node");
+            // Names alone: a node as sent keeps what was sent, before its
+            // geometry or text is looked at (moved, it goes with the next
+            // full update, as geometry does for any client).
+            if !geometry
+                && focused != Some(id)
+                && self.projection_revisions.get(&id) == Some(&revision)
+                && self.cache.get(&native).is_some_and(|cached| {
+                    let runs = self.text_runs.get(&id).map_or(&[][..], Vec::as_slice);
+                    cached.is_disabled() == disabled
+                        && cached.children().iter().eq(children
+                            .get(&id)
+                            .into_iter()
+                            .flatten()
+                            .chain(runs))
+                })
+            {
+                continue;
+            }
             // Assistive bounds: the box around where it shows, or where an
             // animation is taking it with `hit = "target"` (as Core
             // Animation's model layer): a reader's highlight goes ahead.
             let r = scene.hit_bounds(id);
-            let revision = semantics
-                .node_revision(id)
-                .expect("projected semantic node");
             let bounds = accesskit::Rect::new(
                 r.x as f64 * scale,
                 r.y as f64 * scale,
                 (r.x + r.width) as f64 * scale,
                 (r.y + r.height) as f64 * scale,
             );
-            let mut native_children = children.remove(&id).unwrap_or_default();
+            let kids = children.get(&id).map_or(&[][..], Vec::as_slice);
             let runs = self.text_runs.get(&id).map_or(&[][..], Vec::as_slice);
             // Text read as text: a label, or a text node that is a heading
             // (a label with a level). A heading holding text is named by
@@ -557,10 +812,7 @@ impl AccessibilityTree {
                         && cached.position_in_set()
                             == semantic.position_in_set.or(counted.map(|c| c.0))
                         && cached.size_of_set() == semantic.size_of_set.or(counted.map(|c| c.1))
-                        && cached
-                            .children()
-                            .iter()
-                            .eq(native_children.iter().chain(runs))
+                        && cached.children().iter().eq(kids.iter().chain(runs))
                 })
                 && runs.iter().all(|run| {
                     self.cache.contains_key(run) && self.text_positions.contains_key(run)
@@ -568,6 +820,7 @@ impl AccessibilityTree {
             {
                 continue;
             }
+            let mut native_children = kids.to_vec();
             let mut n = Node::new(semantic_role(semantic));
             // A page drawn as an image embeds its own accessible tree
             // (another process's) as its last child: a frame holding a
@@ -1026,14 +1279,29 @@ impl AccessibilityTree {
                 node.add_action(Action::SetTextSelection);
             }
         }
-        let live: HashSet<_> = self
-            .ids
-            .values()
-            .copied()
-            .chain(self.text_runs.values().flatten().copied())
-            .collect();
-        self.text_positions.retain(|run, _| live.contains(run));
-        self.cache.retain(|id, _| live.contains(id));
+        if dirty.is_some() {
+            // Only the nodes looked at can have let runs go.
+            for run in runs_before {
+                let kept = dirty.iter().flatten().any(|id| {
+                    self.text_runs
+                        .get(id)
+                        .is_some_and(|runs| runs.contains(&run))
+                });
+                if !kept {
+                    self.text_positions.remove(&run);
+                    self.cache.remove(&run);
+                }
+            }
+        } else {
+            let live: HashSet<_> = self
+                .ids
+                .values()
+                .copied()
+                .chain(self.text_runs.values().flatten().copied())
+                .collect();
+            self.text_positions.retain(|run, _| live.contains(run));
+            self.cache.retain(|id, _| live.contains(id));
+        }
         nodes.retain(|(id, node)| {
             if self.cache.get(id) == Some(node) {
                 false
@@ -1042,6 +1310,15 @@ impl AccessibilityTree {
                 true
             }
         });
+        self.walk = Some(walk);
+        self.seen_revision = semantics.revision();
+        self.last_focused = focused;
+        self.changes.structure = false;
+        self.changes.painted.clear();
+        if geometry {
+            self.changes.geometry = false;
+            self.changes.moved.clear();
+        }
         let mut tree = Tree::new(root);
         tree.toolkit_name = Some("zgx".into());
         tree.toolkit_version = Some(env!("CARGO_PKG_VERSION").into());
@@ -1053,6 +1330,161 @@ impl AccessibilityTree {
                 .and_then(|n| self.ids.get(&n).copied())
                 .unwrap_or(root),
         }
+    }
+    /// The whole scene: which nodes are in the accessible tree, in paint order,
+    /// and how they hang together.
+    fn walk_scene<'a>(
+        &mut self,
+        scene: &Scene,
+        semantics: &'a Semantics,
+        scale: f64,
+    ) -> (Vec<(NodeId, &'a SemanticNode)>, Walk) {
+        let mut faded_out = HashSet::default();
+        let mut children: HashMap<NodeId, Vec<AccessibleId>> = HashMap::default();
+        // Scene order, not hash-map iteration order, determines accessible traversal.
+        let mut ordered: Vec<_> = scene
+            .paint_items()
+            .filter(|p| {
+                let shown = p.effects.opacity > 0.0;
+                if !shown {
+                    faded_out.insert(p.id);
+                }
+                shown
+            })
+            .filter_map(|p| semantics.get(p.id).map(|s| (p.id, s)))
+            // Text with nothing in it (a count at zero) says nothing: it
+            // joins the tree when it has something to say.
+            .filter(|(_, s)| {
+                s.role != Role::Label || !s.value.as_deref().unwrap_or(&s.label).is_empty()
+            })
+            .collect();
+        // What is hidden from assistive technology (`aria-hidden`) goes with
+        // its subtree, and a control's unnamed images are its own (ARIA's
+        // presentational children: its name says what it is, and a reader
+        // hears no bare "image" inside a button). Only a tree with either
+        // looks.
+        let mut hidden = Vec::new();
+        let mut bare_image = false;
+        for (id, s) in &ordered {
+            if s.hidden {
+                hidden.push(*id);
+            }
+            bare_image |= s.role == Role::Image && s.label.is_empty();
+        }
+        if !hidden.is_empty() {
+            ordered.retain(|(id, _)| !hidden.iter().any(|h| scene.is_within(*id, *h)));
+        }
+        // Inert content (a row playing its exit, gone from its data) is not
+        // there to act on: a reader doesn't offer it.
+        if scene.has_inert() {
+            ordered.retain(|(id, _)| scene.inert_around(*id).is_none());
+        }
+        if bare_image {
+            ordered.retain(|(id, s)| {
+                !(s.role == Role::Image
+                    && s.label.is_empty()
+                    && within_control(scene, semantics, *id))
+            });
+        }
+        let visible: HashSet<_> = ordered
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(std::iter::once(scene.root()))
+            .collect();
+        self.ids.retain(|id, _| visible.contains(id));
+        self.projection_revisions
+            .retain(|id, _| visible.contains(id));
+        let mut parents = HashMap::default();
+        for (id, _) in &ordered {
+            if *id == scene.root() {
+                continue;
+            }
+            let mut parent = scene.parent(*id);
+            while let Some(p) = parent {
+                if visible.contains(&p) {
+                    break;
+                }
+                parent = scene.parent(p);
+            }
+            parents.insert(*id, parent.unwrap_or(scene.root()));
+        }
+        // Apply logical ownership without changing physical clipping or bounds.
+        // Each accepted edge keeps the graph acyclic; invalid overrides retain
+        // their physical parent and never introduce duplicate native children.
+        for (id, semantic) in &ordered {
+            if *id == scene.root() {
+                continue;
+            }
+            let Some(parent) = semantic.logical_parent.filter(|p| visible.contains(p)) else {
+                continue;
+            };
+            let mut ancestor = parent;
+            let valid = loop {
+                if ancestor == *id {
+                    break false;
+                }
+                if ancestor == scene.root() {
+                    break true;
+                }
+                let Some(next) = parents.get(&ancestor) else {
+                    break false;
+                };
+                ancestor = *next;
+            };
+            if valid {
+                parents.insert(*id, parent);
+            }
+        }
+        for (id, _) in &ordered {
+            if *id == scene.root() {
+                continue;
+            }
+            let child = self.id(*id);
+            children.entry(parents[id]).or_default().push(child);
+        }
+        // Where each list's items are in it ("3 of 5", as a browser's
+        // `<li>` reads), for items the app doesn't say it of: only a tree
+        // with a list counts.
+        let mut list_items: HashMap<NodeId, (usize, usize)> = HashMap::default();
+        if ordered.iter().any(|(_, s)| s.role == Role::List) {
+            let mut counts: HashMap<NodeId, usize> = HashMap::default();
+            let mut lists: Vec<(NodeId, NodeId, usize)> = Vec::new();
+            for (id, semantic) in &ordered {
+                let Some(&list) = parents.get(id) else {
+                    continue;
+                };
+                if semantic.role == Role::ListItem
+                    && semantics.get(list).is_some_and(|s| s.role == Role::List)
+                {
+                    let count = counts.entry(list).or_default();
+                    *count += 1;
+                    lists.push((*id, list, *count));
+                }
+            }
+            for (item, list, position) in lists {
+                list_items.insert(item, (position, counts[&list]));
+            }
+        }
+        self.text_runs.retain(|owner, _| visible.contains(owner));
+        self.run_boxes.retain(|owner, _| visible.contains(owner));
+        self.blocks.retain(|owner| visible.contains(owner));
+        self.long_runs.retain(|owner, _| visible.contains(owner));
+        let nodes = ordered
+            .iter()
+            .enumerate()
+            .map(|(at, (id, semantic))| (*id, (at as u32, Shape::of(semantic))))
+            .collect();
+        (
+            ordered,
+            Walk {
+                nodes,
+                visible,
+                children,
+                list_items,
+                faded_out,
+                scale,
+            },
+        )
     }
 }
 // AccessKit character lengths and word indices are u8. Bound each run to
@@ -1180,7 +1612,8 @@ fn text_run_data_on(
     let mut runs = Vec::new();
     let mut run = fresh(0);
     let mut chars: Vec<Option<Edge>> = Vec::new();
-    for (offset, grapheme) in value.grapheme_indices(true) {
+    for range in zgx::text_layout::grapheme_ranges(value) {
+        let (offset, grapheme) = (range.start, &value[range]);
         let length = u8::try_from(grapheme.len()).ok()?;
         let (edge, wrap_start) = match &mut walk {
             Some(walk) => walk.edge(value, offset)?,
@@ -1260,9 +1693,8 @@ fn far_side(rect: accesskit::Rect, window: accesskit::Rect) -> Option<FarSide> {
 /// `value` as one line across `rect`, its graphemes spread evenly: where
 /// text far from the window is, near enough, without shaping it.
 fn estimated_line(value: &str, rect: zgx::scene::Rect) -> zgx::scene::TextLine {
-    use unicode_segmentation::UnicodeSegmentation;
     let text = value.trim_end_matches(['\n', '\r']);
-    let count = text.graphemes(true).count().max(1);
+    let count = zgx::text_layout::grapheme_ranges(text).count().max(1);
     let step = rect.width / count as f32;
     zgx::scene::TextLine {
         range: 0..text.len(),
@@ -3141,6 +3573,169 @@ mod vocabulary_tests {
     use zgx::{compose::prelude::*, semantics::Live, widgets::Ui};
 
     /// Every projected node, after a frame.
+    /// A frame and an update, as a window's host does them. In a debug build
+    /// each update of what changed is checked against a whole walk
+    /// (`assert_same_as`), so every step here says a client hears the same.
+    fn frame(ui: &mut Ui, tree: &mut AccessibilityTree, focused: Option<NodeId>) -> TreeUpdate {
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        tree.note_flush(&ui.scene.borrow());
+        tree.update(
+            &ui.scene.borrow(),
+            &ui.semantics.borrow(),
+            focused,
+            "Test",
+            1.,
+        )
+    }
+    fn frame_names(ui: &mut Ui, tree: &mut AccessibilityTree, focused: Option<NodeId>) {
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        tree.note_flush(&ui.scene.borrow());
+        tree.update_names(
+            &ui.scene.borrow(),
+            &ui.semantics.borrow(),
+            focused,
+            "Test",
+            1.,
+        );
+    }
+    /// An update looks only at what changed, and a client hears just what a
+    /// whole walk would tell it, whatever changes: text, places, rows, what's
+    /// shown, what a node is, the focus.
+    #[test]
+    fn an_update_of_what_changed_says_what_a_whole_walk_says() {
+        let mut ui = Ui::new(400., 600.);
+        ui.set_assistive_technology(true);
+        let words = ui.signal(String::from("Words"));
+        let count = ui.signal(3_usize);
+        let shown = ui.signal(true);
+        let opacity = ui.signal(1_f32);
+        let height = ui.signal(20_f32);
+        let (read_words, read_count, read_shown, read_opacity, read_height) = (
+            words.clone(),
+            count.clone(),
+            shown.clone(),
+            opacity.clone(),
+            height.clone(),
+        );
+        ui.mount(
+            column()
+                .child(div().reactive_style(move || Styles::new().h(read_height.get())))
+                .child(text_signal(move || read_words.get()))
+                .child(button().child(text("Go")))
+                .child(column().role(Role::List).child(keyed(
+                    move || (0..read_count.get()).collect(),
+                    |i: usize, _| row().role(Role::ListItem).child(text(format!("Item {i}"))),
+                )))
+                .child(
+                    column()
+                        .reactive_style(move || Styles::new().opacity(read_opacity.get()))
+                        .child(text("Faded")),
+                )
+                .child(zgx::compose::switch(
+                    move || read_shown.get(),
+                    |shown, _| match shown {
+                        true => text("Shown"),
+                        false => div(),
+                    },
+                )),
+        );
+        let mut tree = AccessibilityTree::new();
+        let first = frame(&mut ui, &mut tree, None);
+        assert!(first.nodes.len() > 5, "a first update says all of it");
+        frame(&mut ui, &mut tree, None);
+        // Text alone: that node, and the walk isn't made.
+        words.set("Words and more".into());
+        let update = frame(&mut ui, &mut tree, None);
+        #[cfg(debug_assertions)]
+        assert!(tree.looked_at_changes, "text alone needs no walk");
+        assert!(
+            update.nodes.len() < first.nodes.len() / 2,
+            "{} of {} nodes for one text",
+            update.nodes.len(),
+            first.nodes.len()
+        );
+        // Text saying nothing leaves the tree, and comes back.
+        words.set(String::new());
+        frame(&mut ui, &mut tree, None);
+        words.set("Back".into());
+        frame(&mut ui, &mut tree, None);
+        // Everything below moves.
+        height.set(60.);
+        frame(&mut ui, &mut tree, None);
+        // Names alone leave the move due, then a whole update sends it.
+        height.set(90.);
+        words.set("Again".into());
+        frame_names(&mut ui, &mut tree, None);
+        frame(&mut ui, &mut tree, None);
+        // Rows come and go, and those left are counted again.
+        count.set(5);
+        frame(&mut ui, &mut tree, None);
+        count.set(2);
+        frame(&mut ui, &mut tree, None);
+        // Fading out and in, and what's shown changing.
+        opacity.set(0.);
+        frame(&mut ui, &mut tree, None);
+        opacity.set(1.);
+        frame(&mut ui, &mut tree, None);
+        shown.set(false);
+        frame(&mut ui, &mut tree, None);
+        shown.set(true);
+        frame(&mut ui, &mut tree, None);
+        // What a node is, and being disabled, which its subtree reads.
+        let some = {
+            let semantics = ui.semantics.borrow();
+            semantics
+                .iter()
+                .map(|(id, _)| id)
+                .max_by_key(|id| id.number())
+                .expect("nodes")
+        };
+        ui.semantics
+            .borrow_mut()
+            .update(some, |node| node.disabled = true);
+        frame(&mut ui, &mut tree, None);
+        ui.semantics
+            .borrow_mut()
+            .update(some, |node| node.disabled = false);
+        frame(&mut ui, &mut tree, None);
+        // The focus coming and going, the node changing as it has it.
+        frame(&mut ui, &mut tree, Some(some));
+        ui.semantics
+            .borrow_mut()
+            .update(some, |node| node.label = "Named".into());
+        frame(&mut ui, &mut tree, Some(some));
+        frame(&mut ui, &mut tree, None);
+        // Focused, it goes with names alone though it moved, where others wait.
+        height.set(120.);
+        frame_names(&mut ui, &mut tree, Some(some));
+        frame(&mut ui, &mut tree, Some(some));
+        frame(&mut ui, &mut tree, None);
+        // A window at a new scale.
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        tree.note_flush(&ui.scene.borrow());
+        tree.update(&ui.scene.borrow(), &ui.semantics.borrow(), None, "Test", 2.);
+        // Nothing changed: nothing to look at or say but the window.
+        frame(&mut ui, &mut tree, None);
+    }
+    /// Without flushes heard (a caller that hears none), every update walks.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn with_no_flush_heard_an_update_walks_the_scene() {
+        let mut ui = Ui::new(400., 300.);
+        let words = ui.signal(String::from("Words"));
+        let read = words.clone();
+        ui.mount(column().child(text_signal(move || read.get())));
+        ui.prepare_frame();
+        let mut tree = AccessibilityTree::new();
+        tree.update(&ui.scene.borrow(), &ui.semantics.borrow(), None, "Test", 1.);
+        words.set("More".into());
+        ui.prepare_frame();
+        tree.update(&ui.scene.borrow(), &ui.semantics.borrow(), None, "Test", 1.);
+        assert!(!tree.looked_at_changes);
+    }
     fn project(ui: &mut Ui) -> Vec<Node> {
         ui.prepare_frame();
         eprintln!("rev {}", ui.scene.borrow().language_revision());
@@ -3343,6 +3938,122 @@ mod vocabulary_tests {
         count.set(0);
         project(&mut ui, &mut tree);
         assert!(tree.run_boxes.is_empty(), "and goes with it");
+    }
+
+    /// A names-only update (`update_names`) sends the node whose name
+    /// changed and leaves one that only moved as it was sent; the next full
+    /// update (`update`) sends where it went.
+    #[test]
+    fn a_names_only_update_sends_the_renamed_and_leaves_the_moved_for_later() {
+        let mut ui = Ui::new(400., 300.);
+        ui.set_assistive_technology(true);
+        let name = ui.signal("One".to_string());
+        let gap = ui.signal(0_f32);
+        let (read_name, read_gap) = (name.clone(), gap.clone());
+        ui.mount(
+            column()
+                .child(
+                    button()
+                        .accessible_label_when(move || read_name.get())
+                        .child(text("x")),
+                )
+                .child(div().reactive_style(move || Styles::new().h(read_gap.get())))
+                .child(button().accessible_label("Still").child(text("y"))),
+        );
+        let mut tree = AccessibilityTree::new();
+        let frame = |ui: &mut Ui| ui.prepare_frame();
+        frame(&mut ui);
+        let first = tree.update(&ui.scene.borrow(), &ui.semantics.borrow(), None, "Test", 1.);
+        let still_box = |nodes: &[(accesskit::NodeId, Node)]| {
+            nodes
+                .iter()
+                .find(|(_, n)| n.label() == Some("Still"))
+                .and_then(|(_, n)| n.bounds())
+        };
+        let was = still_box(&first.nodes).expect("sent first");
+        // The first renamed, the second moved down.
+        name.set("Two".to_string());
+        gap.set(40.);
+        frame(&mut ui);
+        let names = tree.update_names(&ui.scene.borrow(), &ui.semantics.borrow(), None, "Test", 1.);
+        assert!(
+            names.nodes.iter().any(|(_, n)| n.label() == Some("Two")),
+            "the new name goes"
+        );
+        assert_eq!(still_box(&names.nodes), None, "the moved node waits");
+        let full = tree.update(&ui.scene.borrow(), &ui.semantics.borrow(), None, "Test", 1.);
+        let now = still_box(&full.nodes).expect("then it goes");
+        assert!(now.y0 > was.y0, "where it went: {was:?} then {now:?}");
+    }
+
+    /// With a screen reader (`screen_reader()` true: VoiceOver or Switch
+    /// Control on macOS, Narrator, NVDA or JAWS on Windows), a name changing
+    /// frame after frame goes out on each frame it changes, never held for
+    /// the pacer: what it speaks is never late.
+    #[test]
+    fn a_screen_reader_hears_each_name_on_the_frame_it_changes() {
+        use super::{GEOMETRY_EVERY, GeometryPacer, urgent};
+        let mut ui = Ui::new(400., 300.);
+        ui.set_assistive_technology(true);
+        let name = ui.signal("Name 0".to_string());
+        let read = name.clone();
+        ui.mount(
+            column().child(
+                button()
+                    .accessible_label_when(move || read.get())
+                    .child(text("x")),
+            ),
+        );
+        let label = |nodes: &[Node]| {
+            find(nodes, accesskit::Role::Button)[0]
+                .label()
+                .map(str::to_owned)
+        };
+        let start = std::time::Instant::now();
+        let mut pacer = GeometryPacer::default();
+        assert!(pacer.update_now(start, true, true), "the first tree");
+        assert_eq!(label(&project(&mut ui)).as_deref(), Some("Name 0"));
+        // A frame apart, well inside the pacer's interval each time.
+        let frame = GEOMETRY_EVERY / 12;
+        for n in 1..=6 {
+            name.set(format!("Name {n}"));
+            let at = start + frame * n;
+            let now = urgent(false, false, true, || true);
+            assert!(now, "a name change is urgent to a screen reader");
+            assert!(pacer.update_now(at, now, true), "sent on frame {n}");
+            assert_eq!(
+                label(&project(&mut ui)).as_deref(),
+                Some(format!("Name {n}").as_str()),
+                "the tree on frame {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn at_rest_the_tables_give_back_what_a_big_page_took_and_nothing_else() {
+        let mut ui = Ui::new(400., 300.);
+        ui.set_assistive_technology(true);
+        let count = ui.signal(4_000_usize);
+        let read = count.clone();
+        ui.mount(column().child(keyed(
+            move || (0..read.get()).collect(),
+            |i: usize, _| text(format!("Row {i}")),
+        )));
+        let mut tree = AccessibilityTree::new();
+        let project = |ui: &mut Ui, tree: &mut AccessibilityTree| {
+            ui.prepare_frame();
+            tree.update(&ui.scene.borrow(), &ui.semantics.borrow(), None, "Test", 1.)
+        };
+        project(&mut ui, &mut tree);
+        let big = tree.cache.capacity();
+        count.set(2);
+        project(&mut ui, &mut tree);
+        assert!(tree.cache.capacity() >= big, "a table only grows by itself");
+        tree.rest();
+        assert!(tree.cache.capacity() < big / 8);
+        // What it knows stays: nothing has changed, so nothing goes out again.
+        let same = project(&mut ui, &mut tree);
+        assert!(same.nodes.is_empty(), "{:?}", same.nodes.len());
     }
 
     #[test]
@@ -3763,14 +4474,22 @@ mod pacing_tests {
         assert!(!pacer.update_now(at(96), false, true));
         assert!(pacer.update_now(at(112), false, true));
         assert_eq!(pacer.deadline(), None);
-        // A name changing mid-animation: at once.
-        assert!(pacer.update_now(at(128), true, true));
+        // A name changing mid-animation: at once, alone (the geometry not
+        // due yet keeps its own time, not put off by the name).
+        assert_eq!(
+            pacer.update_kind(at(128), true, true),
+            Some(super::TreeUpdateKind::Names)
+        );
         // The frames stop after one more move; nothing else comes but the
-        // wake at its deadline, which sends it.
+        // wake at its deadline, 100 ms after the last full update, which
+        // sends it.
         assert!(!pacer.update_now(at(144), false, true));
-        assert_eq!(pacer.deadline(), Some(at(228)));
+        assert_eq!(pacer.deadline(), Some(at(212)));
         assert!(!pacer.update_now(at(200), false, false));
-        assert!(pacer.update_now(at(228), false, false));
+        assert_eq!(
+            pacer.update_kind(at(212), false, false),
+            Some(super::TreeUpdateKind::Full)
+        );
         // Then quiet: nothing to send, nothing held.
         assert!(!pacer.update_now(at(400), false, false));
         assert_eq!(pacer.deadline(), None);

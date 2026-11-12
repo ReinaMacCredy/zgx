@@ -44,9 +44,16 @@ fn scrollbar_track_paging_thumb_capture_resize_and_cancel() {
     ui.prepare_frame();
     let bar = bar(&ui);
     let bounds = ui.scene.borrow().bounds(bar);
+    // At the content's right edge, in the platform's track: zgx's 8, and
+    // Windows' and GNOME's 12.
+    let track = if cfg!(any(windows, target_os = "linux")) {
+        12.
+    } else {
+        8.
+    };
     assert_eq!(
         (bounds.x, bounds.y, bounds.width, bounds.height),
-        (182., 10., 8., 100.)
+        (190. - track, 10., track, 100.)
     );
     down(&mut ui, 186., 90.);
     up(&mut ui, 186., 90.);
@@ -206,25 +213,27 @@ fn thumb_drag_survives_unrelated_button_release() {
     );
     ui.prepare_frame();
     let track = bar(&ui);
-    down(&mut ui, 196., 10.);
+    // On the thumb on every platform: below Windows' arrow button (12
+    // long), within the shortest thumb elsewhere.
+    down(&mut ui, 196., 20.);
     assert_eq!(ui.input.captured(), Some(track));
     ui.dispatch(InputEvent::PointerDown {
         x: 196.,
-        y: 10.,
+        y: 20.,
         button: PointerButton::Secondary,
     });
     ui.dispatch(InputEvent::PointerUp {
         x: 196.,
-        y: 10.,
+        y: 20.,
         button: PointerButton::Secondary,
     });
     assert_eq!(ui.input.captured(), Some(track));
-    ui.dispatch(InputEvent::PointerMove { x: 196., y: 70. });
+    ui.dispatch(InputEvent::PointerMove { x: 196., y: 80. });
     assert!(offset.get() > 0.);
-    up(&mut ui, 196., 70.);
+    up(&mut ui, 196., 80.);
     assert_eq!(ui.input.captured(), None);
     let settled = offset.get();
-    ui.dispatch(InputEvent::PointerMove { x: 196., y: 100. });
+    ui.dispatch(InputEvent::PointerMove { x: 196., y: 110. });
     assert_eq!(offset.get(), settled);
 }
 

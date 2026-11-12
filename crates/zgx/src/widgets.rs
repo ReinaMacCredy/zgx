@@ -751,10 +751,18 @@ impl EditorHandle {
         ))
     }
     /// Where an input method's candidates go, in the window's points: under
-    /// the clause it converts (`composition_area`), else at the caret.
+    /// the clause it converts (`composition_area`), else at the caret; an
+    /// empty rect once the editor is gone from the scene (Windows' input
+    /// method may still ask, before it hears focus moved).
     pub fn input_method_area(&self) -> Rect {
-        self.composition_area()
-            .unwrap_or_else(|| self.scene.borrow().transformed_bounds(self.caret))
+        self.composition_area().unwrap_or_else(|| {
+            let scene = self.scene.borrow();
+            if scene.contains(self.caret) {
+                scene.transformed_bounds(self.caret)
+            } else {
+                Rect::default()
+            }
+        })
     }
     /// Where bytes `range` of the text it shows (its committed text with
     /// any composition in place of the selection) are, in the window's
@@ -1283,7 +1291,8 @@ impl EditorHandle {
 pub(crate) type PasteHook = Rc<dyn Fn(Option<&str>) -> bool>;
 /// The layout and notification passes a frame takes to settle.
 const LAYOUT_PASSES: usize = 64;
-/// How much of a point a size may differ by and be the same (`resized`).
+/// How much of a point a size or a position may differ by and be the same
+/// (`resized`, `moved`).
 const SIZE_NOISE: f32 = 1. / 1024.;
 /// The passes it takes once layout has failed to settle
 /// (`Ui::contain_layout_feedback`): each change is tried again, cheaply.
@@ -1639,6 +1648,8 @@ pub(crate) struct UiStorage {
     dying: RefCell<std::collections::VecDeque<NodeId>>,
     /// A large subtree was removed since the last frame was prepared.
     removed: Cell<bool>,
+    /// What spare time is for (`crate::spare`).
+    spare: crate::spare::SpareWork,
     editors: RefCell<crate::scene::NodeMap<EditorHandle>>,
     /// What takes a person's paste, for the few editors asked to (`View::on_paste`).
     paste_hooks: RefCell<crate::scene::NodeMap<PasteHook>>,
@@ -1663,10 +1674,19 @@ pub(crate) struct UiStorage {
     /// (`tab_into_next_row`).
     row_focus: Cell<Option<RowFocus>>,
     content_sizes: RefCell<crate::scene::NodeMap<Signal<(f32, f32)>>>,
+    /// Bumped as any of those is published resized, once a measured list asks
+    /// for it (`Ui::content_size_revision`).
+    content_revision: RefCell<Option<Signal<u64>>>,
     /// Nodes' laid-out sizes (`observe_size`): read only when layout runs.
     observed_sizes: RefCell<crate::scene::NodeMap<Signal<(f32, f32)>>>,
     observed_bounds: RefCell<crate::scene::NodeMap<Signal<Rect>>>,
     observed_visibility: RefCell<crate::scene::NodeMap<Signal<bool>>>,
+    /// Of those, the ones that count as shown within a margin of the view
+    /// (`observe_visibility_within`): only nodes asked so are here.
+    visibility_margins: RefCell<crate::scene::NodeMap<f32>>,
+    /// How many nodes were observed when those margins were last checked
+    /// against them (`forget_unobserved_margins`): fewer since, one went.
+    margins_checked: Cell<usize>,
     /// Scroll views' insets kept clear scrolling into view
     /// (`set_scroll_padding`).
     scroll_padding: RefCell<crate::scene::NodeMap<crate::scene::Insets>>,
@@ -1699,6 +1719,8 @@ pub(crate) struct UiStorage {
     pub(crate) find_off: Cell<bool>,
     /// Virtual lists' rows' indices from their places, by list.
     pub(crate) list_rows: RefCell<std::collections::HashMap<NodeId, crate::find::RowIndex>>,
+    /// How far a wheel's line scrolls each list, by its root: a row's height.
+    pub(crate) wheel_lines: RefCell<std::collections::HashMap<NodeId, f32>>,
     /// What the last primary press went to: the keyboard scrolls the scroll
     /// view around it (`scroll_keys`).
     last_pressed: Cell<Option<NodeId>>,
@@ -1706,6 +1728,8 @@ pub(crate) struct UiStorage {
     elastic: RefCell<crate::elastic::State>,
     /// Wheel notches stepped at once (`Ui::set_wheel_glides(false)`).
     wheel_jumps: Cell<bool>,
+    /// Scroll views that page (`View::paging`): none, never more than a look.
+    paging: RefCell<crate::paging::State>,
     /// Scrollbars hide until their view scrolls (`Ui::set_overlay_scrollbars`).
     overlay_scrollbars: Signal<bool>,
     /// Editors' caret width in points (`Ui::set_caret_width`).
@@ -1728,6 +1752,13 @@ pub(crate) struct UiStorage {
     listening: Cell<bool>,
     /// Overlay scrollbars shown, to fade once their view stops scrolling.
     scrollbar_fades: RefCell<Vec<std::rc::Weak<crate::compose_scrollbar::Fade>>>,
+    /// Scroll views' and lists' own scrollbar styles, by the node their bar
+    /// mounts on, until it does (`View::scrollbar_style`).
+    scrollbar_styles:
+        RefCell<rustc_hash::FxHashMap<NodeId, Rc<crate::compose_scrollbar::ScrollbarStyle>>>,
+    /// The style of the scroll view or list opening now, until its node is
+    /// known (`compose::hold_scrollbar_style`).
+    held_scrollbar_style: RefCell<Option<Rc<crate::compose_scrollbar::ScrollbarStyle>>>,
     /// Input is being dispatched: what scrolls now, the user scrolled.
     dispatching: Cell<bool>,
     /// A platform's wheel is being dispatched (`Ui::wheel_in_window`).
@@ -1771,6 +1802,10 @@ pub struct WeakUi {
     storage: Weak<UiStorage>,
 }
 impl WeakUi {
+    /// Whether `other` is the same `Ui`'s (a window's, as nodes are).
+    pub(crate) fn same(&self, other: &WeakUi) -> bool {
+        Weak::ptr_eq(&self.storage, &other.storage)
+    }
     /// The `Ui`, if it still exists.
     pub fn upgrade(&self) -> Option<Ui> {
         self.storage.upgrade().map(Ui::from_storage)
@@ -1874,6 +1909,99 @@ impl Drop for UiStorage {
     }
 }
 impl Ui {
+    /// The interface's lines of a memory report: its scene's, its reactive
+    /// runtime's, its semantics', and what it keeps per node beside them
+    /// (effects, input bindings and resources each node owns; editors,
+    /// observers and listeners). Worked out only as a report asks.
+    #[cold]
+    pub fn memory(&self, report: &mut crate::memory::Report) {
+        use crate::memory::{map_bytes, vec_bytes};
+        self.scene.borrow().memory(report);
+        self.runtime.memory(report);
+        self.input.memory(report);
+        if let Ok(semantics) = self.semantics.try_borrow() {
+            semantics.memory(report);
+        }
+        let storage = &self.storage;
+        let Ok(owned) = storage.owned.try_borrow() else {
+            return;
+        };
+        let held: usize = owned
+            .values()
+            .map(|owned| {
+                let effects = if owned.effects.spilled() {
+                    owned.effects.capacity() * size_of::<Effect>()
+                } else {
+                    0
+                };
+                effects
+                    + vec_bytes(&owned.bindings)
+                    + vec_bytes(&owned.resources)
+                    + owned
+                        .resources
+                        .iter()
+                        .map(|resource| size_of_val(&**resource))
+                        .sum::<usize>()
+            })
+            .sum();
+        report.add(
+            "interface",
+            "what nodes own",
+            Some(owned.len()),
+            Some(map_bytes(&owned) + held),
+        );
+        let listeners = storage
+            .layout_listeners
+            .try_borrow()
+            .map_or(0, |listeners| {
+                map_bytes(&listeners) + listeners.values().map(vec_bytes).sum::<usize>()
+            });
+        let tables = storage.editors.try_borrow().map_or(0, |m| map_bytes(&m))
+            + storage
+                .paste_hooks
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage
+                .content_sizes
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage
+                .observed_sizes
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage
+                .observed_bounds
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage
+                .observed_visibility
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage
+                .visibility_margins
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage
+                .scroll_padding
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage.containers.try_borrow().map_or(0, |m| map_bytes(&m))
+            + storage
+                .list_reveals
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage.list_rows.try_borrow().map_or(0, |m| map_bytes(&m))
+            + storage
+                .wheel_lines
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + storage
+                .pending_labels
+                .try_borrow()
+                .map_or(0, |m| map_bytes(&m))
+            + listeners;
+        report.add("interface", "tables", None, Some(tables));
+    }
     /// A `width` by `height` document on a runtime of its own.
     pub fn new(width: f32, height: f32) -> Self {
         Self::with_runtime(Runtime::new(), width, height)
@@ -1926,6 +2054,7 @@ impl Ui {
             owned: RefCell::default(),
             dying: RefCell::default(),
             removed: Cell::new(false),
+            spare: Default::default(),
             editors: RefCell::default(),
             paste_hooks: RefCell::default(),
             editor_layout: RefCell::new(None),
@@ -1938,9 +2067,12 @@ impl Ui {
             refocus_trail: RefCell::new(None),
             row_focus: Cell::new(None),
             content_sizes: RefCell::default(),
+            content_revision: RefCell::default(),
             observed_sizes: RefCell::default(),
             observed_bounds: RefCell::default(),
             observed_visibility: RefCell::default(),
+            visibility_margins: RefCell::default(),
+            margins_checked: Cell::new(0),
             scroll_padding: RefCell::default(),
             after_layout: RefCell::new(Vec::new()),
             layout_listeners: RefCell::default(),
@@ -1958,10 +2090,14 @@ impl Ui {
             find: RefCell::new(None),
             find_off: Cell::new(false),
             list_rows: Default::default(),
+            wheel_lines: Default::default(),
             last_pressed: Cell::new(None),
             elastic: Default::default(),
             wheel_jumps: Cell::new(false),
+            paging: Default::default(),
             scrollbar_fades: RefCell::new(Vec::new()),
+            scrollbar_styles: Default::default(),
+            held_scrollbar_style: Default::default(),
             dispatching: Cell::new(false),
             wheel_in_window: Cell::new(false),
             document_listeners: RefCell::new(Vec::new()),
@@ -2715,6 +2851,29 @@ impl Ui {
         self.storage.editor_layout_revision.set(None);
         signal
     }
+    /// `content_size_revision` bumped, if a measured list asked for it: out of
+    /// line, as most apps have none.
+    #[inline(never)]
+    fn content_sizes_published(&self) {
+        let revision = self.storage.content_revision.borrow().clone();
+        if let Some(revision) = revision {
+            revision.mutate(|serial| {
+                *serial = serial.wrapping_add(1);
+                true
+            });
+        }
+    }
+    /// A revision bumped after each publication of content sizes in which any
+    /// changed: what reads many nodes' sizes (a measured list's rows) reads
+    /// it, and theirs untracked, rather than tracking each one.
+    pub(crate) fn content_size_revision(&self) -> Signal<u64> {
+        if let Some(revision) = &*self.storage.content_revision.borrow() {
+            return revision.clone();
+        }
+        let revision = self.signal(0_u64);
+        *self.storage.content_revision.borrow_mut() = Some(revision.clone());
+        revision
+    }
     /// Observe the node's laid-out size (its border box), published after
     /// each layout that runs: unlike `observe_bounds`, nothing an ancestor
     /// does (scrolling, translating) costs it anything. The registration
@@ -2729,6 +2888,12 @@ impl Ui {
             self.storage.observed_bounds.borrow().len(),
             self.storage.observed_visibility.borrow().len(),
         ]
+    }
+    /// How many nodes are observed with a margin (`observe_visibility_within`):
+    /// for tests that what unmounts lets go.
+    #[doc(hidden)]
+    pub fn visibility_margin_count(&self) -> usize {
+        self.storage.visibility_margins.borrow().len()
     }
     pub(crate) fn observe_size(&self, node: NodeId) -> Signal<(f32, f32)> {
         if let Some(signal) = self.storage.observed_sizes.borrow().get(&node) {
@@ -2934,6 +3099,41 @@ impl Ui {
     pub(crate) fn is_dispatching(&self) -> bool {
         self.storage.dispatching.get()
     }
+    /// Hold the style of the element opening now (`None`: it has none).
+    pub(crate) fn hold_scrollbar_style(
+        &self,
+        style: Option<Rc<crate::compose_scrollbar::ScrollbarStyle>>,
+    ) {
+        *self.storage.held_scrollbar_style.borrow_mut() = style;
+    }
+    /// The style held for the element just opened, taken.
+    pub(crate) fn held_scrollbar_style(
+        &self,
+    ) -> Option<Rc<crate::compose_scrollbar::ScrollbarStyle>> {
+        self.storage.held_scrollbar_style.borrow_mut().take()
+    }
+    /// Keep `style` for the scrollbar that mounts on `node`.
+    pub(crate) fn keep_scrollbar_style(
+        &self,
+        node: NodeId,
+        style: Rc<crate::compose_scrollbar::ScrollbarStyle>,
+    ) {
+        self.storage
+            .scrollbar_styles
+            .borrow_mut()
+            .insert(node, style);
+    }
+    /// The style kept for the scrollbar mounting on `node`, if any.
+    pub(crate) fn take_scrollbar_style(
+        &self,
+        node: NodeId,
+    ) -> Option<Rc<crate::compose_scrollbar::ScrollbarStyle>> {
+        let mut styles = self.storage.scrollbar_styles.borrow_mut();
+        if styles.is_empty() {
+            return None;
+        }
+        styles.remove(&node)
+    }
     pub(crate) fn scrollbar_fades(
         &self,
     ) -> &RefCell<Vec<std::rc::Weak<crate::compose_scrollbar::Fade>>> {
@@ -3038,6 +3238,30 @@ impl Ui {
     pub fn take_navigation_swipe(&self) -> bool {
         std::mem::take(&mut self.storage.elastic.borrow_mut().asked)
     }
+    /// How far a wheel's line scrolls what is under (`x`, `y`), if it says:
+    /// a list's row height (the innermost list there), as a table's rows set
+    /// an `NSTableView`'s line. None elsewhere: the platform's line.
+    pub fn wheel_line_at(&self, x: f32, y: f32) -> Option<f32> {
+        let lines = self.storage.wheel_lines.borrow();
+        if lines.is_empty() {
+            return None;
+        }
+        let scene = self.scene.borrow();
+        let hit = scene.hit_test(x, y)?;
+        std::iter::once(hit)
+            .chain(scene.ancestors(hit))
+            .find_map(|node| lines.get(&node).copied())
+    }
+    /// A touch pan's phase, for scroll views that page: they follow a pan as a
+    /// trackpad's gesture, not as a wheel's notches. Nothing else hears of it, so
+    /// a pan of any other view is what it would be without this.
+    #[doc(hidden)]
+    pub fn paging_gesture(&self, phase: crate::input::ScrollGesture) {
+        crate::paging::gesture(self, phase);
+    }
+    pub(crate) fn paging_state(&self) -> &RefCell<crate::paging::State> {
+        &self.storage.paging
+    }
     pub(crate) fn elastic_state(&self) -> &RefCell<crate::elastic::State> {
         &self.storage.elastic
     }
@@ -3049,6 +3273,14 @@ impl Ui {
     /// while they can't see it.
     pub fn observe_shown(&self) -> Signal<bool> {
         self.storage.presented.clone()
+    }
+    /// The app came forward or went to the back (any of its windows active,
+    /// or none; not a window of it giving way to another): a popup wanted
+    /// while it is at the back stays wanted, not shown, and shows as it comes
+    /// forward (`Scene::set_popups_held`). What is open as it goes closes as
+    /// ever (`Ui::dismiss_popups`). The host's to tell, as focus changes.
+    pub fn set_app_active(&self, active: bool) {
+        self.scene.borrow_mut().set_popups_held(!active);
     }
     /// Whether the window is the active one, its keys going to it
     /// (`Ui::set_window_active`), as it changes.
@@ -3362,6 +3594,36 @@ impl Ui {
                 open.set(false);
             }
         }
+    }
+    /// As `observe_visibility`, but shown when any of the node's box grown
+    /// by `margin` on every side would show (`Scene::shows_within`): true
+    /// as it comes within `margin` of the view, before it shows.
+    pub(crate) fn observe_visibility_within(&self, node: NodeId, margin: f32) -> Signal<bool> {
+        let margin = margin.max(0.);
+        let changed = self
+            .storage
+            .visibility_margins
+            .borrow_mut()
+            .insert(node, margin)
+            .is_none_or(|was| was != margin);
+        if changed {
+            // Judged again at the next frame, with this margin.
+            self.storage.bounds_geometry_revision.set(None);
+        }
+        self.observe_visibility(node)
+    }
+    /// Lets go of the margins of nodes no longer observed (removed).
+    #[cold]
+    #[inline(never)]
+    fn forget_unobserved_margins(&self) {
+        let observed = self.storage.observed_visibility.borrow();
+        if observed.len() < self.storage.margins_checked.get() {
+            self.storage
+                .visibility_margins
+                .borrow_mut()
+                .retain(|node, _| observed.contains_key(node));
+        }
+        self.storage.margins_checked.set(observed.len());
     }
     pub(crate) fn observe_visibility(&self, node: NodeId) -> Signal<bool> {
         if let Some(signal) = self.storage.observed_visibility.borrow().get(&node) {
@@ -4107,7 +4369,7 @@ impl Ui {
                     for (node, signal) in self.storage.observed_bounds.borrow().iter() {
                         if scene.contains(*node) {
                             let now = scene.world_bounds(*node);
-                            if signal.with_untracked(|told| *told != now) {
+                            if signal.with_untracked(|told| moved(*told, now)) {
                                 bounds.push((*node, signal.clone(), now));
                             }
                         }
@@ -4117,10 +4379,22 @@ impl Ui {
             };
             let mut visibility = Vec::new();
             if geometry_changed {
+                // Margins of nodes no longer observed go here, not as each
+                // node is removed: removal stays as it is for every node.
+                if !self.storage.visibility_margins.borrow().is_empty() {
+                    self.forget_unobserved_margins();
+                }
                 let scene = self.scene.borrow();
+                let margins = self.storage.visibility_margins.borrow();
                 for (node, signal) in self.storage.observed_visibility.borrow().iter() {
                     if scene.contains(*node) {
-                        let now = scene.visible_bounds(*node).is_some();
+                        let now = match margins.is_empty() {
+                            true => scene.visible_bounds(*node).is_some(),
+                            false => match margins.get(node) {
+                                Some(margin) => scene.shows_within(*node, *margin),
+                                None => scene.visible_bounds(*node).is_some(),
+                            },
+                        };
                         if signal.with_untracked(|told| *told != now) {
                             visibility.push((*node, signal.clone(), now));
                         }
@@ -4130,12 +4404,17 @@ impl Ui {
             // Publish outside every storage/scene borrow: geometry subscribers can
             // mount, dispose, translate, or reenter frame preparation.
             self.runtime.batch(|| {
+                let mut any = false;
                 for (node, signal, size) in sizes {
                     if self.scene.borrow().contains(node)
                         && signal.with_untracked(|told| resized(*told, size))
                     {
                         signal.set(size);
+                        any = true;
                     }
+                }
+                if any {
+                    self.content_sizes_published();
                 }
                 // Changed, as gathered above (what reads them runs after
                 // the batch): set without comparing again.
@@ -4246,14 +4525,14 @@ impl Ui {
         let bounds = self.storage.observed_bounds.borrow();
         let bounds = bounds.iter().filter(|(node, signal)| {
             scene.contains(**node)
-                && signal.with_untracked(|bounds| *bounds != scene.world_bounds(**node))
+                && signal.with_untracked(|told| moved(*told, scene.world_bounds(**node)))
         });
-        let mut moved = sizes;
-        moved.extend(bounds.map(|(node, _)| *node));
-        moved.sort_by_key(|node| node.number());
-        moved.dedup();
-        moved.truncate(8);
-        moved
+        let mut moving = sizes;
+        moving.extend(bounds.map(|(node, _)| *node));
+        moving.sort_by_key(|node| node.number());
+        moving.dedup();
+        moving.truncate(8);
+        moving
     }
     /// Recompute editor geometry after changing the font backend or display scale.
     pub(crate) fn observe_text_geometry_revision(&self) -> Signal<u64> {
@@ -4371,6 +4650,20 @@ impl Ui {
         self.try_dispatch_with_modifiers(event, modifiers)
             .unwrap_or_else(|error| panic!("{error}"))
     }
+    /// The pointer passed `x, y` on its way to its next move, which a host
+    /// heard in one turn with it and handles alone (a platform's moves,
+    /// folded): hover goes there, so what it enters and leaves hears it, as
+    /// it would from a move of its own; nothing else does (no move is
+    /// dispatched there). A cell crossed between two moves of a turn is
+    /// entered and left.
+    pub fn try_pointer_passed(&mut self, x: f32, y: f32) -> Result<(), LayoutFeedbackError> {
+        self.try_prepare_frame()?;
+        let _span = crate::profile::span(crate::profile::Phase::Input);
+        self.storage.dispatching.set(true);
+        self.input.pointer_passed(&self.scene, x, y);
+        self.storage.dispatching.set(false);
+        Ok(())
+    }
     /// Fallible counterpart of `dispatch_with_modifiers`; failed geometry
     /// preparation leaves the event and click sequence unprocessed.
     pub fn try_dispatch_with_modifiers(
@@ -4422,6 +4715,8 @@ impl Ui {
         let elastic = self.storage.elastic.borrow().enabled;
         let event = match event {
             InputEvent::ScrollGesture(phase) => {
+                self.input.scroll_gesture(phase);
+                crate::paging::gesture(self, phase);
                 if elastic {
                     crate::elastic::gesture(self, phase);
                 }
@@ -4477,6 +4772,7 @@ impl Ui {
             self.next_selection_deadline(),
             crate::compose_scrollbar::next_fade(self),
             crate::elastic::next_step(self),
+            crate::paging::next_step(self),
             crate::caret_blink::next(self),
             crate::find::next_step(self),
         ]
@@ -4506,7 +4802,7 @@ impl Ui {
     }
     /// Advance due captured-editor interactions using an explicit monotonic time.
     /// Returns whether a tick ran; stalls contribute at most 50 ms of motion.
-    pub fn advance_interactions(&mut self, now: Instant) -> Result<bool, LayoutFeedbackError> {
+    pub fn advance_interactions(&self, now: Instant) -> Result<bool, LayoutFeedbackError> {
         if self.storage.advancing_interaction.get() {
             return Ok(false);
         }
@@ -4523,6 +4819,13 @@ impl Ui {
         };
         // A stretched scroll view springing back.
         let keys = if crate::elastic::advance(self, now) {
+            self.try_prepare_frame()?;
+            true
+        } else {
+            keys
+        };
+        // A paged scroll view going to its page.
+        let keys = if crate::paging::advance(self, now) {
             self.try_prepare_frame()?;
             true
         } else {
@@ -4607,6 +4910,24 @@ impl Ui {
         }
         drop(old);
         self.input.dispatch(&self.scene, InputEvent::PointerCancel);
+    }
+    /// Whether `scope`, a focus scope, shows in a portal owned from within
+    /// `row`: a popover opened from it.
+    pub(crate) fn opened_from(&self, scope: NodeId, row: NodeId) -> bool {
+        let scene = self.scene.borrow();
+        let inside = |node: NodeId, around: NodeId| {
+            node == around || (scene.contains(node) && scene.ancestors(node).any(|up| up == around))
+        };
+        inside(scope, row)
+            || self
+                .storage
+                .portals
+                .borrow()
+                .iter()
+                .any(|(owner, overlay)| inside(scope, *overlay) && inside(*owner, row))
+    }
+    pub(crate) fn spare(&self) -> &crate::spare::SpareWork {
+        &self.storage.spare
     }
     /// Whether nodes removed (`Ui::remove`) still hold what they held, to
     /// be freed over the next frames: frames call `reclaim` as they are
@@ -5015,7 +5336,7 @@ impl Ui {
         // empty.
         let shown = match &initial {
             TextValue::Flat(text)
-                if !(multiline && text.contains('\n')) && !crate::editor_lines::is_long(text) =>
+                if (!multiline || !text.contains('\n')) && !crate::editor_lines::is_long(text) =>
             {
                 text.clone()
             }
@@ -5164,7 +5485,7 @@ impl Ui {
             if !s.contains(root) {
                 return;
             }
-            if !draw_hint.laid_out.take() {
+            if !draw_hint.laid_out.take() && !DRAWS_LAID_OUT.get() {
                 s.prepare_layout();
             }
             let bounds = s.bounds(root);
@@ -5639,7 +5960,7 @@ impl Ui {
             if caret_shown {
                 // A bare insertion point: no composition, no selection.
                 let bare = e.preedit().is_none() && selection.range().is_empty();
-                draw_blink.restart(caret, caret_color, Instant::now(), bare);
+                draw_blink.restart(caret, caret_color, crate::clock::now(), bare);
             } else {
                 draw_blink.release(caret);
             }
@@ -6549,7 +6870,7 @@ impl Ui {
                 {
                     return;
                 }
-                let now = Instant::now();
+                let now = crate::clock::now();
                 let old = storage
                     .interaction
                     .borrow_mut()
@@ -7904,10 +8225,19 @@ pub(crate) fn finish_input_draws(scene: &Rc<RefCell<Scene>>) {
     let runtime = storage.runtime.clone();
     // Batched: an observer of a signal a shaper writes (unsupported) runs
     // after the draws, not inside an editor's borrow.
+    // Laid out once for all of them: each draw reads its editor's box from
+    // that layout, not a pass of its own (`DRAWS_LAID_OUT`), and the box it
+    // read is kept, so that one another's draw moves (a field growing with
+    // its text) is drawn again below.
     runtime.batch(|| {
+        scene.borrow_mut().prepare_layout();
+        DRAWS_LAID_OUT.set(true);
         for (_, effect, draw) in draws.waiting {
+            scene.borrow().read_geometry_for(Some(effect));
             runtime.run_as(effect, &*draw);
         }
+        scene.borrow().read_geometry_for(None);
+        DRAWS_LAID_OUT.set(false);
         scene.borrow_mut().prepare_layout();
     });
     let watch = |effect: u64, starts: bool| {
@@ -7930,6 +8260,12 @@ pub(crate) fn finish_input_draws(scene: &Rc<RefCell<Scene>>) {
         runtime.rerun_watched(&moved, watch);
         scene.borrow_mut().prepare_layout();
     }
+}
+thread_local! {
+    /// Whether the scene was laid out for the input draws running now, at
+    /// a mount's end (`finish_input_draws`): a draw then reads its box as
+    /// that layout left it rather than laying out again.
+    static DRAWS_LAID_OUT: Cell<bool> = const { Cell::new(false) };
 }
 /// Whether the mount deferring input draws has bound an input: without one
 /// its observers run as any batch's.
@@ -8064,7 +8400,30 @@ mod ownership_tests {
 /// as this compares with what was told last.
 #[inline]
 fn resized(told: (f32, f32), now: (f32, f32)) -> bool {
-    !((told.0 - now.0).abs() < SIZE_NOISE && (told.1 - now.1).abs() < SIZE_NOISE)
+    told != now && !(same_length(told.0, now.0) && same_length(told.1, now.1))
+}
+
+/// Whether bounds have moved from what was told of them, as `resized`
+/// tells a size: a position summed at a window's scale lands on
+/// neighbouring floats as a size does.
+#[inline]
+fn moved(told: Rect, now: Rect) -> bool {
+    told != now
+        && !(same_length(told.x, now.x)
+            && same_length(told.y, now.y)
+            && same_length(told.width, now.width)
+            && same_length(told.height, now.height))
+}
+
+/// Whether a length is the one told, to within `SIZE_NOISE`, or equal: an
+/// unbounded size stays infinite, and infinity less itself is NaN, which is
+/// near nothing, so it was told again on every pass and never settled.
+/// A NaN length is never the same, as it never was compared exactly (NaN
+/// equals nothing), so one would keep layout from settling: layout
+/// doesn't make one.
+#[inline]
+fn same_length(told: f32, now: f32) -> bool {
+    (told - now).abs() < SIZE_NOISE || told == now
 }
 
 fn allocated_content_size(scene: &Scene, node: NodeId) -> (f32, f32) {
@@ -8624,6 +8983,72 @@ mod bounds_observer_tests {
         assert!(seen.get().0 > base + 0.0009, "{:?}", seen.get());
     }
 
+    /// Bounds are told as sizes are: a position flipping between
+    /// neighbouring floats, its reader moving it each time, settles, and a
+    /// move anyone could see is told.
+    #[test]
+    fn bounds_differing_only_by_rounding_settle_and_real_moves_are_told() {
+        let mut ui = Ui::new(400., 200.);
+        let node = ui.container(ui.root(), Layout::Overlay, fixed(100., 40.));
+        let bounds = ui.observe_bounds(node);
+        let (scene, seen) = (
+            Rc::downgrade(&ui.scene),
+            Rc::new(Cell::new(Rect::default())),
+        );
+        let (told, flips, wanted) = (seen.clone(), Rc::new(Cell::new(0)), Rc::new(Cell::new(10.)));
+        let (flipped, want) = (flips.clone(), wanted.clone());
+        ui.bind(node, move || {
+            told.set(bounds.get());
+            let nudge = if flipped.get() % 2 == 0 { 2e-5 } else { 0. };
+            flipped.set(flipped.get() + 1);
+            let scene = scene.upgrade().unwrap();
+            scene.borrow_mut().set_transform(
+                node,
+                Transform {
+                    x: want.get() + nudge,
+                    y: 0.,
+                },
+            );
+        });
+        ui.try_prepare_frame().unwrap();
+        assert!((seen.get().x - 10.).abs() < 0.001, "{:?}", seen.get());
+        assert!(flips.get() < 8, "{} readings", flips.get());
+        wanted.set(30.);
+        ui.scene
+            .borrow_mut()
+            .set_transform(node, Transform { x: 30., y: 0. });
+        ui.try_prepare_frame().unwrap();
+        assert_eq!(seen.get().x.round(), 30.);
+    }
+
+    /// An unbounded size is the same size on every pass: infinity less
+    /// itself is NaN, which no tolerance holds.
+    #[test]
+    fn an_unbounded_size_settles() {
+        let mut ui = Ui::new(400., 200.);
+        let node = ui.container(ui.root(), Layout::Overlay, fixed(f32::INFINITY, 40.));
+        let size = ui.observe_size(node);
+        let (scene, readings) = (Rc::downgrade(&ui.scene), Rc::new(Cell::new(0)));
+        let (read, seen) = (readings.clone(), Rc::new(Cell::new(0.)));
+        let width = seen.clone();
+        ui.bind(node, move || {
+            width.set(size.get().0);
+            // Its height only rounds differently, so each reading dirties
+            // layout without changing anything that is told.
+            read.set(read.get() + 1);
+            let height = if read.get() % 2 == 0 { 40.00001 } else { 40. };
+            let scene = scene.upgrade().unwrap();
+            scene
+                .borrow_mut()
+                .set_style(node, fixed(f32::INFINITY, height));
+        });
+        ui.try_prepare_frame().unwrap();
+        assert_eq!(seen.get(), f32::INFINITY);
+        assert!(readings.get() < 8, "{} readings", readings.get());
+        assert!(!resized((f32::INFINITY, 40.), (f32::INFINITY, 40.)));
+        assert!(resized((f32::INFINITY, 40.), (100., 40.)));
+    }
+
     /// A hook can hold a script's whole VM: it goes with its editor.
     #[test]
     fn a_paste_hook_goes_with_its_editor() {
@@ -8894,4 +9319,116 @@ struct RowFocus {
     backward: bool,
     /// Where Tab would have gone: past the list's last row that way.
     otherwise: Option<NodeId>,
+}
+
+#[cfg(test)]
+mod layout_drag_tests {
+    use super::Ui;
+    mod layout_drag_page {
+        use crate as zgx;
+        include!("../examples/support/layout_drag_page.rs");
+    }
+
+    /// Passes and measures a frame as the split between six panes is dragged,
+    /// on `layout_drag_bench`'s page (which the gate counts as `layout-drag`).
+    fn drag() -> (f64, f64, usize) {
+        let mut ui = Ui::new(2000., 1100.);
+        let split = ui.signal(320_f32);
+        let runtime = ui.runtime.clone();
+        let _handle = ui.mount(layout_drag_page::page(split.clone(), &runtime));
+        for _ in 0..3 {
+            ui.prepare_frame();
+            ui.scene.borrow_mut().flush();
+        }
+        let (passes, measures) = {
+            let scene = ui.scene.borrow();
+            (scene.layout_passes(), scene.measure_calls)
+        };
+        let mut frames = 0;
+        for width in layout_drag_page::widths(30, 12.) {
+            split.set(width);
+            ui.prepare_frame();
+            ui.scene.borrow_mut().flush();
+            frames += 1;
+        }
+        let scene = ui.scene.borrow();
+        (
+            (scene.layout_passes() - passes) as f64 / frames as f64,
+            (scene.measure_calls - measures) as f64 / frames as f64,
+            scene.len(),
+        )
+    }
+
+    /// A frame of the drag takes no more passes and measures than it did when
+    /// `layout-drag` was added (3.13 and 2,170 over 630 nodes). Each pane
+    /// asks its nodes under several constraints a pass, and its lists' and
+    /// text areas' viewports resized ask for another: lower these as that
+    /// work goes.
+    #[test]
+    fn a_dragged_split_measures_within_its_budget() {
+        let (passes, measures, nodes) = drag();
+        eprintln!("drag: {passes:.2} passes, {measures:.0} measures a frame, {nodes} nodes");
+        assert!(passes <= 3.2, "{passes:.2} passes a frame");
+        assert!(measures <= 2200., "{measures:.0} measures a frame");
+    }
+}
+
+#[cfg(test)]
+mod input_draw_pass_tests {
+    use super::Ui;
+    use crate::compose::prelude::*;
+
+    /// Layout passes a mount of `n` rows, each a button and a text input,
+    /// takes, as `widget_bench` mounts them.
+    fn passes_to_mount(n: usize) -> u64 {
+        let mut ui = Ui::new(1200., 800.);
+        let values: Vec<_> = (0..n).map(|_| ui.signal(String::new())).collect();
+        let before = ui.scene.borrow().layout_passes();
+        let _handle = ui.mount(column().children(values.into_iter().map(|value| {
+            row()
+                .gap(8.)
+                .child(button().child(text("Button")))
+                .child(text_input("Name", value).w(160.))
+        })));
+        ui.scene.borrow_mut().flush();
+        ui.scene.borrow().layout_passes() - before
+    }
+
+    /// A mount draws its text inputs from one layout, not one each: as many
+    /// passes for 200 inputs as for 2. Each draw reading its box from a pass
+    /// of its own laid out the scene once per input.
+    #[test]
+    fn a_mounts_text_inputs_share_one_layout() {
+        let (few, many) = (passes_to_mount(2), passes_to_mount(200));
+        assert_eq!(few, many, "{few} passes for 2 inputs, {many} for 200");
+        assert!(many <= 3, "{many} passes");
+    }
+
+    /// Fields drawn from the one layout are drawn where it placed them: the
+    /// text of each inside its own box.
+    #[test]
+    fn a_mounts_text_inputs_draw_in_their_own_boxes() {
+        let mut ui = Ui::new(600., 800.);
+        let long = ui.signal("line\\n".repeat(12));
+        let below = ui.signal(String::from("below"));
+        let mounted = ui.mount(
+            column()
+                .child(text_area("Notes", long).id("notes").w(300.))
+                .child(text_input("Name", below).id("below").w(300.)),
+        );
+        ui.scene.borrow_mut().flush();
+        let notes = mounted.find("notes").unwrap();
+        let field = mounted.find("below").unwrap();
+        for node in [notes, field] {
+            let editor = ui.editor(node).unwrap();
+            let line = editor.text_area(0..1).unwrap();
+            let bounds = ui.scene.borrow().bounds(node);
+            assert!(
+                line.x >= bounds.x
+                    && line.y >= bounds.y
+                    && line.y + line.height <= bounds.y + bounds.height,
+                "{line:?} in {bounds:?}"
+            );
+        }
+    }
 }

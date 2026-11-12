@@ -99,6 +99,68 @@ fn scene() -> Scene {
             scene.set_blend(layer, blend);
         }
     }
+    // A layer shader reading what's behind it, past its box, and painting
+    // past its box too.
+    let reader = scene.append(
+        scene.root(),
+        NodeKind::Container(Layout::Overlay),
+        fixed(20., 20.),
+    );
+    scene.set_transform(reader, Transform { x: 60., y: 10. });
+    scene.set_layer_shader(
+        reader,
+        Some(FillShader::new(
+            "fn layer(input: LayerInput) -> vec4<f32> {
+                let behind = zgx_backdrop(input.p + vec2(6.0, 3.0));
+                return vec4(behind.gbr, behind.a);
+            }",
+            None,
+        )),
+    );
+    scene.set_layer_extent(reader, 2., 8.);
+    // Layer shaders with inputs: a pass's texture and the boxes bound past
+    // the quads' groups, on their own and beside the backdrop. (Their passes
+    // are wgpu's to build.)
+    let inputs = || zgx::decoration::ShaderInputs {
+        passes: vec![zgx::decoration::ShaderPass {
+            name: "tint".into(),
+            source: "fn run(input: PassInput) -> vec4<f32> {
+                return vec4(input.uv, 0.5, 1.0);
+            }"
+            .into(),
+            size: zgx::decoration::PassSize::Pixels(8, 8),
+            format: zgx::decoration::PassFormat::Rgba16Float,
+            feedback: false,
+            steps: 1,
+            once: false,
+        }],
+        geometry: Some(zgx::decoration::geometry_tag("box")),
+        ..Default::default()
+    };
+    for (at, source) in [
+        (
+            70.,
+            "fn layer(input: LayerInput) -> vec4<f32> {
+                let inside = zgx_rect_count() > 0u && zgx_rect_distance(zgx_window(input.p), 0u) < 0.0;
+                return vec4(zgx_tint(input.p / input.size).rgb, select(0.5, 1.0, inside));
+            }",
+        ),
+        (
+            0.,
+            "fn layer(input: LayerInput) -> vec4<f32> {
+                return vec4(zgx_tint(input.p / input.size).rgb * zgx_backdrop(input.p).rgb, 1.0);
+            }",
+        ),
+    ] {
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            fixed(16., 16.),
+        );
+        scene.set_transform(node, Transform { x: at, y: 76. });
+        scene.set_layer_shader(node, Some(FillShader::with_inputs(source, None, inputs())));
+    }
+    scene.set_geometry_tag(filled, zgx::decoration::geometry_tag("box"));
     scene
 }
 
@@ -136,15 +198,15 @@ fn an_apps_shaders_built_through_a_child_draw_as_wgpu_builds_them() {
     let through_child = started.elapsed();
     let compiled = zgx_gpu::app_shaders_compiled_in_child() - before;
     // The first draw's cost: each frame makes its device and builds the
-    // three shaders (`--nocapture` shows it).
+    // six shaders (`--nocapture` shows it).
     println!(
-        "first frame with 3 app shaders: {in_process:?} built in the process, \
+        "first frame with 6 app shaders: {in_process:?} built in the process, \
          {through_child:?} through children ({compiled} compiled)"
     );
-    // The fill, the layer shader and the blended layer shader (with an
-    // empty cache; a warm one reads them back).
+    // The fill, the layer shader, the blended layer shader, the one
+    // reading the backdrop and the two with inputs (with an empty cache; a warm one reads them back).
     if std::env::var_os("ZGX_EXPECT_COLD_CACHE").is_some() {
-        assert_eq!(compiled, 3, "each shader compiled in a child");
+        assert_eq!(compiled, 6, "each shader compiled in a child");
     }
     assert!(wgpu.iter().any(|&b| b != 0), "the frame drew something");
     let differing = wgpu
@@ -200,6 +262,12 @@ fn a_child_fxc_cannot_survive_fails_that_shader_alone() {
     // One test at a time (`SERIAL`): this one also sets the environment
     // the children read.
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    // DXC compiles in the process: there is no child to lose.
+    drop(GpuRenderer::new(8, 8));
+    if zgx_gpu::app_shaders_compile_with_fxc() != Some(true) {
+        eprintln!("skipped: app shaders are compiled with DXC here, in no child process");
+        return;
+    }
     let salt = std::process::id() % 97;
     zgx_gpu::stop_app_shader_child();
     // SAFETY: read only by the child started below.

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.89"
 name = "zgx-cosmic-text"
-version = "0.19.10"
+version = "0.19.14"
 authors = ["Jeremy Soller <jeremy@system76.com>"]
 build = false
 autolib = false
@@ -142,7 +142,9 @@ version = "0.3.2"
 default-features = false
 
 [dependencies.swash]
-version = "0.2.6"
+version = "0.2.11"
+package = "zgx-swash"
+path = "../swash"
 features = [
     "render",
     "scale",
@@ -171,6 +173,9 @@ version = "0.5.8"
 
 [dependencies.unicode-segmentation]
 version = "1.12.0"
+
+[dependencies.unicode-width]
+version = "0.2.0"
 
 [dev-dependencies.criterion]
 version = "0.8.1"

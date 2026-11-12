@@ -26,14 +26,20 @@ mod focus_groups;
 mod focus_removal;
 #[path = "../focus_visible.rs"]
 mod focus_visible;
+#[path = "../hit_shared_edge.rs"]
+mod hit_shared_edge;
 #[path = "../hit_targets.rs"]
 mod hit_targets;
 #[path = "../hover_nested.rs"]
 mod hover_nested;
+#[path = "../hover_passed.rs"]
+mod hover_passed;
 #[path = "../hover_refresh.rs"]
 mod hover_refresh;
 #[path = "../hover_removal.rs"]
 mod hover_removal;
+#[path = "../hover_scroll.rs"]
+mod hover_scroll;
 #[path = "../hover_subtree.rs"]
 mod hover_subtree;
 #[path = "../key_activation_target.rs"]
@@ -42,5 +48,9 @@ mod key_activation_target;
 mod native_pointer;
 #[path = "../pointer_drag_buttons.rs"]
 mod pointer_drag_buttons;
+#[path = "../pointer_lock.rs"]
+mod pointer_lock;
+#[path = "../switch_keeping_focus.rs"]
+mod switch_keeping_focus;
 #[path = "../zoom.rs"]
 mod zoom;

@@ -208,6 +208,10 @@ pub struct FontSystem {
     /// shaped with, newest last (`FontSystem::first_font`).
     first_font: Vec<FirstFont>,
 
+    /// zgx patch: and of families with no face of their own, newest last
+    /// (`FontSystem::first_fallback`).
+    first_fallback: Vec<FirstFallback>,
+
     /// zgx patch: the faces `query_face` found, by family, weight and style.
     face_queries: Vec<(FamilyOwned, fontdb::Weight, fontdb::Style, Option<fontdb::ID>)>,
 
@@ -217,6 +221,16 @@ pub struct FontSystem {
     /// zgx patch: each face's `wght` axis range (`None`: not variable in
     /// weight), read from its file the first time a match needs it.
     weight_axes: HashMap<fontdb::ID, Option<(f32, f32)>>,
+
+    /// zgx patch: what a fallback search's last stage, every face in turn,
+    /// found for each character it was asked for: the first face holding
+    /// it, or none. That stage loads each face it looks at (some 400 on
+    /// iOS), so it runs once a character; forgotten when the database can
+    /// change (`db_mut`).
+    pub(crate) scanned: HashMap<char, Option<fontdb::ID>>,
+
+    /// zgx patch: how many times that stage has run (`full_scans`).
+    pub(crate) full_scans: u64,
 
     /// Scratch buffer for shaping and laying out.
     pub(crate) shape_buffer: ShapeBuffer,
@@ -258,7 +272,27 @@ struct FirstFont {
     font: Arc<Font>,
 }
 
+/// zgx patch: where a family with no face of its own went in its search: the
+/// fallback it found for runs of `scripts`, and where it stopped
+/// (`FontSystem::first_fallback`).
+#[derive(Debug)]
+struct FirstFallback {
+    attrs: FontMatchAttrs,
+    optical: u16,
+    font: Arc<Font>,
+    scripts: Vec<unicode_script::Script>,
+    /// What Han characters' language was (`ShapeBuffer::han`), with Han among
+    /// `scripts`.
+    han: u32,
+    place: crate::font::fallback::SearchPlace,
+}
+
 impl FontSystem {
+    /// zgx patch: gives back the scratch of shaping, for an app at rest.
+    pub fn rest(&mut self) {
+        self.shape_buffer.rest();
+    }
+
     const FONT_MATCHES_CACHE_SIZE_LIMIT: usize = 256;
     /// Create a new [`FontSystem`], that allows access to any installed system fonts
     ///
@@ -370,7 +404,10 @@ impl FontSystem {
             font_cache: HashMap::default(),
             font_matches_cache: HashMap::default(),
             first_font: Vec::new(),
+            first_fallback: Vec::new(),
             face_queries: Vec::new(),
+            scanned: HashMap::default(),
+            full_scans: 0,
             hyphenator: None,
             weight_axes: HashMap::default(),
             font_codepoint_support_info_cache: HashMap::default(),
@@ -410,6 +447,9 @@ impl FontSystem {
         self.han_by_language = self.language_set
             && ["zh", "ja", "ko"].iter().any(|l| is_language(&self.locale, l));
         self.fallbacks = Fallbacks::new(&*self.dyn_fallback, &[], han_locale(&self.locale));
+        // zgx patch: what a search found went by the lists it replaces.
+        self.first_font.clear();
+        self.first_fallback.clear();
         #[cfg(feature = "shape-run-cache")]
         self.shape_run_cache.clear();
     }
@@ -438,6 +478,11 @@ impl FontSystem {
         Some(hyphenator(word, &self.locale))
     }
 
+    /// zgx: how many fonts are loaded (parsed and kept), for a memory report.
+    pub fn loaded_fonts(&self) -> usize {
+        self.font_cache.values().filter(|font| font.is_some()).count()
+    }
+
     /// Get the database.
     pub const fn db(&self) -> &fontdb::Database {
         &self.db
@@ -447,8 +492,17 @@ impl FontSystem {
     pub fn db_mut(&mut self) -> &mut fontdb::Database {
         self.font_matches_cache.clear();
         self.first_font.clear();
+        self.first_fallback.clear();
         self.face_queries.clear();
+        self.scanned.clear();
         &mut self.db
+    }
+
+    /// zgx patch: how many times a fallback search has looked at every face
+    /// for characters no listed fallback holds; once a character at most
+    /// while the database stays as it is. For tests and counters.
+    pub fn full_scans(&self) -> u64 {
+        self.full_scans
     }
 
     /// zgx patch: the face `db().query` gives for one family at a weight
@@ -598,12 +652,62 @@ impl FontSystem {
         });
     }
 
+    /// zgx patch: for a family with no face of its own, the fallback its
+    /// search found for a run of `scripts`, and where it stopped. That search
+    /// looks at no word's characters, so what it finds goes by these alone.
+    /// Apart from `first_font`, whose hits don't pay for it.
+    pub(crate) fn first_fallback(
+        &self,
+        attrs: &Attrs<'_>,
+        scripts: &[unicode_script::Script],
+    ) -> Option<(Arc<Font>, crate::font::fallback::SearchPlace)> {
+        let han = self.shape_buffer.han;
+        self.first_fallback
+            .iter()
+            .rev()
+            .find(|first| {
+                first.attrs.matches(attrs)
+                    && (first.optical == attrs.optical || !first.font.has_optical())
+                    && first.scripts == scripts
+                    && (first.han == han || !scripts.contains(&unicode_script::Script::Han))
+            })
+            .map(|first| (first.font.clone(), first.place))
+    }
+
+    /// zgx patch: keep what `first_fallback` gives.
+    pub(crate) fn keep_first_fallback(
+        &mut self,
+        attrs: &Attrs<'_>,
+        scripts: &[unicode_script::Script],
+        font: &Arc<Font>,
+        place: crate::font::fallback::SearchPlace,
+    ) {
+        if self.first_fallback.len() == FIRST_FONTS {
+            self.first_fallback.remove(0);
+        }
+        self.first_fallback.push(FirstFallback {
+            attrs: attrs.into(),
+            optical: attrs.optical,
+            font: font.clone(),
+            scripts: scripts.to_vec(),
+            han: self.shape_buffer.han,
+            place,
+        });
+    }
+
+    /// How many runs' first fonts are kept, for tests.
+    #[doc(hidden)]
+    pub fn first_fonts_kept(&self) -> usize {
+        self.first_font.len() + self.first_fallback.len()
+    }
+
     pub fn get_font_matches(&mut self, attrs: &Attrs<'_>) -> Arc<Vec<FontMatchKey>> {
         // Clear the cache first if it reached the size limit
         if self.font_matches_cache.len() >= Self::FONT_MATCHES_CACHE_SIZE_LIMIT {
             log::trace!("clear font mache cache");
             self.font_matches_cache.clear();
             self.first_font.clear();
+            self.first_fallback.clear();
         }
 
         self.font_matches_cache

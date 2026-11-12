@@ -255,6 +255,9 @@ pub struct TestApp {
     pub clock: FrameClock,
     /// Display frames delivered so far.
     pub frame: Cell<u64>,
+    /// The refresh interval its frames report, if not their 60 Hz spacing
+    /// (`report_interval`).
+    reported: Cell<Option<Duration>>,
     /// When it started, the time frames count from.
     pub start: Instant,
     /// Native views (web pages, terminals) the script placed: headless, they
@@ -308,12 +311,42 @@ impl TestApp {
     pub fn try_new(host: impl FnOnce(&Runtime) -> ScriptHost) -> Result<Self, String> {
         Self::try_wrapped(host, |view| view)
     }
+    /// As a window has it, with time its frames leave over: its lists build
+    /// ahead and keep rows (`zgx::spare`), as [`TestApp::spend_spare_time`]
+    /// or the test's own `ui.run_spare_work` lets them. With a clipboard and
+    /// file dialogs too, as [`TestApp::with_desktop`].
+    pub fn with_spare_time(host: impl FnOnce(&Runtime) -> ScriptHost) -> Self {
+        let desktop = Rc::new(FakeDesktop::default());
+        let service = zgx::platform::PlatformService(desktop.clone());
+        let mut app = Self::mounted(host, move |view| provide(service, view), true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        app.desktop = Some(desktop);
+        app
+    }
+    /// All the spare time asked for: what lists have to build ahead is built.
+    pub fn spend_spare_time(&self) {
+        while self.ui.spare_work_wanted() {
+            self.ui
+                .run_spare_work(Instant::now(), std::time::Duration::from_secs(60))
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+    }
     /// [`TestApp::wrapped`], or the script's error when it fails to load.
     pub fn try_wrapped(
         host: impl FnOnce(&Runtime) -> ScriptHost,
         wrap: impl FnOnce(View) -> View,
     ) -> Result<Self, String> {
+        Self::mounted(host, wrap, false)
+    }
+    fn mounted(
+        host: impl FnOnce(&Runtime) -> ScriptHost,
+        wrap: impl FnOnce(View) -> View,
+        spare_time: bool,
+    ) -> Result<Self, String> {
         let mut ui = Ui::new(400., 300.);
+        if spare_time {
+            ui.host_spare_time();
+        }
         // A layout that doesn't settle is the app's error, as a window
         // shows it, its last layout kept: a test sees it (`error`), and
         // goes on.
@@ -348,6 +381,7 @@ impl TestApp {
             executor,
             clock,
             frame: Cell::new(0),
+            reported: Cell::new(None),
             start: Instant::now(),
             natives,
             desktop: None,
@@ -398,6 +432,7 @@ impl TestApp {
             executor: self.executor.clone(),
             clock: self.clock.clone(),
             frame: Cell::new(self.frame.get()),
+            reported: Cell::new(self.reported.get()),
             start: self.start,
             natives,
             desktop: self.desktop.clone(),
@@ -451,9 +486,13 @@ impl TestApp {
         self.clock.deliver(Frame {
             index,
             time: self.start + interval * index as u32,
-            interval,
+            interval: self.reported.get().unwrap_or(interval),
         });
         self.settle();
+        // What the pointer and the keys leave going (an overlay scrollbar
+        // fading, a key repeating), stepped to now as a window steps it:
+        // this thread's time, a test's own clock where it has one.
+        let _ = self.ui.advance_interactions(zgx::clock::now());
         self.lay_out();
         // The frame is done, as a renderer's present ends one.
         zgx::profile::frame();
@@ -479,6 +518,18 @@ impl TestApp {
     /// two frames.
     fn run_timers(&self, to: Duration) {
         self.host.0.timers.run_test_timers(to, || self.settle());
+    }
+    /// Have frames report `interval` as the display's refresh, while still
+    /// coming 1/60 s apart: a display that says one rate and draws another.
+    pub fn report_interval(&self, interval: Duration) {
+        self.reported.set(Some(interval));
+    }
+    /// Let `n` frames' time pass with none delivered, as a late frame or a
+    /// hidden window does: the next frame comes that much later.
+    pub fn skip_frames(&self, n: u64) {
+        let interval = Duration::from_secs_f64(1. / 60.);
+        self.frame.set(self.frame.get() + n);
+        self.run_timers(self.host.0.timers.test_now() + interval * n as u32);
     }
     /// `n` frames: an animation's worth.
     pub fn frames(&self, n: usize) {

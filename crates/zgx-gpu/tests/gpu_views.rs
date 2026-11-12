@@ -308,3 +308,293 @@ fn a_view_drawn_by_a_renderer_on_another_device_hears_its_device_changed() {
     draw(&mut b);
     assert_eq!(*devices.borrow(), 1, "once, on the second device");
 }
+
+/// Four pictures of 14.4 MB and a view of 10.2 MB, in a window showing them
+/// whole: past the 64 MiB they share, until one of the pictures gives way.
+struct Budgeted {
+    ui: Ui,
+    gpu: GpuRenderer,
+    pictures: [Signal<bool>; 4],
+    view: Signal<bool>,
+}
+impl Budgeted {
+    const WINDOW: u32 = 3900;
+    fn new(view_first: bool) -> Option<Self> {
+        Self::with_view(view_first, 1600.)
+    }
+    fn with_view(view_first: bool, side: f32) -> Option<Self> {
+        let gpu = GpuRenderer::new(Self::WINDOW, Self::WINDOW).ok()?;
+        let view = zgx_gpu::viewport::view(Fill {
+            color: Rc::new(RefCell::new(RED)),
+            drawn: Rc::default(),
+            devices: Rc::default(),
+        });
+        let mut ui = Ui::new(Self::WINDOW as f32, Self::WINDOW as f32);
+        let pictures = [0, 1, 2, 3].map(|_| ui.signal(false));
+        let shown = ui.signal(false);
+        let viewed = {
+            let shown = shown.clone();
+            switch(
+                move || shown.get(),
+                move |on, _| match on {
+                    true => gpu_view("Model", &view).size(side, side).absolute(),
+                    false => div(),
+                },
+            )
+        };
+        let mut viewed = Some(viewed);
+        let mut root = div().size(Self::WINDOW as f32, Self::WINDOW as f32);
+        if view_first {
+            root = root.child(viewed.take().expect("once"));
+        }
+        // Side by side: one covered by another isn't drawn.
+        for (i, on) in pictures.iter().enumerate() {
+            let on = on.clone();
+            let (x, y) = ((i % 2) as f32 * 1950., (i / 2) as f32 * 1950.);
+            let pixels = vec![200; 1900 * 1900 * 4];
+            let picture = std::sync::Arc::new(
+                zgx::image::ImageData::new(1900, 1900, pixels).expect("a picture"),
+            );
+            root = root.child(switch(
+                move || on.get(),
+                move |on, _| match on {
+                    true => image("Picture", picture.clone())
+                        .size(1900., 1900.)
+                        .absolute()
+                        .left(x)
+                        .top(y),
+                    false => div(),
+                },
+            ));
+        }
+        // After the pictures: they're drawn this frame by the time it draws.
+        if let Some(viewed) = viewed {
+            root = root.child(viewed);
+        }
+        ui.mount(root);
+        Some(Self {
+            ui,
+            gpu,
+            pictures,
+            view: shown,
+        })
+    }
+    /// Which pictures show, read off the window where the view doesn't cover
+    /// them.
+    fn showing(&mut self) -> [bool; 4] {
+        let pixels = self.gpu.readback().unwrap();
+        let window = Self::WINDOW as usize;
+        [(1800, 100), (2100, 100), (100, 2100), (3800, 3800)]
+            .map(|(x, y)| pixels[(y * window + x) * 4 + 3] == 200)
+    }
+    /// A whole frame: what it uploaded, or why it failed.
+    fn frame(&mut self) -> Result<usize, String> {
+        self.ui.prepare_frame();
+        let _ = self.ui.scene.borrow_mut().flush();
+        let all = zgx::scene::Rect::new(0., 0., Self::WINDOW as f32, Self::WINDOW as f32);
+        (self.gpu.render(&self.ui.scene.borrow(), &[all]))
+            .map(|stats| stats.image_uploads)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[test]
+fn pictures_nothing_shows_give_way_to_a_view_least_recently_drawn_first() {
+    let Some(mut w) = Budgeted::new(false) else {
+        return;
+    };
+    for on in &w.pictures {
+        on.set(true);
+    }
+    assert_eq!(w.frame(), Ok(4));
+    assert_eq!(w.showing(), [true; 4]);
+    // No longer shown: the first a frame before the second.
+    w.pictures[0].set(false);
+    w.frame().unwrap();
+    w.pictures[1].set(false);
+    w.frame().unwrap();
+    // The view fits once one has gone, and the two still shown keep theirs.
+    w.view.set(true);
+    // (The view is the one upload.)
+    assert_eq!(w.frame(), Ok(1), "the view found no room");
+    assert_eq!(w.showing(), [false, false, true, true]);
+    // The second is still there: shown again, nothing uploads.
+    w.pictures[1].set(true);
+    assert_eq!(w.frame(), Ok(0), "gave back more than it needed");
+    assert_eq!(w.showing(), [false, true, true, true]);
+    // The first, least recently drawn, gave its texture back: it uploads.
+    w.view.set(false);
+    w.frame().unwrap();
+    w.pictures[0].set(true);
+    assert_eq!(w.frame(), Ok(1), "the first kept its texture");
+    assert_eq!(w.showing(), [true; 4]);
+}
+
+/// A picture still in the scene but off the window gives way too.
+#[test]
+fn a_picture_off_the_window_gives_way_to_a_view() {
+    let Some(mut w) = Budgeted::new(false) else {
+        return;
+    };
+    for on in &w.pictures {
+        on.set(true);
+    }
+    assert_eq!(w.frame(), Ok(4));
+    let first = {
+        let scene = w.ui.scene.borrow();
+        let root = scene.root();
+        let mut node = root;
+        while scene.children(node).len() < 4 {
+            node = scene.children(node)[0];
+        }
+        scene.children(node)[0]
+    };
+    let away = zgx::scene::Transform { x: 0., y: 5000. };
+    w.ui.scene.borrow_mut().set_transform(first, away);
+    w.frame().unwrap();
+    w.view.set(true);
+    // (The view is the one upload.)
+    assert_eq!(w.frame(), Ok(1), "the view found no room");
+    assert_eq!(w.showing(), [false, true, true, true]);
+    assert_eq!(w.gpu.debug_cache_stats().images_softer, 0);
+}
+
+/// As a film's wallpaper does: pictures showing hold nearly all their budget,
+/// and a view shows beside them, costing its own texture. Whichever paints
+/// first, nothing on screen goes softer or blank for it, and when the view
+/// goes, so does what it held.
+#[test]
+fn a_view_shows_beside_pictures_holding_their_whole_budget() {
+    for view_first in [false, true] {
+        let Some(mut w) = Budgeted::new(view_first) else {
+            return;
+        };
+        for on in &w.pictures {
+            on.set(true);
+        }
+        assert_eq!(w.frame(), Ok(4));
+        let pictures = w.gpu.debug_cache_stats().image_bytes;
+        // Four of 14.4 MB: past 64 MiB with the 10.2 MB view.
+        assert_eq!(pictures, 4 * 1900 * 1900 * 4);
+        w.view.set(true);
+        assert_eq!(w.frame(), Ok(1), "the view failed");
+        assert_eq!(w.showing(), [true; 4], "a picture on screen went blank");
+        // The view itself, red, where it lies: under a translucent picture
+        // when it paints first.
+        let at = (800 * Budgeted::WINDOW as usize + 800) * 4;
+        let pixels = w.gpu.readback().unwrap();
+        assert!(
+            pixels[at] > pixels[at + 1],
+            "the view doesn't show: {:?}",
+            &pixels[at..at + 4]
+        );
+        let cache = w.gpu.debug_cache_stats();
+        assert_eq!(cache.images_softer, 0, "a picture went softer for the view");
+        assert_eq!(cache.image_bytes, pictures + 1600 * 1600 * 4);
+        // Gone, it takes its texture with it, and the pictures stay.
+        w.view.set(false);
+        assert_eq!(w.frame(), Ok(0), "a picture lost its texture");
+        assert_eq!(w.showing(), [true; 4]);
+        assert_eq!(w.gpu.debug_cache_stats().image_bytes, pictures);
+    }
+}
+
+/// A view over its own budget still fails, saying what holds it, and what
+/// shows is left alone.
+#[test]
+fn a_view_over_its_own_budget_fails_and_says_so() {
+    let Some(mut w) = Budgeted::with_view(false, 4200.) else {
+        return;
+    };
+    for on in &w.pictures {
+        on.set(true);
+    }
+    assert_eq!(w.frame(), Ok(4));
+    w.view.set(true);
+    let error = w.frame().expect_err("past its budget");
+    assert!(
+        error.contains("view textures exceed their budget"),
+        "{error}"
+    );
+    assert!(error.contains("70560000 bytes"), "{error}");
+    w.view.set(false);
+    assert_eq!(w.frame(), Ok(0), "a picture lost its texture");
+    assert_eq!(w.showing(), [true; 4]);
+}
+
+/// Notes each frame's time.
+struct Timed(Rc<RefCell<Vec<std::time::Instant>>>);
+impl Viewport for Timed {
+    fn render(&mut self, frame: &mut ViewportFrame<'_>) {
+        self.0.borrow_mut().push(frame.time);
+    }
+}
+
+#[test]
+fn a_view_s_frames_are_on_the_interface_s_time() {
+    // Frames 1/60 s apart on a virtual clock, however long each takes to
+    // draw: the view's frames say the same times each run.
+    let run = || -> Option<Vec<std::time::Duration>> {
+        let clock = zgx::clock::VirtualClock::new();
+        let mut gpu = GpuRenderer::new(100, 100).ok()?;
+        let times = Rc::new(RefCell::new(Vec::new()));
+        let view = zgx_gpu::viewport::view(Timed(Rc::clone(&times)));
+        let mut ui = Ui::new(100., 100.);
+        ui.mount(
+            div()
+                .size(100., 100.)
+                .child(gpu_view("Timed", &view).size(50., 50.)),
+        );
+        for frame in 0..5u32 {
+            clock.advance(std::time::Duration::from_secs(1) * frame / 60, || {});
+            view.invalidate();
+            ui.prepare_frame();
+            let report = ui.scene.borrow_mut().flush();
+            gpu.render(&ui.scene.borrow(), &report.damage).unwrap();
+            // Drawing takes time on the wall clock, none on the interface's.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        let start = clock.start();
+        let times = times.borrow().iter().map(|t| *t - start).collect();
+        Some(times)
+    };
+    let (Some(first), Some(second)) = (run(), run()) else {
+        return;
+    };
+    let expected: Vec<_> = (0..5u32)
+        .map(|frame| std::time::Duration::from_secs(1) * frame / 60)
+        .collect();
+    assert_eq!(first, expected);
+    assert_eq!(second, first);
+}
+
+#[test]
+fn a_view_in_two_boxes_is_drawn_at_one_time_a_frame() {
+    // Shown twice in a window, a view is drawn twice a frame: both at the
+    // frame's one instant (on the wall clock, which moves between them), so
+    // what steps once a frame time steps once.
+    let Ok(mut gpu) = GpuRenderer::new(100, 100) else {
+        return;
+    };
+    let times = Rc::new(RefCell::new(Vec::new()));
+    let view = zgx_gpu::viewport::view(Timed(Rc::clone(&times)));
+    let mut ui = Ui::new(100., 100.);
+    ui.mount(
+        div()
+            .size(100., 100.)
+            .child(gpu_view("One", &view).size(40., 40.))
+            .child(gpu_view("Two", &view).size(30., 30.)),
+    );
+    for _ in 0..2 {
+        view.invalidate();
+        ui.prepare_frame();
+        let report = ui.scene.borrow_mut().flush();
+        gpu.render(&ui.scene.borrow(), &report.damage).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let times = times.borrow();
+    assert_eq!(times.len(), 4, "two boxes, two frames");
+    assert_eq!(times[0], times[1], "one frame, one time");
+    assert_eq!(times[2], times[3]);
+    assert!(times[2] > times[1], "a later frame, a later time");
+}

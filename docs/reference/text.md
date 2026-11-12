@@ -42,7 +42,7 @@ Any [property](properties.md); these are the text ones (they also set the defaul
 | `align` | `"start" \| "left" \| "center" \| "right"` | `"start"` | within the text's own box |
 | `wrap` | `boolean \| "balance"` | `false` | wrap at the box's width; `"balance"` balances the lines, as CSS's `text-wrap: balance` (see [properties](properties.md)) |
 | `lines` | `number` | none | at most this many lines |
-| `truncate` | `boolean` | `false` | end an overflowing line with "…" |
+| `truncate` | `boolean` | `false` | end the text with "…" where it overflows: on one line, or on the last of `lines` when that is set, here or on a parent |
 | `line_height` | `number` | the font's | points |
 | `letter_spacing` | `number` | `0` | points |
 | `tabular` | `boolean` | `false` | tabular figures (OpenType `tnum`): every digit one width, for numbers that change in place |
@@ -77,6 +77,7 @@ Any [property](properties.md); these are the text ones (they also set the defaul
 | `underline_style` | `"solid"`, `"double"`, `"dotted"`, `"dashed"`, `"wavy"` | `"solid"` | how the underline is drawn (CSS's `text-decoration-style`): `"wavy"` marks a spelling mistake or a diagnostic. The software raster draws them all solid |
 | `underline_color` | `Color` | the text's | its colour, or a token (`"$danger"`) |
 | `underline_thickness` | `number` | `1` | its thickness, in points. Any of these three underlines the span |
+| `fade_in` | `{ start: number, ms: number, power: number? }` | none | its text fading in, colour only: clear at `start` (milliseconds, as `ui.now()` says) to its colour `ms` later, its alpha easing out as `1 - (1 - t)^power` (`power` 2). The paragraph draws it in Rust a frame at a time while it fades, recolouring its glyphs: no script runs for it and nothing lays out again. A streamed reply's new words, each chunk a span with the time it came |
 | `on_click` | `ClickHandler \| Handler \| Action` | none | a click on the run (a link, underlined), told the keys held (`{ shift, ctrl, alt, meta }`); a middle click passes as a ⌘-click (Control elsewhere), as a browser opens a background tab. Returning `true` handled it, as `on_key`'s does: its `href` doesn't open (an app opening its links in a pane of its own, or asking first) |
 | `href` | `string` | none | where the run links (`"https://…"`): a link, underlined, with the pointing hand; a click (after `on_click`'s) opens it with the system's handler if it is a web or mail link (`http:`, `https:`, `mailto:`; other schemes don't open), and its context menu has Open Link (those only) and Copy Link |
 | `hover` | `{ underline: boolean?, color: Color? }` | none | a link's look under the pointer (CSS's `a:hover`); with it, the link isn't underlined at rest unless `underline` says so |
@@ -156,9 +157,10 @@ To draw blocks your own way, take them from `ui.markdown`:
 
 ```luau
 ui.markdown(text: string, opts: MarkdownOptions?) -> { MarkdownBlock }
+ui.markdown(text: State<string>, opts: MarkdownOptions?) -> ReadOnlyState<{ MarkdownBlock }>
 ```
 
-`ui.markdown` parses markdown (CommonMark with tables, strikethrough and task lists; raw HTML dropped) into blocks for a script to draw its own way. A block has `t`: `p` (`s`: runs), `h` (`l`: level, `s`), `code` (`lang`, `text`), `ul` and `ol` (`start`, `items`: each item a list of blocks), `quote` (`b`: blocks), `hr`, `table` (`head`: cells, `rows`: rows of cells, a cell being runs) and `img` (`src`, `alt`). A picture on a line of its own (only blanks beside it) is an `img` block, splitting its paragraph there: the words before it a `p`, the picture, the words after it another, and no empty `p` where it took a paragraph's place. Among words it is a run with `img` (its source) and `x` its alt text. A tight list item's text is a `p` with `tight`. Quotes and lists nest 64 levels at most (a list level counts two); deeper ones show as the deepest level's blocks. A run is `{ x = text, b?, i?, c? (code), s? (strike), a? (link), f? (a file), img? (a picture's source) }`. The types say so: a `MarkdownBlock` is a union by `t`, so `if b.t == "code" then … b.lang … end` is checked, and a run is a `MarkdownRun`.
+`ui.markdown` parses markdown (CommonMark with tables, strikethrough and task lists; raw HTML dropped) into blocks for a script to draw its own way. A block has `t`: `p` (`s`: runs), `h` (`l`: level, `s`), `code` (`lang`, `text`), `ul` and `ol` (`start`, `items`: each item a list of blocks), `quote` (`b`: blocks), `hr`, `table` (`head`: cells, `rows`: rows of cells, a cell being runs; `align`, only when the source aligns a column: each column's `"start"`, `"center"`, `"end"` or `""`) and `img` (`src`, `alt`). A picture on a line of its own (only blanks beside it) is an `img` block, splitting its paragraph there: the words before it a `p`, the picture, the words after it another, and no empty `p` where it took a paragraph's place. Among words it is a run with `img` (its source) and `x` its alt text. A tight list item's text is a `p` with `tight`. Quotes and lists nest 64 levels at most (a list level counts two); deeper ones show as the deepest level's blocks. A run is `{ x = text, b?, i?, c? (code), s? (strike), a? (link), f? (a file), img? (a picture's source) }`. The types say so: a `MarkdownBlock` is a union by `t`, so `if b.t == "code" then … b.lang … end` is checked, and a run is a `MarkdownRun`.
 
 | Option | Type | Default | |
 |---|---|---|---|
@@ -167,6 +169,8 @@ ui.markdown(text: string, opts: MarkdownOptions?) -> { MarkdownBlock }
 | `paths` | `boolean` | `false` | repository paths (`src/main.rs:12`), code spans that are a path whole and relative links that read as one are files: runs with `f` |
 | `lazy` | `boolean` \| `number` | `false` | with `key`: a text of 4 KB or more (`true`; a number sets the bytes) that lands whole, not by appends (a long reply opened at once), comes back at once with one entry a block, and is parsed over the next frames, the end first, so no frame parses all of it. A block not parsed yet is `{ t = "pending", hint, lines, from, to }`: what it is by its first line (`"p"`, `"h"`, `"code"`, `"list"`, `"quote"`, `"table"`, `"hr"`), its lines, and its bytes in the text as `string.sub` takes them, for holding its place (a windowed transcript's boxes) and finding text in it. A block keeps its index from the first answer, and one parsed stays the same table. A computed around the call runs again as blocks come in (the end's, a block asked for with `first`, all). Appends to it parse as ever; shorter texts, and text with link reference definitions, parse at once |
 | `first` | `number` | none | with `lazy`: parse block `first` (from 1) before the other pending ones (a search found something in it) |
+
+Given the state holding the text rather than the text (`local blocks = ui.markdown(reply, { key = "reply" })`), it answers a read-only state of the blocks, kept current as the text changes: draw it with `ui.each(blocks, …)` and read it with `blocks:get()`, with no `ui.computed` around it. That is how a streaming reply costs what each chunk adds: its appends (`reply:append(token)`) reach the parser as they are, the text never becomes a script string, no script table is made for each answer, and `ui.each` looks at the blocks after those it already has. A computed around it would make that state again each time it runs (`zgx lint` says so). Given a string (`reply:get()` in a computed), it answers the blocks as a table, as ever.
 
 Without a `key`, the same text gives the same blocks. Rust hosts parse with `zgx_script::markdown::parse` and stream with `zgx_script::markdown::Incremental`, which take a code block hook too (coloured lines, say).
 
@@ -181,9 +185,8 @@ local function runs(list: { MarkdownRun }): Node
 	return ui.rich(props)
 end
 
-local blocks = ui.computed(function()
-	return ui.markdown(reply:get(), { key = "reply" })
-end)
+-- A state of the blocks, kept current as the reply grows.
+local blocks = ui.markdown(reply, { key = "reply" })
 
 return ui.column {
 	gap = 8,
@@ -251,7 +254,7 @@ return ui.column {
 
 - Text from data is a template too: a commit message with `{id}` in it looks for state named `id` (an error if there is none), and `{{` shows as `{`. Pass `literal = true` (on `ui.text`, `ui.rich` or a span) for text the script didn't write.
 - A template names state by its key, not by its Luau variable: `"{count}"` shows `ui.state("count", …)` whatever the local is called (a component's `ui.use_state` has no key: give `ui.text` the state itself, `ui.text { count }`), and `"{state.count}"` is state `state`'s field `count`, not a module's state. A name no state has is an error when the text is built.
-- Text does not wrap by default, and a row shrinks it no narrower than it is (its min-content, unwrapped): `wrap = true` (in a box with a width) lets it wrap down to its longest word, or `min_w = 0, truncate = true` ends it with "…" in a row.
+- Text does not wrap by default, and a row shrinks it no narrower than it is (its min-content, unwrapped): `wrap = true` (in a box with a width) lets it wrap down to its longest word, or `truncate = true` lets it shrink past that, ending it with "…", when the text is itself the row's child (a box around it still needs its width: give the box `min_w = 0`). `truncate` on a box is inherited by the text inside, which shrinks the same way in rows of its own.
 - A span's `color`, `bg`, `text_size`, `weight`, `bold`, `italic`, `underline`, `strike` and `font` follow a state or a function, and its text does. Its other options are plain values, read once.
 - A span is used once: putting the same `ui.span` in two paragraphs is an error. Make a new one each time.
 - `ui.text` and `ui.rich` take no children; extra array entries in `ui.text` are an error.

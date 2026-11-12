@@ -157,3 +157,189 @@ fn native_surface_component_retains_nodes_fits_padding_and_releases_bindings() {
     source.set(frame(false));
     assert!(!ui.scene.borrow().contains(image));
 }
+unsafe extern "C" {
+    fn CVPixelBufferGetIOSurface(buffer: *const std::ffi::c_void) -> *const std::ffi::c_void;
+}
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    fn IOSurfaceGetID(surface: *const std::ffi::c_void) -> u32;
+    fn IOSurfaceLookup(id: u32) -> *const std::ffi::c_void;
+}
+/// Whether the IOSurface `id` still exists.
+fn surface_exists(id: u32) -> bool {
+    unsafe extern "C" {
+        fn CFRelease(object: *const std::ffi::c_void);
+    }
+    // SAFETY: Lookup returns a +1 reference or null.
+    unsafe {
+        let surface = IOSurfaceLookup(id);
+        if !surface.is_null() {
+            CFRelease(surface);
+        }
+        !surface.is_null()
+    }
+}
+/// A window may go idle on the frame that removed a surface: no frame comes
+/// after to let CoreVideo's cache of it go, so going idle does. (A video
+/// player's last picture otherwise stayed for the window's life.)
+#[test]
+fn a_surface_gone_from_the_scene_is_let_go_as_the_window_rests() {
+    let frame = frame(false);
+    // SAFETY: The buffer is IOSurface-backed; its surface lives as long.
+    let id = unsafe {
+        IOSurfaceGetID(CVPixelBufferGetIOSurface(
+            std::ptr::from_ref(frame.pixel_buffer()).cast(),
+        ))
+    };
+    let mut scene = Scene::new(32., 32.);
+    let node = scene.append(
+        scene.root(),
+        NodeKind::NativeSurface(frame),
+        Style {
+            width: Some(32.),
+            height: Some(32.),
+            ..Default::default()
+        },
+    );
+    let mut gpu = GpuRenderer::new(32, 32).unwrap();
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    // Shown, resting keeps it: the window may draw it again.
+    gpu.trim();
+    assert!(surface_exists(id), "let go of a surface still shown");
+    scene.remove(node);
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    // As a window rests, a while after its last frame: CoreVideo's cache
+    // keeps a texture a second, whatever a flush asks.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    gpu.trim();
+    assert!(
+        !surface_exists(id),
+        "a window at rest kept a surface no node shows"
+    );
+}
+/// A window that shows only surfaces (a video player, nothing else drawn as
+/// a picture) lets go of each it no longer shows as it draws on, not only
+/// once it rests: playing, it shows a new one every frame.
+#[test]
+fn a_surface_replaced_is_let_go_while_the_window_draws_on() {
+    let id_of = |frame: &NativeSurface| unsafe {
+        // SAFETY: The buffer is IOSurface-backed; its surface lives as long.
+        IOSurfaceGetID(CVPixelBufferGetIOSurface(
+            std::ptr::from_ref(frame.pixel_buffer()).cast(),
+        ))
+    };
+    let first = frame(false);
+    let id = id_of(&first);
+    let mut scene = Scene::new(32., 32.);
+    let style = Style {
+        width: Some(32.),
+        height: Some(32.),
+        ..Default::default()
+    };
+    let node = scene.append(scene.root(), NodeKind::NativeSurface(first), style);
+    let mut gpu = GpuRenderer::new(32, 32).unwrap();
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    scene.set_kind(node, NodeKind::NativeSurface(frame(false)));
+    // Frames on, a while past CoreVideo's second, and no rest between.
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < until {
+        scene.flush();
+        gpu.render(&scene, &[Rect::new(0., 0., 32., 32.)]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    assert!(
+        !surface_exists(id),
+        "a window drawing on kept a surface no node shows"
+    );
+    // It polled and flushed to let go of it, and stops a second and a half
+    // after: a window drawing the same surfaces does nothing more.
+    let draw_for = |gpu: &mut GpuRenderer, scene: &mut Scene, millis| {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+        while std::time::Instant::now() < until {
+            scene.flush();
+            gpu.render(scene, &[Rect::new(0., 0., 32., 32.)]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let collected = gpu.debug_cache_stats().surface_collections;
+    assert!(collected > 0, "it let go of a surface without collecting");
+    draw_for(&mut gpu, &mut scene, 600);
+    let stopped = gpu.debug_cache_stats().surface_collections;
+    draw_for(&mut gpu, &mut scene, 500);
+    assert_eq!(
+        gpu.debug_cache_stats().surface_collections,
+        stopped,
+        "it went on collecting past a second and a half"
+    );
+}
+
+/// A readback's pixel buffers go back at rest, but for the one still held.
+/// CoreVideo's texture cache keeps a texture of each buffer the pool still
+/// has, and the buffer with it: flushed before the pool (each frame), it
+/// keeps them, so a paused video player held two (7 MB at 1280 by 720) for
+/// as long as it was paused. Read as this process's IOSurface memory: one
+/// given back can still be looked up for a while, and the footprint as a
+/// whole moves by more with the allocator's own returns.
+#[test]
+fn a_readbacks_buffers_go_back_at_rest_but_the_one_held() {
+    unsafe extern "C" {
+        fn getpid() -> i32;
+    }
+    let surfaces = || {
+        let out = std::process::Command::new("footprint")
+            // SAFETY: getpid has no preconditions.
+            .args(["-p", &unsafe { getpid() }.to_string()])
+            .output()
+            .expect("footprint");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let line = text
+            .lines()
+            .find(|line| line.trim_end().ends_with(" IOSurface"))
+            .unwrap_or_else(|| panic!("no IOSurface line in {text}"));
+        let mut words = line.split_whitespace();
+        let (number, unit) = (words.next().unwrap(), words.next().unwrap());
+        let scale = match unit {
+            "B" => 1.,
+            "KB" => 1024.,
+            "MB" => 1024. * 1024.,
+            "GB" => 1024. * 1024. * 1024.,
+            _ => panic!("{line}"),
+        };
+        (number.parse::<f64>().unwrap() * scale) as i64
+    };
+    let (width, height) = (1280u32, 720u32);
+    let frame_bytes = (width * height * 4) as i64;
+    let whole = [Rect::new(0., 0., width as f32, height as f32)];
+    let mut scene = Scene::new(width as f32, height as f32);
+    scene.flush();
+    let mut gpu = GpuRenderer::new(width, height).unwrap();
+    let mut staging = zgx_gpu::SurfaceReadback::default();
+    // Frames drawn as a window shows them: each held until the next is.
+    let mut held: std::collections::VecDeque<zgx_gpu::PixelBuffer> = Default::default();
+    for _ in 0..6 {
+        gpu.render(&scene, &whole).unwrap();
+        held.push_back(gpu.readback_surface(&mut staging).unwrap());
+        if held.len() > 2 {
+            held.pop_front();
+        }
+    }
+    // Paused: the last one shown still held, the rest given up.
+    let shown = held.pop_back().unwrap();
+    drop(held);
+    // At rest (a player's comes 5 s after its last frame).
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let before = surfaces();
+    assert!(before >= 2 * frame_bytes, "{before} bytes of surfaces held");
+    staging.release_unused();
+    let after = surfaces();
+    assert!(
+        after < 2 * frame_bytes,
+        "{after} bytes of surfaces held at rest (from {before}), a frame being {frame_bytes}"
+    );
+    drop(shown);
+}

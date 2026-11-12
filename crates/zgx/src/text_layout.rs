@@ -67,21 +67,62 @@ impl LineHeight {
 /// shaper; the fallback uses grapheme cells. Nonfinite values and signed zero
 /// normalize to zero; finite values saturate at ±1,000,000 logical pixels to
 /// keep native geometry practical and typography cache keys consistent.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+///
+/// Or a grid of cells (`cells`, a terminal's): each character takes its
+/// cells exactly, whichever font draws it. The grid is kept in the same bits,
+/// as a negative subnormal (which `px` never makes: it flushes them to zero),
+/// so a font style is no bigger, and hashes and compares no slower, for it;
+/// read as tracking (`pixels`), a grid is less than 1e-38 of a pixel, which
+/// adds nothing to any width, so no reader needs to tell it apart.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct LetterSpacing(u32);
+impl std::fmt::Debug for LetterSpacing {
+    /// Decoded: `cells(7.83)` for a grid, `px(2)` for tracking (never a
+    /// NaN or the raw bits).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.cell() {
+            Some(cell) => write!(f, "LetterSpacing::cells({cell})"),
+            None => write!(f, "LetterSpacing::px({})", self.pixels()),
+        }
+    }
+}
+/// A grid's bits: a negative subnormal, its mantissa the cell width in
+/// 1/1024 logical pixels.
+const GRID: u32 = 0x8000_0000;
+const GRID_UNITS: u32 = 0x007f_ffff;
 impl LetterSpacing {
+    /// A grid of cells `width` logical pixels wide (up to 8,192; none at
+    /// zero or below): each cluster takes its characters' cells (their
+    /// widths, as unicode-width tells them), its glyphs centred in them, so a
+    /// fallback font's glyph a little wider or narrower than the grid's (a
+    /// braille pattern) moves nothing after it. No tracking.
+    pub fn cells(width: f32) -> Self {
+        let units = (width * 1024.).round();
+        if units.is_nan() || units < 1. {
+            return Self::ZERO;
+        }
+        Self(GRID | (units.min(GRID_UNITS as f32) as u32))
+    }
+    /// The grid's cell width in logical pixels, if it is one.
+    pub fn cell(self) -> Option<f32> {
+        (self.0 & !GRID_UNITS == GRID && self.0 & GRID_UNITS != 0)
+            .then(|| (self.0 & GRID_UNITS) as f32 / 1024.)
+    }
     /// No extra spacing.
     pub const ZERO: Self = Self(0);
     /// `value` logical pixels between characters, normalized as the type
     /// says.
     pub fn px(value: f32) -> Self {
-        if value.is_finite() && value != 0. {
+        // (A subnormal, less than 1e-38 of a pixel, is none: its bits are a
+        // grid's.)
+        if value.is_finite() && value.abs() >= f32::MIN_POSITIVE {
             Self(value.clamp(-1_000_000., 1_000_000.).to_bits())
         } else {
             Self::ZERO
         }
     }
-    /// The spacing in logical pixels.
+    /// The tracking in logical pixels (a grid's reads as less than 1e-38,
+    /// none to any width).
     pub fn pixels(self) -> f32 {
         f32::from_bits(self.0)
     }
@@ -140,6 +181,16 @@ impl FontFeatures {
     /// The settings `features` gives, each a four-byte tag and a value (`1`
     /// on, `0` off); a later tag replaces an earlier one.
     pub fn new(features: impl IntoIterator<Item = ([u8; 4], u32)>) -> Self {
+        // Where a box's tags are its own: a script's `font_features` can
+        // name any four bytes, and they make no box on text.
+        Self::settled(
+            features
+                .into_iter()
+                .filter(|(tag, _)| !Self::BOX_TAGS.contains(tag)),
+        )
+    }
+    /// `new`, keeping an inline box's tags: these remade from what they were.
+    fn settled(features: impl IntoIterator<Item = ([u8; 4], u32)>) -> Self {
         let mut canonical = std::collections::BTreeMap::new();
         for (tag, value) in features {
             canonical.insert(tag, value);
@@ -176,7 +227,7 @@ impl FontFeatures {
         }
         let others = self.settings().iter().copied();
         let others = others.filter(|(tag, _)| *tag != Self::HYPHENS);
-        Self::new(others.chain(hyphens.then_some((Self::HYPHENS, 1))))
+        Self::settled(others.chain(hyphens.then_some((Self::HYPHENS, 1))))
     }
     /// zgx's own tag for the language a text's Han characters are in
     /// (`_han`, never given to a font, as `HYPHENS`): its `lang`'s
@@ -199,7 +250,7 @@ impl FontFeatures {
         }
         let others = self.settings().iter().copied();
         let others = others.filter(|(tag, _)| *tag != Self::HAN);
-        Self::new(others.chain((han != 0).then_some((Self::HAN, han))))
+        Self::settled(others.chain((han != 0).then_some((Self::HAN, han))))
     }
     /// zgx's mark on a style's features that say only a language
     /// (`Styled::lang`): they go over the inherited ones (`layered`), not
@@ -247,7 +298,7 @@ impl FontFeatures {
         let others = self.settings().iter().copied();
         let others = others.filter(|(tag, _)| *tag != Self::HAN && *tag != Self::INHERITED);
         let marks = (han != 0).then_some([(Self::HAN, han), (Self::INHERITED, 1)]);
-        Self::new(others.chain(marks.into_iter().flatten()))
+        Self::settled(others.chain(marks.into_iter().flatten()))
     }
     /// These as a text's resolved features (`Scene::set_font`): without the
     /// mark a style's language alone carries (`INHERITS`).
@@ -256,7 +307,7 @@ impl FontFeatures {
             return self.clone();
         }
         let others = self.settings().iter().copied();
-        Self::new(others.filter(|(tag, _)| *tag != Self::INHERITS))
+        Self::settled(others.filter(|(tag, _)| *tag != Self::INHERITS))
     }
     /// What a text in `language` (a BCP 47 tag: "ja", "zh-Hant-TW") says of
     /// its Han characters (`HAN`): which Chinese, Japanese or Korean, or
@@ -293,6 +344,87 @@ impl FontFeatures {
             traditional |= is(part, "hant");
         }
         if traditional { 5 } else { 4 }
+    }
+    /// zgx's own tags for an inline box (`RichText::with_inline_boxes`, never
+    /// given to a font, as `HYPHENS`): the run these are the features of is
+    /// that box's character, never shaped. Its width, height and baseline as
+    /// a float's bits, and how it sits (`InlineAlign`: which, and how far
+    /// raised). Text without boxes holds none of this, and pays nothing.
+    const BOX_WIDTH: [u8; 4] = *b"_ibw";
+    const BOX_HEIGHT: [u8; 4] = *b"_ibh";
+    const BOX_BASELINE: [u8; 4] = *b"_ibb";
+    const BOX_ALIGN: [u8; 4] = *b"_iba";
+    const BOX_RAISE: [u8; 4] = *b"_ibr";
+    const BOX_TAGS: [[u8; 4]; 5] = [
+        Self::BOX_WIDTH,
+        Self::BOX_HEIGHT,
+        Self::BOX_BASELINE,
+        Self::BOX_ALIGN,
+        Self::BOX_RAISE,
+    ];
+    /// Whether these are an inline box's (`BOX_WIDTH`).
+    pub fn is_inline_box(&self) -> bool {
+        self.settings()
+            .iter()
+            .any(|(tag, _)| *tag == Self::BOX_WIDTH)
+    }
+    /// The inline box these say, its character at `at`.
+    #[inline(never)]
+    pub(crate) fn inline_box(&self, at: usize) -> Option<crate::rich_text::InlineBox> {
+        use crate::rich_text::{InlineAlign as A, InlineBox};
+        if !self.is_inline_box() {
+            return None;
+        }
+        let read = |wanted: [u8; 4]| {
+            self.settings()
+                .iter()
+                .find(|(tag, _)| *tag == wanted)
+                .map_or(0, |(_, value)| *value)
+        };
+        let float = |wanted| f32::from_bits(read(wanted));
+        Some(InlineBox {
+            at,
+            width: float(Self::BOX_WIDTH),
+            height: float(Self::BOX_HEIGHT),
+            baseline: float(Self::BOX_BASELINE),
+            align: match read(Self::BOX_ALIGN) {
+                1 => A::Middle,
+                2 => A::TextTop,
+                3 => A::TextBottom,
+                4 => A::Top,
+                5 => A::Bottom,
+                6 => A::Raise(float(Self::BOX_RAISE)),
+                _ => A::Baseline,
+            },
+        })
+    }
+    /// These saying inline box `b`.
+    pub(crate) fn with_inline_box(&self, b: &crate::rich_text::InlineBox) -> Self {
+        use crate::rich_text::InlineAlign as A;
+        let (align, raise) = match b.align {
+            A::Middle => (1, 0.),
+            A::TextTop => (2, 0.),
+            A::TextBottom => (3, 0.),
+            A::Top => (4, 0.),
+            A::Bottom => (5, 0.),
+            A::Raise(by) => (6, by),
+            _ => (0, 0.),
+        };
+        Self::settled(self.without_inline_box().settings().iter().copied().chain([
+            (Self::BOX_WIDTH, b.width.to_bits()),
+            (Self::BOX_HEIGHT, b.height.to_bits()),
+            (Self::BOX_BASELINE, b.baseline.to_bits()),
+            (Self::BOX_ALIGN, align),
+            (Self::BOX_RAISE, f32::to_bits(raise)),
+        ]))
+    }
+    /// These saying no inline box (an ellipsis cloned from a box's run).
+    pub fn without_inline_box(&self) -> Self {
+        if !self.is_inline_box() {
+            return self.clone();
+        }
+        let others = self.settings().iter().copied();
+        Self::settled(others.filter(|(tag, _)| !Self::BOX_TAGS.contains(tag)))
     }
     /// The bytes the settings take, for cache accounting.
     pub fn storage_bytes(&self) -> usize {
@@ -493,6 +625,13 @@ impl TextLayout for Inset {
         let xs = self.inner.carets_x(offsets);
         xs.into_iter().map(|x| x + self.dx).collect()
     }
+    fn inline_boxes(&self) -> Vec<(usize, f32, f32)> {
+        let mut boxes = self.inner.inline_boxes();
+        for (_, x, _) in &mut boxes {
+            *x += self.dx;
+        }
+        boxes
+    }
     fn visual_line_range(&self, position: TextPosition) -> (TextPosition, TextPosition) {
         self.inner.visual_line_range(position)
     }
@@ -595,6 +734,13 @@ pub trait TextLayout {
             (right, left)
         }
     }
+    /// Where each inline box shown is laid out (`RichText::inline_boxes`):
+    /// its character's byte offset, its left edge and its top. A box cut off
+    /// (past a line clamp) isn't listed. None for a shaper that doesn't lay
+    /// them out (the default).
+    fn inline_boxes(&self) -> Vec<(usize, f32, f32)> {
+        Vec::new()
+    }
     /// Physical left/right edge of the caret's visual line, excluding line endings.
     fn visual_line_edge(&self, position: TextPosition, end: bool) -> TextPosition {
         let caret = self.caret_position(position);
@@ -630,6 +776,9 @@ pub struct FallbackTextLayout {
 impl FallbackTextLayout {
     /// Mixed-size approximate cells used when no native rich shaper is installed.
     pub fn with_rich(rich: &crate::rich_text::RichText, width: Option<f32>) -> Self {
+        if rich.has_inline_boxes() {
+            return Self::with_boxes(rich, width);
+        }
         let mut cells: Vec<(Range<usize>, Rect)> = Vec::new();
         let (mut x, mut y, mut max_x, mut pitch) = (0_f32, 0_f32, 0_f32, 0_f32);
         let mut row_start = 0;
@@ -669,11 +818,52 @@ impl FallbackTextLayout {
         for (_, rect) in &mut cells[row_start..] {
             rect.height = pitch;
         }
-        let mut layout = Self {
+        let layout = Self {
             cells,
             end: Rect::new(x, y, 1., pitch),
             size: (max_x.max(x), y + pitch),
         };
+        layout.finished(rich, width)
+    }
+    /// `with_rich` for text with inline boxes (`fallback_boxes`).
+    #[cold]
+    #[inline(never)]
+    fn with_boxes(rich: &crate::rich_text::RichText, width: Option<f32>) -> Self {
+        let boxes = crate::rich_text::fallback_boxes(rich, width);
+        let (x, y, height) = boxes.end;
+        let wide = boxes.rows.iter().fold(0_f32, |w, row| w.max(row.2));
+        Self {
+            cells: boxes.cells,
+            end: Rect::new(x, y, 1., height),
+            size: (wide, y + height),
+        }
+        .finished(rich, width)
+    }
+    /// Where each of `rich`'s inline boxes is at `width` (as
+    /// `TextLayout::inline_boxes`): its character's offset, left and top.
+    /// Those past a clamp aren't listed.
+    pub fn inline_places(
+        rich: &crate::rich_text::RichText,
+        width: Option<f32>,
+    ) -> Vec<(usize, f32, f32)> {
+        let boxes = crate::rich_text::fallback_boxes(rich, width);
+        let layout = Self::with_boxes(rich, width);
+        // Both in order: each found from where the last was.
+        let mut kept = layout.cells.iter();
+        boxes
+            .places
+            .iter()
+            .filter_map(|&(cell, top)| {
+                let (range, _) = boxes.cells.get(cell)?;
+                let (_, rect) = kept.find(|(kept, _)| kept == range)?;
+                Some((range.start, rect.x, top))
+            })
+            .collect()
+    }
+    /// `with_rich`'s cells cut as its clamp says, and aligned.
+    #[inline(always)]
+    fn finished(self, rich: &crate::rich_text::RichText, width: Option<f32>) -> Self {
+        let mut layout = self;
         if let Some(limit) = rich.options().line_clamp.map(|n| n.get()).or((rich
             .options()
             .overflow
@@ -985,30 +1175,101 @@ impl FallbackTextLayout {
         let mut x = 0.;
         let mut y = 0.;
         let mut width = 0_f32;
-        for (index, grapheme) in text.grapheme_indices(true) {
-            if grapheme.contains(['\n', '\r']) {
-                cell(index..index + grapheme.len(), Rect::new(x, y, 0., height));
+        // Each grapheme in turn: its byte range, and whether it breaks the line.
+        let mut each = |range: Range<usize>, newline: bool| {
+            if newline {
+                cell(range, Rect::new(x, y, 0., height));
                 width = width.max(x);
                 x = 0.;
                 y = (y + height).min(f32::MAX);
-                continue;
+                return;
             }
             if max_width.is_some_and(|w| w > 0. && x > 0. && x + advance > w) {
                 width = width.max(x);
                 x = 0.;
                 y = (y + height).min(f32::MAX)
             }
-            cell(
-                index..index + grapheme.len(),
-                Rect::new(x, y, advance, height),
-            );
+            cell(range, Rect::new(x, y, advance, height));
             x = (x + advance).min(f32::MAX);
+        };
+        if text.is_ascii() {
+            for range in AsciiClusters::new(text.as_bytes()) {
+                let newline = matches!(text.as_bytes()[range.start], b'\n' | b'\r');
+                each(range, newline);
+            }
+        } else {
+            for (index, grapheme) in text.grapheme_indices(true) {
+                each(
+                    index..index + grapheme.len(),
+                    grapheme.contains(['\n', '\r']),
+                );
+            }
         }
         width = width.max(x);
         (
             Rect::new(x, y, 1., height),
             (width, (y + height).min(f32::MAX)),
         )
+    }
+}
+/// `text`'s graphemes as byte ranges, in order: what
+/// `grapheme_indices(true)` gives (each `(start, grapheme)` as
+/// `start..start + grapheme.len()`), an ASCII text's read from its bytes
+/// (`AsciiClusters`), anything else segmented. For a walk over every
+/// grapheme of a text (carets, a screen reader's runs).
+pub fn grapheme_ranges(text: &str) -> GraphemeRanges<'_> {
+    if text.is_ascii() {
+        GraphemeRanges::Ascii(AsciiClusters::new(text.as_bytes()))
+    } else {
+        GraphemeRanges::Unicode(text.grapheme_indices(true))
+    }
+}
+/// `grapheme_ranges`' iterator.
+pub enum GraphemeRanges<'a> {
+    #[doc(hidden)]
+    Ascii(AsciiClusters<'a>),
+    #[doc(hidden)]
+    Unicode(unicode_segmentation::GraphemeIndices<'a>),
+}
+impl Iterator for GraphemeRanges<'_> {
+    type Item = Range<usize>;
+    #[inline]
+    fn next(&mut self) -> Option<Range<usize>> {
+        match self {
+            Self::Ascii(bytes) => bytes.next(),
+            Self::Unicode(graphemes) => graphemes
+                .next()
+                .map(|(start, grapheme)| start..start + grapheme.len()),
+        }
+    }
+}
+/// An ASCII text's graphemes, without Unicode's segmentation: each byte is
+/// one, but a carriage return before a line feed, which joins it (UAX #29
+/// GB3; every other ASCII character, controls included, breaks from its
+/// neighbours). `grapheme_indices` gives the same ranges, a table lookup and
+/// state machine step a character slower.
+#[doc(hidden)]
+pub struct AsciiClusters<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+impl<'a> AsciiClusters<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+}
+impl Iterator for AsciiClusters<'_> {
+    type Item = Range<usize>;
+    fn next(&mut self) -> Option<Range<usize>> {
+        let start = self.at;
+        let byte = *self.bytes.get(start)?;
+        let len = if byte == b'\r' && self.bytes.get(start + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+        self.at = start + len;
+        Some(start..self.at)
     }
 }
 impl TextLayout for FallbackTextLayout {
@@ -1102,6 +1363,69 @@ impl TextLayout for FallbackTextLayout {
 }
 #[cfg(test)]
 mod tests {
+    /// `grapheme_ranges` is `grapheme_indices`' ranges, ASCII or not.
+    #[test]
+    fn grapheme_ranges_are_grapheme_indices() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for text in [
+            "",
+            "Row 12 at 345",
+            "a\r\nb\rc\nd",
+            "caf\u{e9} na\u{ef}ve",
+            "e\u{301}\u{302}x",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} family",
+            "\u{1f1fa}\u{1f1f8}\u{1f1ec}\u{1f1e7}",
+            "\u{5e9}\u{5dc}\u{5d5}\u{5dd} hello",
+            "\u{915}\u{94d}\u{937} \r\n",
+        ] {
+            let ranges: Vec<_> = super::grapheme_ranges(text).collect();
+            let indices: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(at, grapheme)| at..at + grapheme.len())
+                .collect();
+            assert_eq!(ranges, indices, "{text:?}");
+        }
+    }
+
+    /// An ASCII text's graphemes are its bytes but CR LF, as Unicode's
+    /// segmentation finds them: every string of up to four bytes from an
+    /// alphabet of controls, line breaks, letters, digits and punctuation,
+    /// and longer mixed ones, give the same ranges either way.
+    #[test]
+    fn ascii_clusters_are_unicode_graphemes() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let check = |text: &str| {
+            let fast: Vec<_> = super::AsciiClusters::new(text.as_bytes()).collect();
+            let slow: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(at, grapheme)| at..at + grapheme.len())
+                .collect();
+            assert_eq!(fast, slow, "{text:?}");
+        };
+        let alphabet = [
+            b'\r', b'\n', b'\t', 0, 1, 0x1b, 0x7f, b' ', b'a', b'Z', b'7', b'-', b'.', b'~',
+        ];
+        let mut text = Vec::new();
+        for len in 0..=4u32 {
+            for mut code in 0..alphabet.len().pow(len) {
+                text.clear();
+                for _ in 0..len {
+                    text.push(alphabet[code % alphabet.len()]);
+                    code /= alphabet.len();
+                }
+                check(std::str::from_utf8(&text).unwrap());
+            }
+        }
+        for text in [
+            "Row 12 at 345",
+            "line one\r\nline two\rthree\nfour\r\n\r\n",
+            "\r\r\n\n\r",
+            "tabs\tand\x00nulls\x7f",
+        ] {
+            check(text);
+        }
+    }
+
     use super::*;
     #[test]
     fn line_height_normalization_hashing_and_tight_pitch() {
@@ -1264,6 +1588,72 @@ mod letter_spacing_tests {
         assert_eq!(LetterSpacing::px(-f32::MAX), LetterSpacing::px(-1_000_000.));
         assert_eq!(LetterSpacing::px(999_999.).pixels(), 999_999.);
         assert_eq!(LetterSpacing::px(-999_999.).pixels(), -999_999.);
+    }
+
+    #[test]
+    fn a_grid_is_kept_in_the_spacings_own_bits() {
+        let grid = LetterSpacing::cells(7.826_66);
+        assert!((grid.cell().unwrap() - 7.826_66).abs() <= 1. / 1024.);
+        // Read as tracking, less than 1e-38 of a pixel: nothing to a width.
+        assert!(grid.pixels() <= 0. && grid.pixels().abs() < f32::MIN_POSITIVE);
+        assert_eq!(10. + grid.pixels(), 10.);
+        // A subnormal tracking is none (its bits would be a grid's).
+        assert_eq!(LetterSpacing::px(-1e-39), LetterSpacing::ZERO);
+        assert_eq!(LetterSpacing::px(1e-39), LetterSpacing::ZERO);
+        assert_eq!(LetterSpacing::px(3.).cell(), None);
+        assert_eq!(LetterSpacing::ZERO.cell(), None);
+        assert_eq!(LetterSpacing::cells(0.), LetterSpacing::ZERO);
+        assert_eq!(LetterSpacing::cells(f32::NAN), LetterSpacing::ZERO);
+        assert_eq!(
+            LetterSpacing::cells(1e9).cell(),
+            Some(GRID_UNITS as f32 / 1024.)
+        );
+        // No tracking value is a grid, and a font style is no bigger.
+        for spacing in [
+            -1_000_000.,
+            -1.,
+            -0.5,
+            -f32::MIN_POSITIVE,
+            f32::MIN_POSITIVE,
+            0.5,
+            1.,
+            1_000_000.,
+        ] {
+            assert_eq!(LetterSpacing::px(spacing).cell(), None);
+        }
+        assert_eq!(std::mem::size_of::<LetterSpacing>(), 4);
+        assert_eq!(
+            format!("{:?}", LetterSpacing::cells(8.)),
+            "LetterSpacing::cells(8)"
+        );
+        assert_eq!(
+            format!("{:?}", LetterSpacing::px(2.)),
+            "LetterSpacing::px(2)"
+        );
+    }
+
+    /// Every reader of a font's spacing reads a grid as no tracking: the
+    /// fallback layout's estimate (0.6 em a cell, as a terminal measures
+    /// its cell without a shaper), its spaced and ellipsis advances, finite
+    /// and as without spacing.
+    #[test]
+    fn readers_read_a_grid_as_no_tracking() {
+        let grid = FontStyle {
+            letter_spacing: LetterSpacing::cells(7.),
+            ..FontStyle::default()
+        };
+        let plain = FontStyle::default();
+        for text in ["ab\ncd", "abc", "a\u{301}b"] {
+            assert_eq!(
+                FallbackTextLayout::with_font(text, 10., None, &grid).size(),
+                FallbackTextLayout::with_font(text, 10., None, &plain).size(),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            FallbackTextLayout::measure_with_font("abc", 10., Some(15.), &grid),
+            FallbackTextLayout::measure_with_font("abc", 10., Some(15.), &plain)
+        );
     }
 
     #[test]

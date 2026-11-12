@@ -338,6 +338,11 @@ fn thousand_streaming_frames_keep_caches_bounded_and_reuse_vertices() {
         let d = scene.flush().damage;
         gpu.render(&scene, &d).unwrap();
     }
+    // Below its four buffers the ring grows rather than waits whenever every
+    // buffer is still being read (d3d11_frame.rs `Ring::write_parts`), so a
+    // GPU busy with other work can add one at any frame here. Warm means the
+    // GPU has caught up: a readback waits for it, and the frame after reuses.
+    gpu.readback().unwrap();
     let initial = gpu.debug_cache_stats().vertex_buffer_bytes;
     // Vertices written in place (unified memory, Direct3D 12) go round a
     // ring of up to four buffers in flight; a staging copy keeps one. Each
@@ -543,6 +548,9 @@ fn image_cache_reclaims_removed_nodes_and_leaves_out_oversized_allocations() {
     scene.remove(node);
     let d = scene.flush().damage;
     gpu.render(&scene, &d).unwrap();
+    // Kept to come back to (a list's row), until the window goes idle.
+    assert_eq!(gpu.debug_cache_stats().image_textures, 1);
+    gpu.trim();
     assert_eq!(gpu.debug_cache_stats().image_textures, 0);
     let huge = std::sync::Arc::new(
         zgx::image::ImageData::new(4096, 4097, vec![0; 4096 * 4097 * 4]).unwrap(),
@@ -747,11 +755,8 @@ fn layer_texture_budget_rasterizes_coarser_and_recovers_after_removal() {
     scene.set_isolated(huge, true);
     let d = scene.flush().damage;
     gpu.render(&scene, &d).unwrap();
-    let issues = gpu.take_issues();
-    assert!(
-        issues[0].contains("budget of isolated layers (64 MiB)"),
-        "{issues:?}"
-    );
+    assert_eq!(gpu.take_issues(), Vec::<String>::new());
+    assert_eq!(gpu.debug_cache_stats().layers_coarser, 1);
     let bytes = gpu.debug_cache_stats().layer_bytes;
     assert!(bytes > 0 && bytes <= 64 * 1024 * 1024, "{bytes}");
     scene.remove(huge);
@@ -787,6 +792,48 @@ fn image_count_budget_leaves_images_out_and_recovers_after_removal() {
     let d = scene.flush().damage;
     gpu.render(&scene, &d).unwrap();
     assert_eq!(gpu.readback().unwrap()[..4], [255, 0, 0, 255]);
+}
+
+/// At the count of images a window may hold, those not drawn this frame give
+/// way: a page of small pictures scrolled through leaves none out.
+#[test]
+fn image_count_budget_lets_images_not_drawn_go_first() {
+    let _gpu_fixture = gpu_fixture();
+    let mut gpu = GpuRenderer::new(8, 8).unwrap();
+    let mut scene = Scene::new(8., 8.);
+    let stack = scene.append(
+        scene.root(),
+        NodeKind::Container(Layout::Overlay),
+        fixed(8., 8.),
+    );
+    let image = || {
+        let image = zgx::image::ImageData::new(1, 1, vec![255, 0, 0, 255]).unwrap();
+        NodeKind::Image(std::sync::Arc::new(image))
+    };
+    let first: Vec<_> = (0..16_384)
+        .map(|_| scene.append(stack, image(), fixed(1., 1.)))
+        .collect();
+    let d = scene.flush().damage;
+    gpu.render(&scene, &d).unwrap();
+    assert_eq!(gpu.debug_cache_stats().image_textures, 16_384);
+    // Still in the scene, far out of view, and a new one comes.
+    scene.set_style(
+        stack,
+        Style {
+            margin: Insets {
+                top: -100_000.,
+                ..Default::default()
+            },
+            ..fixed(8., 8.)
+        },
+    );
+    scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+    let later = scene.append(scene.root(), image(), fixed(8., 8.));
+    let d = scene.flush().damage;
+    gpu.render(&scene, &d).unwrap();
+    assert_eq!(gpu.take_issues(), Vec::<String>::new());
+    assert_eq!(gpu.readback().unwrap()[..4], [255, 0, 0, 255]);
+    drop((first, later));
 }
 
 #[test]
@@ -1750,12 +1797,25 @@ fn overlay_scrollbar_thumb_translates_and_clears_when_content_shrinks() {
             ),
     );
     let mut previous_extent = 0.;
-    for (position, height, thumb_y) in [
-        (0., 400., Some(8)),
-        (168., 400., Some(28)),
-        (336., 400., Some(48)),
-        (0., 40., None),
-        (0., 400., Some(8)),
+    // The platform's thumb at rest, in a track at the content's edge (120):
+    // zgx's 6 across an 8 track and at least 24 long; GNOME's 8 across a 12
+    // track and at least 40; Windows' 6 across a 12 track and at least 30,
+    // between arrow buttons 12 long at each end. Each rounded, its ends 2 in.
+    // (track, across, least, arrows)
+    let (track, across, least, arrows) = if cfg!(target_os = "linux") {
+        (12, 8, 40, 0)
+    } else if cfg!(windows) {
+        (12, 6, 30, 12)
+    } else {
+        (8, 6, 24, 0)
+    };
+    let left = 120 - track + (track - across) / 2;
+    for (position, height, shown) in [
+        (0., 400., true),
+        (168., 400., true),
+        (336., 400., true),
+        (0., 40., false),
+        (0., 400., true),
     ] {
         extent.set(height);
         offset.set(position);
@@ -1771,6 +1831,7 @@ fn overlay_scrollbar_thumb_translates_and_clears_when_content_shrinks() {
             .unwrap();
         assert_eq!(partial, gpu.readback().unwrap());
         let accent = [94, 165, 255, 255];
+        // (Its arrows' carets, in the accent too, left out.)
         let visible: Vec<_> = partial
             .as_chunks::<4>()
             .0
@@ -1778,22 +1839,26 @@ fn overlay_scrollbar_thumb_translates_and_clears_when_content_shrinks() {
             .enumerate()
             .filter(|(_, p)| **p == accent)
             .map(|(i, _)| (i % 128, i / 128))
+            .filter(|(_, row)| *row >= 8 + arrows && *row < 8 + 64 - arrows)
             .collect();
-        match thumb_y {
-            // A rounded thumb 6 px across the 8 px track, its ends 2 px in
-            // from the 24 px its position spans.
-            Some(y) => {
-                assert!(
-                    visible.contains(&(116, y + 12)),
-                    "thumb at {y}: {visible:?}"
-                );
-                assert!(
-                    visible
-                        .iter()
-                        .all(|(x, row)| *x >= 113 && *x < 119 && *row >= y + 2 && *row < y + 22)
-                );
-            }
-            None => assert!(visible.is_empty()),
+        if shown {
+            // Along the 64 the padding leaves (less its arrows), over the
+            // 336 it scrolls.
+            let along = 64 - 2 * arrows;
+            let y = 8 + arrows + ((along - least) as f32 * position / 336.) as usize;
+            assert!(
+                visible.contains(&(left + across / 2, y + least / 2)),
+                "thumb at {y}: {visible:?}"
+            );
+            assert!(
+                visible.iter().all(|(x, row)| *x >= left
+                    && *x < left + across
+                    && *row >= y + 2
+                    && *row < y + least - 2),
+                "thumb at {y}: {visible:?}"
+            );
+        } else {
+            assert!(visible.is_empty());
         }
     }
 }
@@ -2139,7 +2204,10 @@ fn overflowing_menu_keeps_keyboard_focus_pixels_inside_padded_viewport() {
         let focused = view.find(id).unwrap();
         assert_eq!(ui.input.focused(), Some(focused));
         let bounds = ui.scene.borrow().bounds(focused);
-        let index = ((bounds.y as usize + 8) * 128 + bounds.x as usize + 80) * 4;
+        // Its last column, however wide the platform's item margins leave
+        // it (Windows keeps 4 each side).
+        let right = (bounds.x + bounds.width) as usize - 1;
+        let index = ((bounds.y as usize + 8) * 128 + right) * 4;
         assert_eq!(&partial[index..index + 4], &[238, 170, 34, 255]);
         let panel = ui.scene.borrow().bounds(view.find("panel").unwrap());
         for y in [panel.y as usize + 2, (panel.y + panel.height) as usize - 2] {
@@ -2216,7 +2284,11 @@ fn submenu_side_flip_and_dismissal_match_full_repaint_without_layout() {
     let parent = view.find("parent").unwrap();
     let bounds = ui.scene.borrow().bounds(child);
     let parent_bounds = ui.scene.borrow().bounds(parent);
-    assert!(bounds.x >= parent_bounds.x + parent_bounds.width);
+    // Beside its parent: on Windows, its trigger inset by the item's margin
+    // and the submenu opened beside that, over the parent's edge by 4, as a
+    // Windows submenu laps its parent.
+    let overlap = if cfg!(windows) { 4. } else { 0. };
+    assert!(bounds.x >= parent_bounds.x + parent_bounds.width - overlap);
     let pixel = |pixels: &[u8], rect: Rect| {
         let i = ((rect.y as usize + 50) * 400 + rect.x as usize + 90) * 4;
         pixels[i..i + 4].to_vec()
@@ -2227,7 +2299,7 @@ fn submenu_side_flip_and_dismissal_match_full_repaint_without_layout() {
     assert_eq!(layout, 0);
     let bounds = ui.scene.borrow().bounds(child);
     let parent_bounds = ui.scene.borrow().bounds(parent);
-    assert!(bounds.x + bounds.width <= parent_bounds.x);
+    assert!(bounds.x + bounds.width <= parent_bounds.x + overlap);
     assert_eq!(pixel(&flipped, bounds), [238, 51, 34, 255]);
     ui.dispatch(InputEvent::KeyDown {
         key: Key::ArrowLeft,
@@ -2908,6 +2980,8 @@ fn object_fit_pixels_crop_center_and_reuse_uploaded_image_across_transitions() {
     gpu.render(&ui.scene.borrow(), &[Rect::new(0., 0., 112., 104.)])
         .unwrap();
     assert_eq!(partial, gpu.readback().unwrap());
+    // (Those no node shows are kept until the window goes idle.)
+    gpu.trim();
     assert_eq!(gpu.debug_cache_stats().image_textures, 1);
 }
 
@@ -3282,6 +3356,119 @@ fn assert_blur_matches_fresh(
         partial == fresh.readback().unwrap(),
         "bounded blur reconstruction differs from a fresh full frame"
     );
+}
+
+/// A blurred frame walks only where its damage reaches through the filters
+/// (`Scene::backdrop_filters`), not the window: what it draws must still be
+/// what the whole frame draws, even where the damage reaches a filter only
+/// through another (a change under one filter whose output meets a second,
+/// the second's backdrop reaching past both), with boxes under a moved
+/// ancestor and far from every filter changing too.
+#[test]
+fn a_blurred_frame_walked_within_its_reach_is_the_frame_drawn_afresh() {
+    let _fixture = gpu_fixture();
+    let mut gpu = GpuRenderer::new(320, 200).unwrap();
+    let mut scene = Scene::new(320., 200.);
+    scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+    scene.append(
+        scene.root(),
+        NodeKind::Rect(Color(20, 30, 50, 255)),
+        fixed(320., 200.),
+    );
+    let rect = |scene: &mut Scene, parent, color, w, h, x, y| {
+        let node = scene.append(parent, NodeKind::Rect(color), fixed(w, h));
+        scene.set_transform(node, Transform { x, y });
+        node
+    };
+    let root = scene.root();
+    // Under the first filter alone, and under the second alone, past the
+    // first's output and the damage.
+    let under_first = rect(
+        &mut scene,
+        root,
+        Color(240, 200, 60, 255),
+        10.,
+        10.,
+        30.,
+        40.,
+    );
+    let under_second = rect(
+        &mut scene,
+        root,
+        Color(60, 220, 120, 255),
+        10.,
+        10.,
+        150.,
+        40.,
+    );
+    // A group of boxes moved as one, far from both filters.
+    let group = scene.append(root, NodeKind::Container(Layout::Overlay), fixed(60., 60.));
+    scene.set_transform(group, Transform { x: 240., y: 120. });
+    let mut far = Vec::new();
+    for i in 0..12 {
+        let box_ = rect(
+            &mut scene,
+            group,
+            Color(30 + i * 15, 90, 200 - i * 10, 255),
+            8.,
+            8.,
+            (i % 4) as f32 * 14.,
+            (i / 4) as f32 * 14.,
+        );
+        far.push(box_);
+    }
+    // The first filter's output meets the second's: damage under the
+    // first re-blurs the second too, so its backdrop is drawn again.
+    for (x, w) in [(24., 90.), (100., 80.)] {
+        let blur = rect(&mut scene, root, Color(230, 40, 70, 40), w, 60., x, 24.);
+        scene.set_effects(
+            blur,
+            Effects {
+                blur_radius: 5.,
+                ..Effects::default()
+            },
+        );
+    }
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    assert_blur_matches_fresh(&gpu, &scene, 320, 200, 1.);
+    // Under the first filter alone: the second's backdrop (`under_second`)
+    // is drawn again within its blur, though nothing near it changed. The
+    // renderer is given the box alone (the scene's flush grows its damage
+    // through the filters too, but the renderer reconstructs blur from what
+    // it's given), so the reach it walks must be its own.
+    scene.set_kind(under_first, NodeKind::Rect(Color(20, 160, 240, 255)));
+    scene.flush();
+    gpu.render(&scene, &[Rect::new(30., 40., 10., 10.)])
+        .unwrap();
+    assert_blur_matches_fresh(&gpu, &scene, 320, 200, 1.);
+    // Under the second alone.
+    scene.set_kind(under_second, NodeKind::Rect(Color(220, 60, 200, 255)));
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    assert_blur_matches_fresh(&gpu, &scene, 320, 200, 1.);
+    // Far from both: the group slides a step at a time, as rows do, and
+    // one of its boxes changes on the way.
+    for step in 1..=6 {
+        scene.set_transform(
+            group,
+            Transform {
+                x: 240. - step as f32 * 3.5,
+                y: 120. + step as f32 * 1.5,
+            },
+        );
+        if step == 3 {
+            scene.set_kind(far[5], NodeKind::Rect(Color(250, 250, 250, 255)));
+        }
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        assert_blur_matches_fresh(&gpu, &scene, 320, 200, 1.);
+    }
+    // And slid under the second filter: it is backdrop now.
+    scene.set_transform(group, Transform { x: 120., y: 30. });
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    assert_blur_matches_fresh(&gpu, &scene, 320, 200, 1.);
 }
 
 #[test]
@@ -3834,13 +4021,23 @@ fn variable_virtual_rows_height_anchor_focus_and_resize_match_full_repaint() {
         for y in 0..height {
             if y < 8 || y >= height - 8 {
                 // Removing a focused row returns focus to the list, whose
-                // default focus variant paints a one-pixel outer border.
-                let padding =
-                    if ui.input.focused() == Some(mounted.node()) && (y == 0 || y == height - 1) {
-                        [94, 165, 255, 255]
-                    } else {
-                        [16, 32, 48, 255]
-                    };
+                // default focus ring is the platform's: a one-pixel border
+                // (zgx's), an outline 2 wide inset over it (GNOME's), or
+                // one outside it (Windows', past the window here).
+                let ring = if cfg!(windows) {
+                    0
+                } else if cfg!(target_os = "linux") {
+                    2
+                } else {
+                    1
+                };
+                let padding = if ui.input.focused() == Some(mounted.node())
+                    && (y < ring || y >= height - ring)
+                {
+                    [94, 165, 255, 255]
+                } else {
+                    [16, 32, 48, 255]
+                };
                 assert_eq!(
                     pixel(9, y),
                     &padding,
@@ -4002,6 +4199,13 @@ fn variable_virtual_rows_height_anchor_focus_and_resize_match_full_repaint() {
     );
 }
 
+/// Measured rows streaming and reflowing repaint as a full frame does, the
+/// focused row's anchor held. On WARP alone a one-pixel scroll's copied text
+/// differs from it drawn fresh one pixel higher by 1 in blue at two pixels:
+/// inside the copy, outside the repainted strip, so no damage is missing;
+/// WARP's linear sample lands a hair off a glyph's texel centre, by where it
+/// sits on screen. Metal and an RTX 4090 are exact. (CI's WARP run leaves
+/// `pixels` out for this; see ci.yml.)
 #[test]
 fn naturally_measured_streaming_rows_reflow_with_damage_and_stable_anchor() {
     let _gpu_fixture = gpu_fixture();
@@ -4846,8 +5050,8 @@ fn fade_insets_end_the_bands_inside_the_clip() {
 /// Whole-pixel scrolls shift the retained pixels and draw only the exposed
 /// strip; the result matches a fresh renderer exactly. A list fading at its
 /// edges copies its interior and repaints its bands. A sibling painting over
-/// the list, or a fractional shift, make a copy inexact, so those repaint
-/// instead.
+/// the list repaints all its ink over the copy, so the list copies under it
+/// too. A fractional shift makes a copy inexact, so that repaints instead.
 #[test]
 fn scroll_copies_match_a_fresh_render_and_decline_when_inexact() {
     let _gpu_fixture = gpu_fixture();
@@ -4939,9 +5143,9 @@ fn scroll_copies_match_a_fresh_render_and_decline_when_inexact() {
             // Its interior copies, its bands repaint (bands.rs).
             Case::Faded => assert!(copies >= 3, "{copies}"),
             Case::Rounded => assert!(copies >= 3, "{copies}"),
-            // Only 28→100 copies: its 72 px exposed strip repaints the whole
-            // overlay, which the smaller moves would have shifted.
-            Case::Covered => assert_eq!(copies, 1),
+            // The overlay repaints its own ink over what the copy moved
+            // (copy_blocker_tests), so the list copies as the plain one does.
+            Case::Covered => assert!(copies >= 3, "{copies}"),
         }
     }
 }
@@ -5036,6 +5240,78 @@ fn fractional_scrolls_on_the_pixel_grid_copy_and_match_a_fresh_render() {
     );
     let mut copies = 0;
     for scroll in [0., 14.3, 28.6, 31.45, 60.2] {
+        offset.set(scroll);
+        ui.prepare_frame();
+        let damage = ui.scene.borrow_mut().flush().damage;
+        copies += gpu
+            .render(&ui.scene.borrow(), &damage)
+            .unwrap()
+            .scroll_copies;
+        let mut fresh = GpuRenderer::new(160, 120).unwrap();
+        fresh
+            .render(&ui.scene.borrow(), &[Rect::new(0., 0., 160., 120.)])
+            .unwrap();
+        assert_eq!(
+            gpu.readback().unwrap(),
+            fresh.readback().unwrap(),
+            "scroll {scroll}"
+        );
+    }
+    // Texture blits cost Apple GPUs graphics memory; macOS repaints.
+    let expected = if cfg!(target_os = "macos") { 0 } else { 4 };
+    assert_eq!(copies, expected);
+}
+
+/// A clear box over a list (an overlay scrollbar's track away from the
+/// pointer is one) paints nothing: the list's scrolls still copy, and the
+/// frames match a fresh render.
+#[test]
+fn scrolls_under_a_clear_box_copy_and_match_a_fresh_render() {
+    let _gpu_fixture = gpu_fixture();
+    use zgx::{compose::prelude::*, widgets::Ui};
+    let mut gpu = GpuRenderer::new(160, 120).unwrap();
+    let mut ui = Ui::new(160., 120.);
+    ui.scene.borrow_mut().set_pixel_scale(1.);
+    let offset = ui.signal(0_f32);
+    ui.mount(
+        overlay()
+            .w(160.)
+            .h(120.)
+            .bg(rgb(0x000000))
+            .child(
+                virtual_list(
+                    offset.clone(),
+                    24.,
+                    2,
+                    || 1000,
+                    |i| i,
+                    |_, key, _| {
+                        div()
+                            .size(144., 24.)
+                            .bg(if key % 2 == 0 {
+                                rgb(0x223344)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .child(div().size(144., 1.).bg(rgb(0xffffff)))
+                    },
+                )
+                .w(160.)
+                .h(100.)
+                .p(8.)
+                .bg(rgb(0x101820)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(140.)
+                    .top(8.)
+                    .size(8., 84.)
+                    .bg(rgba(0xffffff00)),
+            ),
+    );
+    let mut copies = 0;
+    for scroll in [0., 14., 28., 31., 60.] {
         offset.set(scroll);
         ui.prepare_frame();
         let damage = ui.scene.borrow_mut().flush().damage;
@@ -5335,6 +5611,71 @@ fn sliding_stream_keeps_prepared_text_to_what_is_drawn() {
     assert!(peak < 1024 * 1024, "prepared text grew to {peak} bytes");
 }
 
+/// A text that changes every frame it is drawn (a counter, a header rolling
+/// its count) leaves the text it showed before, undrawn, each frame: the
+/// cache trims what it keeps of those once past their budget, down to half
+/// of it, so once in many frames, not in every one it shapes. After
+/// a burst of texts, what is held comes back down: to the budget as frames
+/// draw, and at rest (`trim`) to where it was before the burst.
+#[test]
+fn a_changing_text_trims_its_cache_once_in_many_frames() {
+    let _gpu_fixture = gpu_fixture();
+    use zgx::{compose::prelude::*, widgets::Ui};
+    let mut gpu = GpuRenderer::new(480, 200).unwrap();
+    let mut ui = Ui::new(480., 200.);
+    gpu.install_text(&mut ui.scene.borrow_mut());
+    let count = ui.signal(0_u64);
+    let read = count.clone();
+    ui.mount(
+        overlay().w(480.).h(200.).child(
+            text_signal(move || {
+                format!(
+                    "ran {} commands, read {} files and searched the code",
+                    read.get(),
+                    read.get() * 3
+                )
+            })
+            .w(460.)
+            .h(40.),
+        ),
+    );
+    let frame = |ui: &mut Ui, gpu: &mut GpuRenderer| {
+        ui.prepare_frame();
+        let damage = ui.scene.borrow_mut().flush().damage;
+        gpu.render(&ui.scene.borrow(), &damage).unwrap();
+    };
+    frame(&mut ui, &mut gpu);
+    gpu.trim();
+    let resting = gpu.text_cache().borrow().bytes().0;
+    // Past the budget: every text shown so far but the one drawn is undrawn.
+    for n in 1..=2000 {
+        count.set(n);
+        frame(&mut ui, &mut gpu);
+    }
+    let held = gpu.text_cache().borrow().bytes().0;
+    let before = gpu.text_cache().borrow().trims();
+    for n in 2001..=2400 {
+        count.set(n);
+        frame(&mut ui, &mut gpu);
+    }
+    let trims = gpu.text_cache().borrow().trims() - before;
+    assert!(
+        trims * 5 <= 400,
+        "{trims} trims in 400 frames, each shaping one text"
+    );
+    // Held within the budget as frames draw, and back at rest.
+    assert!(
+        held < resting + 80 * 1024,
+        "{held} bytes held, {resting} at rest"
+    );
+    gpu.trim();
+    let after = gpu.text_cache().borrow().bytes().0;
+    assert!(
+        after <= resting + 64 * 1024,
+        "{after} bytes held at rest after the burst, {resting} before it"
+    );
+}
+
 /// Plain quads draw with a lighter shader, and opaque flat ones without
 /// blending (every run on a software rasterizer, large ones on a GPU; see
 /// `debug_split_shading`): every feature must look the same either way, to
@@ -5581,6 +5922,50 @@ fn small_quads_of_different_shading_share_a_draw() {
     assert_eq!(large, 3);
 }
 
+/// In a clipping box, what lies wholly inside it and what its edge cuts
+/// share draws: scissored to the window or to the box, the inside ones
+/// lose no pixel either way. Every pixel is as the box cut it.
+#[test]
+fn what_a_clip_cuts_and_what_lies_inside_it_share_a_draw() {
+    let _gpu_fixture = gpu_fixture();
+    use zgx::{compose::prelude::*, widgets::Ui};
+    let render = |wide: f32, clip: bool| {
+        let mut gpu = GpuRenderer::new(600, 400).unwrap();
+        gpu.set_scale_factor(2.);
+        let mut ui = Ui::new(300., 200.);
+        gpu.install_text(&mut ui.scene.borrow_mut());
+        // Rows of a short bar inside the box and a long one past its edge.
+        let rows = column().size(100., 100.).gap(2.).children((0..10).map(|_| {
+            row()
+                .gap(2.)
+                .child(div().size(10., 6.).shrink_0().bg(rgb(0x3366aa)))
+                .child(div().size(wide, 6.).shrink_0().bg(rgb(0x3366aa)))
+        }));
+        ui.mount(match clip {
+            true => rows.overflow_hidden(),
+            false => rows,
+        });
+        ui.prepare_frame();
+        let damage = ui.scene.borrow_mut().flush().damage;
+        let draws = gpu.render(&ui.scene.borrow(), &damage).unwrap().draw_calls;
+        (draws, gpu.readback().unwrap())
+    };
+    let (draws, cut) = render(150., true);
+    // Twenty alternating clips, a draw each before.
+    assert!(draws <= 3, "{draws} draw calls");
+    // The long bars cut at the box's edge, as bars ending there draw.
+    let (_, ending) = render(88., false);
+    let differing = cut
+        .chunks(4)
+        .zip(ending.chunks(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} pixels differ from bars ending at the edge"
+    );
+}
+
 /// Opaque rounded and bordered panels draw a flat interior with the basic
 /// shader and only their edge bands with the full one: the same bytes as one
 /// quad, at fractional positions and sizes, per-corner radii and any scale.
@@ -5802,6 +6187,13 @@ fn text_lands_on_whole_device_pixels() {
 /// reach the clip alone: the same pixels as making every line's, with far
 /// fewer quads, and a document of 100,000 lines draws within the frame's
 /// geometry budget.
+///
+/// On WARP alone (Direct3D 12's software rasterizer) culled and whole differ
+/// by 1 in a channel at 45 glyph-edge pixels: culling shapes fewer lines, so
+/// the same glyph sits in another atlas cell, and WARP's linear sample lands
+/// a hair off its texel centre, by where. The cells' bytes are the same, and
+/// equal settings give equal pixels. Metal and an RTX 4090 are exact. (CI's
+/// WARP run leaves `pixels` out for this; see ci.yml.)
 #[test]
 fn a_long_text_draws_only_the_lines_in_its_clip() {
     let _gpu_fixture = gpu_fixture();
@@ -5884,43 +6276,89 @@ fn find_marks_are_rounded_whichever_shader_draws_the_text() {
     assert_eq!(changed, 0, "find marks differ from the full shader's");
 }
 
-/// A page of large text grows the glyph atlas past its first size. A pause
-/// keeps it (the next frame would rasterize everything again); a long idle
-/// gives it back, and the next frame draws the same picture, the atlas back
-/// at the size it had in one step.
+/// Five lines of large text, fourteen letters a line, none twice (a letter
+/// repeated on whole pixels is one image, below 2x): enough to grow the
+/// glyph atlas past its first size.
+fn large_letters(scene: &mut Scene) -> Vec<NodeId> {
+    (0..5)
+        .map(|line| {
+            let text: String = (0..14)
+                .map(|i| (b'A' + (line * 5 + i) % 26) as char)
+                .collect();
+            scene.append(
+                scene.root(),
+                NodeKind::Text {
+                    text: text.as_str().into(),
+                    font_size: 120. + f32::from(line) * 7.,
+                    color: Color(255, 255, 255, 255),
+                },
+                fixed(1200., 170.),
+            )
+        })
+        .collect()
+}
+
+/// A screen of large text fills a grown atlas. A long idle keeps it (none
+/// of it could go without being rasterized again as the user comes back),
+/// and the next frame draws the same picture from it, uploading nothing.
 #[test]
-fn a_grown_atlas_goes_back_at_idle_and_draws_the_same() {
+fn a_grown_atlas_its_screen_fills_stays_at_idle() {
     let _gpu = gpu_fixture();
     let mut scene = Scene::new(1200., 900.);
-    let lines: Vec<String> = (0..5)
-        .map(|line| (0..14).map(|i| (b'A' + line * 5 + i % 5) as char).collect())
-        .collect();
-    for (i, text) in lines.iter().enumerate() {
-        scene.append(
-            scene.root(),
-            NodeKind::Text {
-                text: text.as_str().into(),
-                font_size: 120. + i as f32 * 7.,
-                color: Color(255, 255, 255, 255),
-            },
-            fixed(1200., 170.),
-        );
-    }
+    large_letters(&mut scene);
     let mut gpu = GpuRenderer::new(1200, 900).unwrap();
     let damage = scene.flush().damage;
     gpu.render(&scene, &damage).unwrap();
     let first_size = 512 * 512 * 4;
-    assert!(gpu.debug_cache_stats().atlas_bytes > first_size);
-    let before = gpu.readback().unwrap();
     let grown = gpu.debug_cache_stats().atlas_bytes;
+    assert!(grown > first_size);
+    let before = gpu.readback().unwrap();
+    gpu.trim();
+    gpu.trim_atlas();
+    assert_eq!(gpu.debug_cache_stats().atlas_bytes, grown);
+    let whole = [Rect::new(0., 0., 1200., 900.)];
+    let stats = gpu.render(&scene, &whole).unwrap();
+    assert_eq!(stats.glyph_uploads, 0);
+    assert!(gpu.readback().unwrap() == before, "the same picture");
+}
+
+/// Large text grows the atlas, then gives way to a line of small text. A
+/// pause keeps the grown atlas; a long idle shrinks it to what the screen
+/// draws, its glyphs copied across: the next frame draws the same picture
+/// without rasterizing any of them again.
+#[test]
+fn a_grown_atlas_shrinks_at_idle_to_what_its_screen_draws() {
+    let _gpu = gpu_fixture();
+    let mut scene = Scene::new(1200., 900.);
+    let large = large_letters(&mut scene);
+    let mut gpu = GpuRenderer::new(1200, 900).unwrap();
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    let first_size = 512 * 512 * 4;
+    let grown = gpu.debug_cache_stats().atlas_bytes;
+    assert!(grown > first_size);
+    for id in large {
+        scene.remove(id);
+    }
+    scene.append(
+        scene.root(),
+        NodeKind::Text {
+            text: "The quick brown fox jumps over the lazy dog".into(),
+            font_size: 16.,
+            color: Color(255, 255, 255, 255),
+        },
+        fixed(1200., 40.),
+    );
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    let before = gpu.readback().unwrap();
     gpu.trim();
     assert_eq!(gpu.debug_cache_stats().atlas_bytes, grown);
-    assert!(gpu.atlas_grown());
     gpu.trim_atlas();
     assert_eq!(gpu.debug_cache_stats().atlas_bytes, first_size);
     let whole = [Rect::new(0., 0., 1200., 900.)];
-    gpu.render(&scene, &whole).unwrap();
-    assert_eq!(gpu.debug_cache_stats().atlas_bytes, grown);
+    let stats = gpu.render(&scene, &whole).unwrap();
+    assert_eq!(stats.glyph_uploads, 0, "drawn from the glyphs copied");
     assert!(gpu.readback().unwrap() == before, "the same picture");
 }
 
@@ -6166,10 +6604,10 @@ fn a_tilt_past_the_eye_inside_a_zoomed_layer_draws() {
     gpu.render(&scene, &report.damage).unwrap();
 }
 
-/// Past the budget or the texture size, a layer rasterizes coarser, is said
-/// once, and shows.
+/// Past the budget or the texture size, a layer rasterizes coarser and shows:
+/// no issue, the budget doing its job, and devtools can find it.
 #[test]
-fn a_layer_past_its_budget_draws_coarser_and_says_so_once() {
+fn a_layer_past_its_budget_draws_coarser_and_raises_no_issue() {
     let _gpu_fixture = gpu_fixture();
     for (width, height) in [(12_000., 12_000.), (60_000., 40.)] {
         let mut gpu = GpuRenderer::new(100, 100).unwrap();
@@ -6190,15 +6628,10 @@ fn a_layer_past_its_budget_draws_coarser_and_says_so_once() {
         );
         let report = scene.flush();
         gpu.render(&scene, &report.damage).unwrap();
-        let issues = gpu.take_issues();
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(issues[0].contains("coarser"), "{issues:?}");
+        assert_eq!(gpu.take_issues(), Vec::<String>::new());
+        assert_eq!(gpu.debug_cache_stats().layers_coarser, 1);
         let pixels = gpu.readback().unwrap();
         assert!(pixels[(10 * 100 + 10) * 4] > 200, "it shows");
-        scene.set_transform(layer, Transform { x: -1., y: 0. });
-        let report = scene.flush();
-        gpu.render(&scene, &report.damage).unwrap();
-        assert!(gpu.take_issues().is_empty(), "said once");
     }
 }
 
@@ -6227,15 +6660,8 @@ fn layers_past_their_count_and_budget_all_draw() {
     }
     let report = scene.flush();
     gpu.render(&scene, &report.damage).unwrap();
-    let issues = gpu.take_issues();
-    assert!(issues.iter().any(|i| i.contains("1024")), "{issues:?}");
-    assert!(
-        issues.iter().any(
-            |i| i.contains("past the budget of isolated layers (64 MiB)")
-                && i.contains("MiB allocated")
-        ),
-        "{issues:?}"
-    );
+    assert_eq!(gpu.take_issues(), Vec::<String>::new());
+    assert!(gpu.debug_cache_stats().layers_coarser > 0);
     assert!(gpu.readback().unwrap()[(300 * 600 + 300) * 4 + 1] > 150);
 }
 
@@ -6679,4 +7105,148 @@ fn a_window_sized_layer_draws_at_its_scale() {
         line.name
     );
     assert_eq!(line.bytes, Some(2944 * 1856 * 4));
+}
+
+#[test]
+fn reading_into_a_kept_buffer_reads_what_a_fresh_read_does() {
+    let _gpu = gpu_fixture();
+    let mut scene = Scene::new(64., 48.);
+    let root = scene.root();
+    scene.set_kind(root, NodeKind::Container(Layout::Overlay));
+    // Red, green and blue a third each, and a translucent band over them:
+    // channels out of order, or alpha lost, would show.
+    for (i, fill) in [
+        Color(255, 0, 0, 255),
+        Color(0, 255, 0, 255),
+        Color(0, 0, 255, 255),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = scene.append(
+            root,
+            NodeKind::Panel {
+                layout: Layout::Overlay,
+                quad: QuadStyle {
+                    fill,
+                    ..Default::default()
+                },
+            },
+            fixed(21., 48.),
+        );
+        scene.set_transform(
+            id,
+            Transform {
+                x: i as f32 * 21.,
+                y: 0.,
+            },
+        );
+    }
+    let band = scene.append(
+        root,
+        NodeKind::Panel {
+            layout: Layout::Overlay,
+            quad: QuadStyle {
+                fill: Color(255, 255, 255, 128),
+                ..Default::default()
+            },
+        },
+        fixed(64., 8.),
+    );
+    scene.set_transform(band, Transform { x: 0., y: 20. });
+    scene.flush();
+    let mut gpu = GpuRenderer::new(64, 48).unwrap();
+    gpu.render(&scene, &[Rect::new(0., 0., 64., 48.)]).unwrap();
+    let fresh = gpu.readback().unwrap();
+    assert_eq!(&fresh[..4], &[255, 0, 0, 255], "RGBA, red first");
+    let green = (5 * 64 + 30) * 4;
+    assert_eq!(&fresh[green..green + 4], &[0, 255, 0, 255]);
+
+    // A kept read swaps red and blue on the GPU (a pass into an RGBA
+    // texture), a fresh one on the CPU: the same bytes either way.
+    let mut staging = zgx_gpu::Readback::default();
+    // Stale bytes of the right length, then of the wrong one: each read
+    // replaces them whole.
+    let mut kept = vec![0xAB; fresh.len()];
+    for _ in 0..2 {
+        gpu.readback_into(&mut kept, &mut staging).unwrap();
+        assert_eq!(kept, fresh);
+    }
+    let mut short = vec![7; 10];
+    gpu.readback_into(&mut short, &mut staging).unwrap();
+    assert_eq!(short, fresh);
+
+    // Another size: the kept pass and texture are made again for the new
+    // target, and read what a fresh read does.
+    gpu.resize(32, 24);
+    let mut small = Scene::new(32., 24.);
+    let small_root = small.root();
+    small.set_kind(small_root, NodeKind::Container(Layout::Overlay));
+    let dot = small.append(
+        small_root,
+        NodeKind::Panel {
+            layout: Layout::Overlay,
+            quad: QuadStyle {
+                fill: Color(10, 200, 90, 255),
+                ..Default::default()
+            },
+        },
+        fixed(8., 8.),
+    );
+    small.set_transform(dot, Transform { x: 4., y: 4. });
+    small.flush();
+    gpu.render(&small, &[Rect::new(0., 0., 32., 24.)]).unwrap();
+    let fresh = gpu.readback().unwrap();
+    assert_eq!(fresh.len(), 32 * 24 * 4);
+    gpu.readback_into(&mut kept, &mut staging).unwrap();
+    assert_eq!(kept, fresh);
+}
+
+/// A frame copied into a pixel buffer on the GPU holds the target's pixels
+/// (as readback reads them), and the pool lends no more than it may hold.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_frame_copied_into_a_pixel_buffer_holds_the_targets_pixels() {
+    let _gpu = gpu_fixture();
+    let mut scene = Scene::new(32., 16.);
+    let root = scene.root();
+    scene.set_kind(root, NodeKind::Container(Layout::Overlay));
+    let half = scene.append(
+        root,
+        NodeKind::Panel {
+            layout: Layout::Overlay,
+            quad: QuadStyle {
+                fill: Color(20, 200, 60, 255),
+                ..Default::default()
+            },
+        },
+        fixed(16., 16.),
+    );
+    scene.set_transform(half, Transform { x: 16., y: 0. });
+    scene.flush();
+    let mut gpu = GpuRenderer::new(32, 16).unwrap();
+    gpu.render(&scene, &[Rect::new(0., 0., 32., 16.)]).unwrap();
+    let rgba = gpu.readback().unwrap();
+    let mut staging = zgx_gpu::SurfaceReadback::default();
+    let buffer = gpu.readback_surface(&mut staging).unwrap();
+    // The buffer's BGRA, row by row, as RGBA.
+    let read = buffer.to_rgba();
+    assert!(read == rgba, "the buffer differs from the target");
+    // At most four lent at once: a fifth is a buffer of its own, with the
+    // same pixels, and once one is let go the pool lends again.
+    let mut held = vec![buffer];
+    while held.len() < 4 {
+        held.push(gpu.readback_surface(&mut staging).unwrap());
+    }
+    assert_eq!(staging.unpooled(), 0, "the pool lent fewer than four");
+    let fifth = gpu.readback_surface(&mut staging).unwrap();
+    assert_eq!(staging.unpooled(), 1, "the pool lent a fifth");
+    assert!(fifth.to_rgba() == rgba, "a fifth buffer differs");
+    drop(fifth);
+    held.pop();
+    gpu.readback_surface(&mut staging).unwrap();
+    assert_eq!(staging.unpooled(), 1, "the pool didn't lend again");
+    // Bytes drawn on the CPU (a blurred frame) uploaded hold the same.
+    let uploaded = staging.upload(32, 16, &rgba).unwrap();
+    assert!(uploaded.to_rgba() == rgba, "uploaded bytes differ");
 }

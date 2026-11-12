@@ -10,7 +10,11 @@ use std::path::PathBuf;
 use zgx_script::{Capability, Plugin, ScriptHost};
 
 fn plugin(name: &str, code: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zgx-filters-{}-{name}", std::process::id()));
+    // A directory of each call's own: tests run in parallel in one process,
+    // and two writing one name's file would load each other's code.
+    static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("zgx-filters-{}-{n}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let entry = dir.join("init.luau");
     std::fs::write(&entry, code).unwrap();
@@ -297,6 +301,38 @@ fn an_order_filter_moves_children() {
         ["C", "B", "A"],
         "the listed first, the rest after"
     );
+}
+
+/// An order filter holds its node in a box of its own, what a plugin's filter
+/// has always laid out as: the node's `grow` stays inside it, unlike a node
+/// with no such filter.
+#[test]
+fn an_order_filter_keeps_its_node_in_a_box() {
+    const GROWS: &str = r##"
+return ui.column { w_full = true, h_full = true,
+    ui.column { id = "toolbar", grow = 1,
+        ui.div { id = "a", w = 40, h = 10 },
+        ui.div { id = "b", w = 40, h = 10 },
+    },
+    ui.div { id = "below", w = 40, h = 10 },
+}"##;
+    let bounds = |h: &mut Harness, id: &str| {
+        let node = h.find(id).unwrap();
+        h.ui.scene.borrow().bounds(node)
+    };
+    let mut h = with(
+        GROWS,
+        "same",
+        r##"ui.filter { target = "#toolbar", order = function(ids) return ids end }"##,
+        any(),
+    );
+    assert_eq!(h.error(), None);
+    h.frames(2);
+    assert_eq!(bounds(&mut h, "toolbar").height, 20.);
+    assert_eq!(bounds(&mut h, "below").y, 20.);
+    let mut plain = Harness::inline(GROWS);
+    plain.frames(2);
+    assert!(bounds(&mut plain, "toolbar").height > 20.);
 }
 
 #[test]

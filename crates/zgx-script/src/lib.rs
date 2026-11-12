@@ -39,7 +39,9 @@ mod design;
 pub mod driver;
 mod element;
 mod elements_report;
+mod estimate;
 mod fetch_policy;
+mod json;
 pub use elements_report::{ElementGroup, ElementsReport, ListedElement};
 mod errors;
 #[cfg(target_os = "macos")]
@@ -110,7 +112,7 @@ pub fn window_size_value(width: f32, height: f32) -> Value {
 pub use rules::GuardKind;
 pub use value::{
     ElementHandle, Folded, PathKey, Shared, Store, Unfold, Value, tables_converted,
-    values_converted,
+    values_converted, values_filed,
 };
 pub use windows::{Window, WindowExtras};
 
@@ -188,14 +190,16 @@ fn read_aliases(dir: &std::path::Path, files: Files) -> HashMap<String, PathBuf>
         })
         .unwrap_or_default()
 }
-/// Whether `path` is in `root` (a canonical directory): by its name, and,
-/// where it exists, by what it is, so a symbolic link inside the root to a
-/// file outside it (a plugin shipping one to `~/.ssh`) is outside too.
+/// Whether `path` is in `root`: by its name, and, where it exists, by what
+/// it is, so a symbolic link inside the root to a file outside it (a plugin
+/// shipping one to `~/.ssh`) is outside too.
 pub(crate) fn within(root: &std::path::Path, path: &std::path::Path) -> bool {
     path.starts_with(root)
-        && path
-            .canonicalize()
-            .map_or(true, |real| real.starts_with(root))
+        && path.canonicalize().map_or(true, |real| {
+            // Where it really is, against where the root really is: the root
+            // itself may lie under a link (macOS's temporary directory does).
+            real.starts_with(root) || root.canonicalize().is_ok_and(|root| real.starts_with(root))
+        })
 }
 /// `path` with `.` and `..` resolved in place, without touching the disk.
 pub(crate) fn normalize(path: &std::path::Path) -> PathBuf {
@@ -309,6 +313,12 @@ fn past_budget(wall: Duration, cpu: Duration, budget: Duration, grain: Duration)
 /// How the last call stopped for its time on this thread was stopped: how
 /// late the watchdog woke, how long the interrupt took after, and the CPU
 /// the call had used (what a test bounding the stop says when it fails).
+/// How many times a size-animated box (`layout`) on this thread has looked
+/// for those inside it: what a test bounding a page of them mounting reads.
+#[doc(hidden)]
+pub fn layout_box_scans() -> u64 {
+    lower::layout_box_scans()
+}
 #[doc(hidden)]
 pub fn last_budget_stop() -> Option<interrupt::BudgetStop> {
     interrupt::last_stop()
@@ -390,6 +400,33 @@ fn thread_cpu() -> Duration {
     START.with(|s| s.elapsed())
 }
 
+/// What a script reads of time and chance, on a virtual clock: Luau's own
+/// clocks are the wall's, and its random numbers seeded from it.
+#[cold]
+fn on_virtual_clock(lua: &Lua) -> mlua::Result<()> {
+    let start = zgx::clock::now();
+    let os: mlua::Table = lua.globals().get("os")?;
+    os.set(
+        "clock",
+        lua.create_function(move |_, ()| Ok((zgx::clock::now() - start).as_secs_f64()))?,
+    )?;
+    let time: mlua::Function = os.get("time")?;
+    os.set(
+        "time",
+        lua.create_function(move |_, date: Option<mlua::Value>| match date {
+            Some(date) => time.call::<mlua::Value>(date),
+            None => Ok(mlua::Value::Number(
+                zgx::clock::system_now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0., |date| date.as_secs() as f64),
+            )),
+        })?,
+    )?;
+    let math: mlua::Table = lua.globals().get("math")?;
+    math.get::<mlua::Function>("randomseed")?.call::<()>(1)?;
+    Ok(())
+}
+
 pub(crate) struct Vm {
     name: String,
     /// The time budget and memory watch (see `interrupt`).
@@ -409,8 +446,50 @@ pub(crate) struct Vm {
     pub(crate) locate: Rc<Cell<bool>>,
     /// The host's live lint mode, warnings and script call count.
     pub(crate) warnings: SharedWarnings,
+    /// Makes a pointer event's table (`point_table`), compiled once.
+    pub(crate) point: std::cell::OnceCell<mlua::Function>,
 }
 impl Vm {
+    /// A pointer event's table for a handler: `x`, `y`, `local_x`,
+    /// `local_y` and the keys held, and a move's `dx`, `dy` (and `locked`,
+    /// while the pointer is). Built in one call into the state: field by
+    /// field from Rust, each `set` (and each key's string) was a protected
+    /// call of its own while a memory limit is set, and a pointer move
+    /// makes one of these for every handler on its way. One maker for
+    /// every event, compiled once: an event that isn't a move leaves the
+    /// move's arguments off, and its table has no such fields.
+    pub(crate) fn point_table(
+        &self,
+        (x, y, local_x, local_y): (f32, f32, f32, f32),
+        (shift, ctrl, alt, meta, cmd): (bool, bool, bool, bool, bool),
+        motion: Option<(f32, f32, bool)>,
+    ) -> mlua::Result<mlua::Table> {
+        let make = match self.point.get() {
+            Some(make) => make,
+            None => {
+                let made = self
+                    .lua
+                    .load(
+                        "local x, y, local_x, local_y, shift, ctrl, alt, meta, cmd, dx, dy, locked = ...\n\
+                         return { x = x, y = y, local_x = local_x, local_y = local_y, shift = shift, \
+                         ctrl = ctrl, alt = alt, meta = meta, cmd = cmd, dx = dx, dy = dy, \
+                         locked = locked }",
+                    )
+                    .set_name("=zgx pointer event")
+                    .into_function()?;
+                self.point.get_or_init(|| made)
+            }
+        };
+        match motion {
+            None => make.call((x, y, local_x, local_y, shift, ctrl, alt, meta, cmd)),
+            Some((dx, dy, false)) => {
+                make.call((x, y, local_x, local_y, shift, ctrl, alt, meta, cmd, dx, dy))
+            }
+            Some((dx, dy, true)) => make.call((
+                x, y, local_x, local_y, shift, ctrl, alt, meta, cmd, dx, dy, true,
+            )),
+        }
+    }
     /// Runs `f` with its own budget. A nested call (a component built
     /// while a handler runs) stops the outer call's clock meanwhile.
     pub(crate) fn guard<R>(
@@ -1284,7 +1363,29 @@ fn require_module<const LENDING: bool>(
     let lent = LENDING
         && matches!(files, Files::Disk)
         && packages.iter().any(|(_, dir)| within(dir, &path));
+    // A package's module, the app's: compiled once for every host until
+    // the next idle trim. A hot-reloading host keeps its own by path (its
+    // `sources`), as for its other files: a trim between edits would
+    // otherwise compile them again at each reload.
+    let in_package = !LENDING
+        && matches!(files, Files::Disk)
+        && packages.iter().any(|(_, dir)| path.starts_with(dir));
+    let package = in_package
+        .then(|| host.upgrade())
+        .flatten()
+        .filter(|h| !h.sources.hot())
+        .map(|h| {
+            let (entry, now) = sources::package_compiled(&code);
+            let count = if now {
+                &h.package_compiles
+            } else {
+                &h.package_hits
+            };
+            count.set(count.get() + 1);
+            entry
+        });
     let compiled = match files {
+        _ if package.is_some() => None,
         Files::Disk if lent => host.upgrade().map(|h| {
             let (compiled, now) = sources::compiled(&code);
             h.lent_compiles.set(h.lent_compiles.get() + u64::from(now));
@@ -1300,7 +1401,11 @@ fn require_module<const LENDING: bool>(
             .or_else(|| sources::prefetched(&code)),
         Files::Bundle(_) => None,
     };
-    let loaded = match compiled.as_deref().and_then(sources::Compiled::bytecode) {
+    let bytecode = match package.as_deref() {
+        Some(package) => package.bytecode(),
+        None => compiled.as_deref().and_then(sources::Compiled::bytecode),
+    };
+    let loaded = match bytecode {
         Some(bytecode) => lua.load(bytecode).set_mode(mlua::chunk::ChunkMode::Binary),
         None => files.chunk(lua.load(code)),
     };
@@ -1415,10 +1520,29 @@ pub fn compile_ahead(script: &std::path::Path, packages: &[(&str, &std::path::Pa
 /// What [`compile_ahead`] did: its latest session's files compiled, whether
 /// its worker is done, whether the session is still open (no load has ended
 /// since), `require`s that found their file compiled ahead (all sessions),
+/// How many packages' modules are kept compiled for hosts to share, until
+/// the next idle trim. For tests.
+#[doc(hidden)]
+pub fn packages_kept() -> usize {
+    sources::packages_kept()
+}
 /// and the compiled entries this thread holds from it. For tests.
 #[doc(hidden)]
 pub fn compile_ahead_counts() -> (usize, bool, bool, usize, usize) {
     sources::ahead_counts()
+}
+
+/// Let animation tracks still at what their property holds skip their
+/// frames (the default), or write every frame as before. For tests: what
+/// an app shows is the same either way.
+#[doc(hidden)]
+pub fn still_tracks_skip(skip: bool) {
+    anime::engine::set_still_skips(skip);
+}
+/// Frames animation tracks skipped this way on this thread. For tests.
+#[doc(hidden)]
+pub fn still_tracks_skipped() -> u64 {
+    anime::engine::still_skipped()
 }
 
 /// Hold [`compile_ahead`]'s workers before their next file, or let them go.
@@ -1560,6 +1684,9 @@ struct Inner {
     /// by name (`package`): `@name/…`.
     packages: Vec<(String, PathBuf)>,
     limits: Limits,
+    /// The collector's goal for a large heap (`ScriptHost::large_heap_goal`),
+    /// in percent: none, Luau's own at every size.
+    large_heap_goal: Option<u16>,
     stores: RefCell<HashMap<String, Rc<Store>>>,
     shared: Rc<Store>,
     /// Keeps `ui.window.titlebar_area` and `controls` as the window's
@@ -1572,8 +1699,9 @@ struct Inner {
     /// Keeps the window's zoom and `ui.window.zoom` the same (`window_zoom`).
     zoom: RefCell<Option<zgx::reactive::Effect>>,
     visible: RefCell<Option<zgx::reactive::Effect>>,
-    /// What publishes the window's state (`window_state`).
-    window_state: RefCell<Vec<zgx::reactive::Effect>>,
+    /// What publishes the window's state: `window_maximized`'s (true) and
+    /// `window_state`'s, each starting only its own anew.
+    window_state: RefCell<Vec<(bool, zgx::reactive::Effect)>>,
     elements: Rc<element::Elements>,
     engine: Rc<anime::Engine>,
     assets: Rc<lower::Assets>,
@@ -1583,6 +1711,8 @@ struct Inner {
     functions: Functions,
     current: RefCell<Option<Rc<Loaded>>>,
     generation: Signal<u64>,
+    /// Where focus was as a reload began, before its scripts ran.
+    focus: zgx::compose::FocusHold,
     error: Signal<Option<String>>,
     stamps: RefCell<Vec<(PathBuf, Option<SystemTime>)>>,
     /// Files scripts `require`d in the last load: watched with the scripts.
@@ -1597,6 +1727,10 @@ struct Inner {
     lent_compiled: RefCell<HashMap<PathBuf, Rc<sources::Compiled>>>,
     /// How many lent modules were compiled (not found compiled).
     lent_compiles: Cell<u64>,
+    /// Packages' modules it compiled, and found compiled by another host
+    /// (`sources::package_compiled`).
+    package_compiles: Cell<u64>,
+    package_hits: Cell<u64>,
     /// The scripts' bytecode by what their files held, once the host
     /// hot-reloads: a reload compiles only what changed.
     sources: sources::Sources,
@@ -1754,6 +1888,7 @@ impl ScriptHost {
             packages: Vec::new(),
             plugins: Vec::new(),
             limits: Limits::default(),
+            large_heap_goal: None,
             stores: RefCell::default(),
             elements: elements.clone(),
             engine: {
@@ -1779,12 +1914,15 @@ impl ScriptHost {
             functions: Functions::default(),
             current: RefCell::default(),
             generation: runtime.signal(0),
+            focus: zgx::compose::FocusHold::default(),
             error: runtime.signal(None),
             stamps: RefCell::default(),
             required: RefCell::default(),
             lent: RefCell::default(),
             lent_compiled: RefCell::default(),
             lent_compiles: Cell::new(0),
+            package_compiles: Cell::new(0),
+            package_hits: Cell::new(0),
             sources: sources::Sources::default(),
             overrides: RefCell::default(),
             decisions: Rc::new(lower::Decisions::new(runtime)),
@@ -1871,8 +2009,8 @@ impl ScriptHost {
         }
     }
     /// Calls `hook` with each issue the framework reports (`zgx::issues`),
-    /// with its kind: an error, or the renderer going on with less (a layer
-    /// coarser, an image softer), which `on_error` hears too, untagged.
+    /// with its kind: an error, or the renderer going on with less (a glyph
+    /// left out), which `on_error` hears too, untagged.
     pub fn on_issue(&self, hook: impl Fn(zgx::issues::IssueKind, &str) + 'static) {
         self.0.issues.borrow_mut().hooks.push(Rc::new(hook));
     }
@@ -2173,6 +2311,20 @@ impl ScriptHost {
     pub fn limits(self, limits: Limits) -> Self {
         self.configure(|inner| inner.limits = limits)
     }
+    /// Once a VM's heap passes 32 MB, its collector aims for `percent` of
+    /// the heap in use (Luau's own is 200: the heap may double before a
+    /// cycle); it goes back once the heap settles below 24 MB. The collector
+    /// can't see what a script's objects hold in Rust (a node's userdata, far
+    /// more than its own bytes), so a large heap left to double keeps rows
+    /// long gone and all they hold. A lower peak for more collection work: a
+    /// heap of 100 MB churned peaks about 23% lower at 150, for about 9% more
+    /// instructions in the script, and rests where it would. Off by default.
+    ///
+    /// No call pays to look: the VM's allocator notices the heap crossing,
+    /// and the goal changes as that call ends.
+    pub fn large_heap_goal(self, percent: u16) -> Self {
+        self.configure(|inner| inner.large_heap_goal = Some(percent))
+    }
     /// Names the application: `ui.persist` saves under its data directory
     /// ([`app_data_dir`]), in `script-state`.
     pub fn app_id(self, id: &str) -> Self {
@@ -2243,6 +2395,28 @@ impl ScriptHost {
     /// size: what shows it follows each replacement; `None` clears it.
     pub fn gpu_view(&self, name: &str, view: Option<zgx::gpu_view::GpuView>) {
         self.0.assets.set_view(name, view, &self.0.runtime);
+    }
+    /// A frame the app shows as it is (a video's, as its decoder or
+    /// renderer made it), for `ui.image { src = "host:<name>" }`: drawn
+    /// from its own storage, with no bytes read back or uploaded, and
+    /// followed as it's replaced. Its `host:<name>` image, if the app sets
+    /// one too, is what reads its pixels (`bg_image`, `dither`,
+    /// `characters`) and what shows once this is `None`.
+    #[cfg(target_os = "macos")]
+    pub fn surface(
+        &self,
+        name: &str,
+        surface: Option<std::rc::Rc<zgx::native_surface::NativeSurface>>,
+    ) {
+        self.0.assets.set_surface(name, surface, &self.0.runtime);
+    }
+    /// The frame set as `host:<name>` ([`ScriptHost::surface`]), if any.
+    #[cfg(target_os = "macos")]
+    pub fn hosted_surface(
+        &self,
+        name: &str,
+    ) -> Option<std::rc::Rc<zgx::native_surface::NativeSurface>> {
+        self.0.assets.hosted_surface(name)
     }
     /// The transport for `ui.fetch` (and remote images): the app owns the
     /// HTTP stack, headers and credentials (a token minted per request), and
@@ -2498,7 +2672,7 @@ impl ScriptHost {
     /// `ui.window.active` and `ui.window.shown`: an app tells someone of
     /// what arrives while they are away (a system notification, a badge).
     pub fn window_state(&self, ui: &zgx::widgets::Ui) {
-        self.0.window_state.borrow_mut().clear();
+        (self.0.window_state.borrow_mut()).retain(|(maximized, _)| *maximized);
         for (key, source) in [
             (windows::ACTIVE, ui.observe_window_active()),
             (windows::SHOWN, ui.observe_shown()),
@@ -2513,7 +2687,7 @@ impl ScriptHost {
                     state.set(now);
                 }
             });
-            self.0.window_state.borrow_mut().push(effect);
+            self.0.window_state.borrow_mut().push((false, effect));
         }
     }
     /// Keep `ui.window.full_screen` as whether the window is in full
@@ -2548,6 +2722,23 @@ impl ScriptHost {
             }
         });
         *self.0.full_screen.borrow_mut() = Some(effect);
+    }
+    /// Keep `ui.window.maximized` as whether the window is maximized: pass
+    /// its `WindowContext::maximized`.
+    pub fn window_maximized(&self, maximized: Signal<bool>) {
+        let state = self.0.shared.state(
+            windows::MAXIMIZED,
+            Value::Bool(maximized.with_untracked(|now| *now)),
+        );
+        let effect = self.0.runtime.effect(move || {
+            let now = Value::Bool(maximized.get());
+            if state.with_untracked(|was| *was != now) {
+                state.set(now);
+            }
+        });
+        let mut effects = self.0.window_state.borrow_mut();
+        effects.retain(|(maximized, _)| !*maximized);
+        effects.push((true, effect));
     }
     /// Keep `ui.window.size` as the window's size in points: pass its
     /// `WindowContext::viewport`. For what layout can't say (a sidebar
@@ -2777,6 +2968,17 @@ impl ScriptHost {
     pub fn collect_garbage(&self) {
         collect_garbage(&self.0);
     }
+    /// A full collection in each VM and nothing else: one the scripts'
+    /// allocations bring on as they run, with none of what the host does as
+    /// it goes idle (`collect_garbage`). For tests: what scripts are given
+    /// must not depend on when one came.
+    #[doc(hidden)]
+    pub fn collect_luau_only(&self) {
+        let loaded = self.0.current.borrow().clone();
+        for vm in loaded.iter().flat_map(|loaded| loaded._vms.iter()) {
+            collect_fully(&vm.lua);
+        }
+    }
     /// Bytes the loaded scripts' VMs hold now, garbage included (for tests:
     /// what a collection frees).
     #[doc(hidden)]
@@ -2786,7 +2988,10 @@ impl ScriptHost {
     }
     /// Bytes the loaded scripts' VMs hold after a full collection (each is
     /// capped at `Limits::memory` or `Limits::plugin_memory`): what a test reads over many updates to
-    /// check that nothing keeps what it no longer needs.
+    /// check that nothing keeps what it no longer needs. The conversion
+    /// cache's tables count until the host next goes idle (`collect_garbage`
+    /// lets go of what no script holds), so a number here is no leak until
+    /// it survives that.
     pub fn script_memory(&self) -> usize {
         let loaded = self.0.current.borrow().clone();
         loaded.map_or(0, |l| {
@@ -2800,14 +3005,63 @@ impl ScriptHost {
         })
     }
     /// The scripts' lines of a memory report: each VM's heap as it stands
-    /// (no collection), and the pictures they show and keep.
+    /// (no collection), of it the pages pooled outside the program's heap
+    /// (every VM's together), and the pictures they show and keep.
     pub fn memory(&self, report: &mut zgx::memory::Report) {
         if let Some(loaded) = self.0.current.borrow().clone() {
             for vm in &loaded._vms {
                 report.add("luau", vm.name.clone(), None, Some(vm.lua.used_memory()));
             }
         }
+        report.add(
+            "luau",
+            "of which pooled pages (every VM)",
+            None,
+            Some(mlua::pooled_page_bytes()),
+        );
+        self.0.engine.memory(report);
         self.0.assets.memory(report);
+        self.states_memory(report);
+    }
+    /// The named states' values, each part counted once however many share
+    /// it: the largest one by one with their text and folded rows, the rest
+    /// together. Worked out only as a report asks.
+    #[cold]
+    fn states_memory(&self, report: &mut zgx::memory::Report) {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut each: Vec<(String, Option<usize>, value::Holding)> = self
+            .named_states()
+            .into_iter()
+            .map(|(name, signal)| {
+                let mut holding = value::Holding::default();
+                let rows = signal.with_untracked(|value| {
+                    value.holding(&mut seen, &mut holding);
+                    match value {
+                        Value::List(items) => Some(items.len()),
+                        _ => None,
+                    }
+                });
+                (name, rows, holding)
+            })
+            .collect();
+        let all: usize = each.iter().map(|(.., held)| held.bytes).sum();
+        report.add("state", "all named states", Some(each.len()), Some(all));
+        each.sort_by_key(|(.., held)| std::cmp::Reverse(held.bytes));
+        for (name, rows, held) in each.into_iter().take(STATES_LISTED) {
+            if held.bytes < STATE_LISTED_FROM {
+                break;
+            }
+            report.add("state", name.clone(), rows, Some(held.bytes));
+            report.add("state", format!("{name}: text"), None, Some(held.text));
+            if held.folded > 0 {
+                report.add(
+                    "state",
+                    format!("{name}: folded rows"),
+                    Some(held.folded),
+                    None,
+                );
+            }
+        }
     }
     /// How many converted values the loaded scripts' VMs keep (each with
     /// its table, until nothing else holds the value): with
@@ -3097,6 +3351,10 @@ impl ScriptHost {
         self.0.commands.begin();
         self.0.windows.begin();
         let reports = self.0.error.version();
+        // Before the scripts run: what they set can move focus in the
+        // interface shown (a `ui.presence` keyed by it ending), and what is
+        // built again keeps focus where it was before.
+        self.0.focus.take();
         let loaded = match ran {
             Some(ran) => self.load_kept(&ran),
             None => self.load(),
@@ -3159,6 +3417,7 @@ impl ScriptHost {
                 Ok(())
             }
             Err(error) => {
+                self.0.focus.release();
                 eprintln!("{error}");
                 report(&self.0.error, error.clone());
                 self.start_check();
@@ -3419,7 +3678,8 @@ impl ScriptHost {
         let generation = self.0.generation.clone();
         // Built again each load: what had the keyboard keeps it (a list's
         // row included, found by its role and name).
-        let app = zgx::compose::switch_keeping_focus(
+        let app = zgx::compose::switch_keeping_focus_held(
+            self.0.focus.clone(),
             move || generation.get(),
             move |_, _| {
                 let current = host.current.borrow().clone();
@@ -3585,6 +3845,12 @@ impl ScriptHost {
     #[doc(hidden)]
     pub fn lent_compiles(&self) -> u64 {
         self.0.lent_compiles.get()
+    }
+    /// The packages' modules this host compiled, and those it found compiled
+    /// by another host (for tests).
+    #[doc(hidden)]
+    pub fn package_compiles(&self) -> (u64, u64) {
+        (self.0.package_compiles.get(), self.0.package_hits.get())
     }
     /// Whether `stamps`, read now, name the files of the last load and each
     /// whose time moved holds what that load read.
@@ -4021,19 +4287,13 @@ impl ScriptHost {
         };
         lua.set_memory_limit(memory).map_err(fail)?;
         lua.set_app_data(MemoryLimit(memory));
-        // The collector's goal for what a cycle may leave: 125% of the heap in
-        // use, where Luau's default lets it double. It can't see what a script's
-        // objects hold in Rust (a node's userdata, far more than its own bytes),
-        // so a heap that doubles keeps rows long gone: about 40 MB more of the
-        // script heap in a long session, and what those rows hold beside it.
-        // SAFETY: the collector's own setting, on a state nothing runs in yet.
-        let _ = unsafe {
-            lua.exec_raw::<()>((), |state| {
-                mlua::ffi::lua_gc(state, mlua::ffi::LUA_GCSETGOAL, GC_GOAL);
-            })
-        };
         let deadline: Rc<Cell<Option<Deadline>>> = Rc::default();
-        let interrupt = interrupt::install(&lua, deadline.clone(), memory);
+        let interrupt = interrupt::install(
+            &lua,
+            deadline.clone(),
+            memory,
+            self.0.large_heap_goal.map(std::ffi::c_int::from),
+        );
         let watch = interrupt.watch();
         #[cfg(test)]
         tests::count_closing(&lua);
@@ -4049,6 +4309,7 @@ impl ScriptHost {
             layout_ids: Default::default(),
             locate: self.0.locate.clone(),
             warnings: self.0.warnings.clone(),
+            point: Default::default(),
         });
         let store = self
             .0
@@ -4108,6 +4369,7 @@ impl ScriptHost {
         // Each module made the first time a script names it (`lazy`).
         let lazy = lazy::Lazy::default();
         lazy.ui(&["path", "linear"], canvas::install);
+        lazy.ui(&["glass"], node::install_glass);
         #[cfg(feature = "scene3d")]
         lazy.ui(
             &["scene3d", "mesh", "light", "group", "model"],
@@ -4208,6 +4470,9 @@ impl ScriptHost {
         .map_err(fail)?;
         lazy::attach(&lua, &ui, lazy).map_err(fail)?;
         ui.set_readonly(true);
+        if zgx::clock::is_virtual() {
+            on_virtual_clock(&lua).map_err(fail)?;
+        }
         lua.sandbox(true).map_err(fail)?;
         let (root, contributions, hooks) = self.evaluate(&vm, script, files, &code)?;
         Ok((vm, root, contributions, hooks))
@@ -4349,10 +4614,14 @@ fn collect_garbage(inner: &Inner) {
     let loaded = inner.current.borrow().clone();
     for vm in loaded.iter().flat_map(|loaded| loaded._vms.iter()) {
         collect_fully(&vm.lua);
-        // What that freed of the conversion cache's tables, its values too,
-        // and what only those held.
+        // The conversion cache's tables weak for one collection: what only
+        // the cache holds goes, then its values too, and what only those
+        // held.
+        value::weaken_cache(&vm.lua);
+        collect_fully(&vm.lua);
         value::sweep_idle(&vm.lua);
         collect_fully(&vm.lua);
+        vm.interrupt.heap_settled(vm.lua.used_memory());
     }
 }
 /// Full collections until one frees nothing more: a collection finalizes
@@ -4368,8 +4637,10 @@ fn collect_fully(lua: &mlua::Lua) {
         held = now;
     }
 }
-/// `LUA_GCSETGOAL`, in percent (see where it's set).
-const GC_GOAL: std::ffi::c_int = 125;
+/// States a memory report lists one by one (`states_memory`), the largest,
+/// and only from this size.
+const STATES_LISTED: usize = 12;
+const STATE_LISTED_FROM: usize = 64 * 1024;
 /// What the host gives back as it goes idle: its scripts' garbage, then the
 /// pictures no node shows (the image cache keeps up to its budget of them
 /// while the app is in use, so a page shown again is instant).
@@ -4382,11 +4653,88 @@ fn trim_idle(inner: &Inner) {
     collect_garbage(inner);
     mlua::release_free_pages();
     inner.assets.trim();
+    // Packages' compiled modules, every host's: the next host compiles them.
+    sources::release_packages();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host asked for a large-heap goal tightens its VM's collector once a
+    /// call takes its heap past the line (here, the script's load); a host
+    /// that didn't (the default) leaves Luau's own.
+    #[test]
+    fn a_large_heap_goal_is_the_hosts_choice() {
+        let runtime = zgx::reactive::Runtime::new();
+        let script = "big = {} for i = 1, 1500000 do big[i] = tostring(i) end return ui.column {}";
+        let tight = |host: &ScriptHost| {
+            host.reload().expect("loads");
+            let current = host.0.current.borrow().clone().expect("loaded");
+            current._vms[0].interrupt.goal_is_tight()
+        };
+        let asked = ScriptHost::inline(&runtime, "large", script).large_heap_goal(150);
+        assert!(tight(&asked), "tightened past the line");
+        let default = ScriptHost::inline(&runtime, "large", script);
+        assert!(!tight(&default), "Luau's own without the option");
+    }
+    /// A directory for one test, under its real path.
+    fn real_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zgx-within-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn within_holds_through_a_linked_root_and_not_out_of_one() {
+        use std::os::unix::fs::symlink;
+        let dir = real_dir("linked");
+        let (real, outside) = (dir.join("real"), dir.join("outside"));
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(real.join("sub/in.luau"), "").unwrap();
+        std::fs::write(outside.join("secret.luau"), "").unwrap();
+        // A plain root: what's in it, and a link in it reaching out.
+        assert!(within(&real, &real.join("sub/in.luau")));
+        symlink(&outside, real.join("out")).unwrap();
+        assert!(!within(&real, &real.join("out/secret.luau")));
+        symlink(outside.join("secret.luau"), real.join("file")).unwrap();
+        assert!(!within(&real, &real.join("file")));
+        // A root under a link: what's in it is in it...
+        let root = dir.join("link");
+        symlink(&real, &root).unwrap();
+        assert!(within(&root, &root.join("sub/in.luau")));
+        // ...a link in it still reaches out...
+        assert!(!within(&root, &root.join("out/secret.luau")));
+        // ...and a link in it to its own files stays in.
+        symlink(real.join("sub"), real.join("back")).unwrap();
+        assert!(within(&root, &root.join("back/in.luau")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn within_takes_no_way_out_by_its_path_alone() {
+        let dir = real_dir("dots");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.join("secret.luau"), "").unwrap();
+        std::fs::write(root.join("in.luau"), "").unwrap();
+        assert!(within(&root, &root.join("in.luau")));
+        // Beside it, by its own name or a name that starts the same.
+        assert!(!within(&root, &dir.join("secret.luau")));
+        assert!(!within(&root, &dir.join("root2/in.luau")));
+        // `..` out of it, resolved as a caller resolves it, and as it comes.
+        assert!(!within(&root, &normalize(&root.join("../secret.luau"))));
+        assert!(!within(&root, &root.join("../secret.luau")));
+        // Not there yet: its path says, as before.
+        assert!(within(&root, &root.join("missing.luau")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     thread_local! {
         /// Scripts' states closed on this thread.
@@ -4481,7 +4829,7 @@ mod tests {
         let deadline: Rc<Cell<Option<Deadline>>> = Rc::default();
         let vm = Vm {
             name: "panics".into(),
-            interrupt: interrupt::install(&lua, deadline.clone(), 0),
+            interrupt: interrupt::install(&lua, deadline.clone(), 0, None),
             lua,
             base: None,
             deadline,
@@ -4491,6 +4839,7 @@ mod tests {
             layout_ids: Default::default(),
             locate: Rc::default(),
             warnings: Rc::default(),
+            point: Default::default(),
         };
         let host = vm
             .lua

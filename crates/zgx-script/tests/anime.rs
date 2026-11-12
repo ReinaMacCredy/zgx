@@ -778,6 +778,46 @@ fn layout_boxes_spring_to_their_content() {
 }
 
 #[test]
+fn layout_boxes_take_a_change_under_a_hundredth_of_a_point_at_once() {
+    // Rounding (text measured again, a parent's share shrinking) moves a
+    // size by thousandths: taken at once, with nothing left animating. A
+    // change anyone could see still eases.
+    let mut h = Harness::inline(
+        r##"local height = ui.state("height", 20)
+        return ui.column {
+            ui.column { id = "box", layout = "height", layout_ease = "linear", layout_duration = 100,
+                ui.div { h = height, w = 50 } },
+            ui.div { id = "below", w = 10, h = 10 },
+            ui.button { id = "nudge", w = 10, h = 10, on_click = ui.set(height, 20.005) },
+            ui.button { id = "grow", w = 10, h = 10, on_click = ui.set(height, 30) },
+        }"##,
+    );
+    let y = |h: &mut Harness| {
+        let node = h.find("below").unwrap();
+        h.ui.scene.borrow().bounds(node).y
+    };
+    h.ui.prepare_frame();
+    h.settle();
+    h.ui.prepare_frame();
+    assert_eq!(y(&mut h), 20.);
+    h.click("nudge");
+    h.ui.prepare_frame();
+    h.settle();
+    h.frame();
+    h.ui.prepare_frame();
+    assert!((y(&mut h) - 20.005).abs() < 1e-4, "at once: {}", y(&mut h));
+    assert!(!h.clock.wants_frame(), "nothing eases");
+    h.click("grow");
+    h.ui.prepare_frame();
+    h.settle();
+    h.frame();
+    h.run_ms(50.);
+    h.ui.prepare_frame();
+    let mid = y(&mut h);
+    assert!(mid > 21. && mid < 29., "eases toward 30, at {mid}");
+}
+
+#[test]
 fn layout_boxes_take_a_reflow_at_once() {
     // Narrowing the box wraps its row onto a second line: the height changed
     // because the width did, not the content, so it is not animated.
@@ -1580,4 +1620,344 @@ fn an_unrelated_restyle_keeps_what_animate_set() {
     assert_eq!(h.fill("box"), Color(0xff, 0x88, 0, 255));
     close(h.x("box"), 100., "x after the colour changed");
     close(h.opacity("box"), 0.5, "opacity after the colour changed");
+}
+
+/// One property animated leaves the node's others alone: a function among
+/// them runs when what it reads changes, not on each frame of the animation.
+const ANIMATED_WITH_FUNCTIONS: &str = r##"
+local tint = ui.shared("tint", "#ff0000")
+anime.animate("#box", { w = 200, duration = 1000 })
+return ui.column {
+    ui.div { id = "box", w = 100, h = 20,
+        bg = function() return tint:get() end,
+        rounded = function() return 4 end,
+    },
+}"##;
+
+#[test]
+fn a_frame_of_an_animation_runs_none_of_the_nodes_functions() {
+    let mut h = Harness::inline(ANIMATED_WITH_FUNCTIONS);
+    h.run_ms(50.);
+    let before = h.host.script_calls();
+    h.run_ms(500.);
+    assert_eq!(h.host.script_calls(), before, "the engine moves it alone");
+    let w = {
+        let node = h.find("box").unwrap();
+        h.ui.scene.borrow().bounds(node).width
+    };
+    assert!(w > 100. && w < 200., "on its way: {w}");
+}
+
+#[test]
+fn a_function_on_an_animating_node_still_follows_what_it_reads() {
+    let mut h = Harness::inline(ANIMATED_WITH_FUNCTIONS);
+    h.run_ms(50.);
+    assert_eq!(h.fill("box"), Color(255, 0, 0, 255));
+    let before = h.host.script_calls();
+    h.host
+        .shared("tint", "#ff0000")
+        .set(zgx_script::Value::Str("#00ff00".into()));
+    h.run_ms(100.);
+    assert_eq!(h.fill("box"), Color(0, 255, 0, 255));
+    assert_eq!(
+        h.host.script_calls(),
+        before + 2,
+        "the node's two functions, once, as any node's on a change"
+    );
+    // And the animation is still its own, to its end.
+    h.run_ms(1000.);
+    let node = h.find("box").unwrap();
+    assert_eq!(h.ui.scene.borrow().bounds(node).width, 200.);
+}
+
+/// What an animation holds wins over a function for the same property, as
+/// over a literal.
+#[test]
+fn an_animated_value_wins_over_the_nodes_function_for_it() {
+    let mut h = Harness::inline(
+        r##"anime.animate("#box", { w = 200, duration = 100 })
+        return ui.column { ui.div { id = "box", w = function() return 100 end, h = 20 } }"##,
+    );
+    h.run_ms(500.);
+    let node = h.find("box").unwrap();
+    assert_eq!(h.ui.scene.borrow().bounds(node).width, 200.);
+}
+
+/// As for a tween beside them: it runs the node on every frame it moves.
+#[test]
+fn a_tween_on_a_node_runs_none_of_its_functions_as_it_moves() {
+    let mut h = Harness::inline(
+        r##"local to = ui.shared("to", 100)
+        local tint = ui.shared("tint", "#ff0000")
+        return ui.column {
+            ui.div { id = "box", h = 20, w = ui.tween(to, { duration = 1000 }),
+                bg = function() return tint:get() end,
+            },
+        }"##,
+    );
+    h.settle();
+    h.host.shared("to", 100.).set(zgx_script::Value::Num(200.));
+    h.run_ms(50.);
+    let before = h.host.script_calls();
+    h.run_ms(500.);
+    assert_eq!(h.host.script_calls(), before, "the tween moves it alone");
+    let width = |h: &mut Harness| {
+        let node = h.find("box").unwrap();
+        h.ui.scene.borrow().bounds(node).width
+    };
+    let w = width(&mut h);
+    assert!(w > 100. && w < 200., "on its way: {w}");
+    // The function still follows what it reads, and the tween goes on.
+    h.host
+        .shared("tint", "#ff0000")
+        .set(zgx_script::Value::Str("#00ff00".into()));
+    h.run_ms(50.);
+    assert_eq!(h.fill("box"), Color(0, 255, 0, 255));
+    h.run_ms(1000.);
+    assert_eq!(width(&mut h), 200.);
+}
+
+/// A box bound to a spring of a keyboard's stiffness, from 0 to 100 on "go".
+fn keyboard_spring() -> Harness {
+    let mut h = Harness::inline(
+        r##"local open = ui.state("open", false)
+        return ui.column {
+            ui.div { id = "box", w = 20, h = 20, x = ui.spring(open, { from = 0, to = 100, stiffness = 555.0265, damping = 47.118 }) },
+            ui.button { "Go", id = "go", on_click = function() open:set(true) end },
+        }"##,
+    );
+    h.frames(2);
+    h.click("go");
+    h
+}
+
+#[test]
+fn a_bound_spring_keeps_time_when_the_display_says_a_shorter_interval() {
+    // iOS can report a refresh shorter than the time between its frames: a spring
+    // stepping by that interval ran a third as fast as the keyboard it followed.
+    let mut h = keyboard_spring();
+    h.report_interval(std::time::Duration::from_secs_f64(1. / 240.));
+    // 190 ms on: a critically damped spring of this stiffness has some 6% left.
+    h.frames(12);
+    let x = h.x("box");
+    assert!(x > 85., "only at {x} after 190 ms");
+}
+
+#[test]
+fn a_late_frame_doesnt_slow_a_bound_spring() {
+    let mut steady = keyboard_spring();
+    steady.frames(12);
+    let mut late = keyboard_spring();
+    late.frames(4);
+    late.skip_frames(3);
+    late.frames(5);
+    let (a, b) = (steady.x("box"), late.x("box"));
+    assert!((a - b).abs() < 3., "{b} with a late frame, {a} without");
+}
+
+#[test]
+fn a_slow_display_keeps_a_bound_springs_time() {
+    // 20 Hz: a frame every 50 ms, longer than a step may be.
+    let mut steady = keyboard_spring();
+    steady.frames(12);
+    let mut slow = keyboard_spring();
+    slow.report_interval(std::time::Duration::from_millis(50));
+    for _ in 0..4 {
+        slow.skip_frames(2);
+        slow.frames(1);
+    }
+    let (a, b) = (steady.x("box"), slow.x("box"));
+    assert!((a - b).abs() < 3., "{b} at 20 Hz, {a} at 60 Hz");
+}
+
+#[test]
+fn a_window_back_after_a_while_takes_no_huge_step() {
+    // Hidden two seconds mid-way, its next frame steps at most a thirtieth of a
+    // second, and it goes on to land.
+    let mut h = keyboard_spring();
+    h.frames(3);
+    let before = h.x("box");
+    h.skip_frames(120);
+    h.frames(1);
+    let after = h.x("box");
+    assert!(
+        after.is_finite() && after >= before && after <= 101.,
+        "{before} then {after}"
+    );
+    h.frames(60);
+    assert!((h.x("box") - 100.).abs() < 0.5);
+}
+
+/// What a state does run to 100 from 0, sampled each frame, and how long it went on.
+fn spring_to_path(options: &str) -> Vec<f32> {
+    let mut h = Harness::inline(&format!(
+        r##"local at = ui.state("at", 0)
+        local shown = ui.state("shown", "going")
+        return ui.column {{
+            ui.div {{ id = "box", w = 20, h = 20, x = at }},
+            ui.text {{ "{{shown}}", id = "said" }},
+            ui.button {{ "Go", id = "go", on_click = function()
+                ui.spring_to(at, 100, {{ {options}, done = function() shown:set("arrived") end }})
+            end }},
+        }}"##
+    ));
+    h.frames(2);
+    h.click("go");
+    let path = (0..90)
+        .map(|_| {
+            h.run_ms(17.);
+            h.x("box")
+        })
+        .collect();
+    assert_eq!(h.text("said"), "arrived");
+    path
+}
+
+#[test]
+fn a_spring_over_a_small_range_runs_to_the_end() {
+    // An opacity, 0 to 1 on a 0.415 s spring: it eases all the way, not
+    // jumping to 1 once within half a unit (a point's tolerance).
+    let mut h = Harness::inline(
+        r##"local shown = ui.state("shown", 0)
+        return ui.column {
+            ui.div { id = "box", w = 20, h = 20, x = function() return shown:get() * 100 end },
+            ui.button { "Go", id = "go", on_click = function()
+                ui.spring_to(shown, 1, { stiffness = 229.2, damping = 30.28 })
+            end },
+        }"##,
+    );
+    h.frames(2);
+    h.click("go");
+    let path: Vec<f32> = (0..40)
+        .map(|_| {
+            h.run_ms(17.);
+            h.x("box")
+        })
+        .collect();
+    // Critically damped at 15.14 a second: about 72% of the way at 170 ms.
+    let at = path[9];
+    assert!(
+        (55. ..85.).contains(&at),
+        "part way at 170 ms: {at} ({path:?})"
+    );
+    assert!(
+        path.windows(2).all(|pair| pair[1] - pair[0] < 20.),
+        "no jump: {path:?}"
+    );
+    assert_eq!(*path.last().unwrap(), 100.);
+}
+
+#[test]
+fn a_state_runs_to_its_target_on_a_spring_with_no_script_each_frame() {
+    let stiffness = 600f64;
+    let path = spring_to_path("stiffness = 600, damping = 48.99, most = 1200");
+    assert_eq!(*path.last().unwrap(), 100.);
+    assert!(
+        path.windows(2).all(|pair| pair[0] <= pair[1]),
+        "critically damped: no way back"
+    );
+    // The closed form of a critically damped spring, at some step.
+    let rate = stiffness.sqrt();
+    let at = |ms: f64| {
+        let t = ms / 1000.;
+        100. * (1. - (1. + rate * t) * (-rate * t).exp())
+    };
+    let i = 9;
+    let (ms, found) = (i as f64 * 17., f64::from(path[i]));
+    assert!(
+        (found - at(ms)).abs() < 1.,
+        "{found} at {ms} ms, against {}",
+        at(ms)
+    );
+}
+
+#[test]
+fn a_spring_with_little_damping_passes_its_target_and_comes_back() {
+    let path = spring_to_path("stiffness = 440, damping = 35.7, velocity = 3000, most = 1200");
+    let peak = path.iter().copied().fold(0f32, f32::max);
+    assert!(peak > 101., "past it: {peak}");
+    assert_eq!(*path.last().unwrap(), 100.);
+}
+
+#[test]
+fn a_delay_holds_a_spring_and_from_waits_until_it_has_passed() {
+    let path = spring_to_path("stiffness = 650, damping = 56, delay = 40");
+    assert_eq!(path[0], 0., "still waiting");
+    assert!(path[5] > 0., "then moves");
+    // Starting behind the state, it stays until the spring reaches it.
+    let path = spring_to_path("stiffness = 440, damping = 35.7, from = -200, velocity = 6000");
+    assert!(path.iter().all(|at| *at >= 0.), "never back: {path:?}");
+    assert!(path.iter().any(|at| *at > 90.));
+}
+
+#[test]
+fn a_state_given_a_speed_starts_with_it_and_stopping_says_it() {
+    let moving = spring_to_path("stiffness = 600, damping = 48.99, velocity = 2000");
+    let still = spring_to_path("stiffness = 600, damping = 48.99");
+    assert!(
+        moving[1] > still[1] * 1.5,
+        "{} against {}",
+        moving[1],
+        still[1]
+    );
+    let mut h = Harness::inline(
+        r##"local at = ui.state("at", 0)
+        local said = ui.state("said", "none")
+        local stop
+        return ui.column {
+            ui.div { id = "box", w = 20, h = 20, x = at },
+            ui.text { "{said}", id = "said" },
+            ui.button { "Go", id = "go", on_click = function() stop = ui.spring_to(at, 100, { stiffness = 600, damping = 48.99 }) end },
+            ui.button { "Stop", id = "stop", on_click = function() said:set(if stop() > 100 then "fast" else "slow") end },
+        }"##,
+    );
+    h.frames(2);
+    h.click("go");
+    h.run_ms(40.);
+    h.click("stop");
+    assert_eq!(h.text("said"), "fast");
+    let at = h.x("box");
+    h.run_ms(100.);
+    assert_eq!(h.x("box"), at, "and it stays where it was stopped");
+}
+
+/// What a host's memory report counts of the engine (`anime` lines).
+fn anime_counts(h: &Harness) -> (usize, usize) {
+    let mut report = zgx::memory::Report::default();
+    h.host.memory(&mut report);
+    let count = |name: &str| {
+        report
+            .lines
+            .iter()
+            .find(|l| l.area == "anime" && l.name == name)
+            .and_then(|l| l.entries)
+            .unwrap_or_else(|| panic!("no anime line `{name}`"))
+    };
+    (
+        count("clips playing"),
+        count("state and table properties owned"),
+    )
+}
+
+/// A finished animation of a state or a table lets its properties go, as a
+/// cancelled one does: an app animating a fresh state a time (a reply's
+/// clock) holds nothing for the ones that ended. While they play, each
+/// property is owned; a restart owns it again.
+#[test]
+fn finished_animations_of_states_and_tables_let_their_properties_go() {
+    let mut h = Harness::inline(&script(
+        r##"local handles = {}
+        for i = 1, 20 do
+            anime.animate({ x = 0 }, { x = 1, duration = 100 })
+            table.insert(handles, anime.animate(ui.state("s" .. i, 0), { value = 1, duration = 100 }))
+        end"##,
+    ));
+    h.frame();
+    assert_eq!(anime_counts(&h), (40, 40), "playing, each property owned");
+    h.run_ms(300.);
+    assert_eq!(
+        anime_counts(&h),
+        (0, 0),
+        "ended (their handles kept): nothing owned"
+    );
 }

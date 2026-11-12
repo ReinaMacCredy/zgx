@@ -1,13 +1,15 @@
-# zgx patch to wgpu-hal 29.0.4 (Metal backend, two Direct3D 12 additions)
+# zgx patch to wgpu-hal 29.0.4 (Metal backend, three Direct3D 12 additions, one Vulkan)
 
 Vendored from crates.io `wgpu-hal` 29.0.4 (MIT OR Apache-2.0, license files
 unchanged) and applied through `[patch.crates-io]` in the workspace
 `Cargo.toml`. Only `src/metal/{command,mod,device,adapter}.rs` differ, plus
 the new `src/metal/buffer_writes.rs`, and for Direct3D 12
 `src/dx12/instance.rs`, `src/auxil/dxgi/factory.rs`,
-`src/dx12/shader_compilation.rs`, `src/dx12/mod.rs` and the new
-`src/dx12/shader_disk_cache.rs` (see the last two sections); search for
-"zgx patch".
+`src/dx12/shader_compilation.rs`, `src/dx12/mod.rs`, `src/dx12/adapter.rs`
+and the new `src/dx12/shader_disk_cache.rs` (see the Direct3D 12 sections),
+`Cargo.toml`'s `metal` feature (naga's WGSL in, for single-use shader
+modules), and for Vulkan `src/vulkan/{adapter,command,device,mod}.rs` and
+`src/vulkan/swapchain/native.rs` (the last section); search for "zgx patch".
 
 ## Why
 
@@ -66,6 +68,30 @@ system CPU for zgx vs 1.4% for GPUI on the same animation
 Result: two command buffers per frame (one per render pass), 1.2 ms less
 kernel time per 100 frames, and zgx below GPUI in CPU per frame.
 
+## Metal: single-use shader modules let go of their IR
+
+wgpu-core keeps every shader module alive with each render pipeline made
+from it, and the Metal backend keeps the module's naga IR (module and
+validation info) so it can write MSL as a pipeline is made. zgx compiles each
+app shader (a fill, a layer shader, a blend, an effect's pass) into a module
+holding the whole quad shader, makes one pipeline from it and drops it, and
+yet each pipeline kept about 250 KB of IR. A heavy session in Zeron held
+29 MB of it.
+
+`metal::zgx_single_use_next_module(Some(wgsl))` says the next module the
+calling thread makes from WGSL is for one render pipeline, with `wgsl` the
+source wgpu parses for it (zgx-gpu's `single_use_module` sets it just
+before, and takes it back just after). Once a render pipeline is made from
+such a module, its source becomes `ShaderModuleSource::Spent` and the IR is
+freed; the module keeps the WGSL (about 13 KB for the quad shader). A later
+pipeline from a spent module parses that WGSL again for that pipeline, and
+the module stays spent. Spending costs nothing more than the drop. The
+source sits behind an `RwLock` for this, and the `metal` feature turns on
+naga's `wgsl-in`. Modules made otherwise are unchanged, and compute
+pipelines never spend a module. zgx-gpu's `single_use_module_tests` and
+`device_loss` tests cover a second pipeline and a fill drawn again on a new
+device.
+
 ## Direct3D 12: one adapter, one device
 
 `Instance::enumerate_adapters`, which wgpu-core's `request_adapter` ranks,
@@ -116,3 +142,64 @@ mark carries them (`ZGX_PROFILE=1`: `first frame presented (shaders: 6
 read, 0 compiled, 0 not kept)`), so a start slowed by compiling says so.
 `ZGX_SHADER_LOG=1` prints that line alone, for a probe timing starts
 (`ZGX_PROFILE`'s spans add about 25 ms to a start).
+
+## Direct3D 12: WARP's submissions one at a time
+
+On WARP 10.0.26100 (Windows 11 24H2 and 25H2), wgpu devices in one process
+that execute command lists at the same time make the driver fault
+(`d3d10warp.dll`, an access violation under `ExecuteCommandLists`), or draw
+nothing with no error. Direct3D 12 hands every caller the one device of the
+adapter, so each wgpu device is a queue of its own on that device. The
+fault needs those queues executing together: on 16 threads drawing a
+triangle each, a debug build faulted in 38 of 40 runs; with one lock
+around `ExecuteCommandLists` and the fence signal after it, or one queue
+for every device, in 0 of 20 each. Locking pipeline creation, shader
+compiles, resource creation or device creation, or committed resources in
+place of placed ones, didn't help. Raw Direct3D 12 drawing from 8 threads
+with a queue each did not fault, so something in what wgpu records is also
+needed. What that is remains unknown: the lock works around the fault, and
+the trigger inside wgpu's recording is still to be found.
+
+The adapter's `Workarounds::serialize_submits` is set for WARP (any version),
+and `Queue::submit` holds the process-wide `WARP_SUBMITS` lock across
+`ExecuteCommandLists` and `Signal`. A GPU's queues take no lock. zgx-gpu also
+shares one wgpu device among its renderers on WARP. Tested by
+`crates/zgx-gpu/tests/warp_devices.rs`: sixteen threads, each with a wgpu
+device of its own on WARP, drawing and reading back at once.
+
+## Vulkan: a present copies what its swap chain image lacks
+
+zgx presents on Linux by copying its retained frame into the swap chain
+image it acquires. Copying all of it every frame was most of what was left
+of a frame's CPU under a software rasterizer (a 1280x800 copy for a hover
+changing two cells), so zgx-gpu now copies only what that image lacks: the
+changes of every frame since the one it holds (`SwapHistory`, buffer age by
+image). That rests on the spec alone: presentation "will not affect the
+content of the presentable images", and an image reacquired and moved out of
+`PRESENT_SRC_KHR` holds "the same as they were prior to transitioning the
+image to the present source layout" (`vkQueuePresentKHR`).
+
+- **The barrier out of a presented image.** wgpu-core tracks every surface
+  texture it acquires as `UNINITIALIZED`, which `derive_image_layout` makes
+  `UNDEFINED`, a layout the driver may discard contents leaving.
+  `Texture::presented` (a swap chain image's flag, shared from
+  `NativeSwapchain::presented` into each texture acquired for it, set as it
+  is presented) makes `transition_textures` leave `PRESENT_SRC_KHR`
+  instead, where the image is. An image's first use leaves `UNDEFINED` as
+  before. A new swap chain starts with every flag clear.
+- **Present regions.** `VK_KHR_incremental_present` is enabled where the
+  device has it, and `Surface::set_next_present_regions` (beside
+  `set_next_present_time`) names the next present's changed rectangles,
+  chained as `VkPresentRegionsKHR`; Mesa's WSI hands them to
+  `wl_surface.damage_buffer`, so the compositor redraws them alone. Without
+  the extension the regions are dropped; the partial copy doesn't need it.
+- **`Buffer::raw_handle`**, for the readback `ZGX_SWAP_CHECK` records.
+
+The copy itself is zgx-gpu's (`copy_lacking`), recorded through
+`CommandEncoder::as_hal_mut` in a command buffer of its own: a wgpu copy into
+part of a texture it holds uninitialized clears all of it first. Any doubt
+copies all of it: an image new or of unknown age, a resize or recreate, a
+suboptimal acquire, an expose or the window shown again (`forget_presented`).
+`scripts/partial_repaint_smoke.py` reads every partly copied image back under
+`ZGX_SWAP_CHECK` (sway and X11, a resize and a hide/show mid-stream) and
+finds none differing from its frame.

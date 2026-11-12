@@ -118,6 +118,10 @@ pub(crate) struct Element {
     scene: OnceCell<std::rc::Weak<RefCell<Scene>>>,
     /// Pointer and key listeners added after mount (`createDraggable`).
     pub listeners: RefCell<Vec<Listener>>,
+    /// Whether the node has the listener that runs `listeners`: from the
+    /// first, for a node takes the pointer once it listens, and `id` or
+    /// `on_mount` alone should not make it (`pointer_events = "none"`).
+    forwards: Cell<bool>,
     /// A scroll view's offset (points), for scroll observers.
     pub scroll: OnceCell<(Signal<f32>, bool)>,
     /// What the node's literals set: where an animation starts from before
@@ -159,6 +163,7 @@ impl Element {
             owners: RefCell::default(),
             scene: OnceCell::new(),
             listeners: RefCell::default(),
+            forwards: Cell::new(false),
             scroll: OnceCell::new(),
             base: Cell::new((None, None)),
             base_effects: Cell::new((1., 0.)),
@@ -428,6 +433,23 @@ impl Element {
             let _ = self.scene.set(Rc::downgrade(&scene));
         }
         let _ = self.handle.set(handle);
+    }
+    /// Adds a pointer and key listener to the mounted node.
+    pub fn listen(self: &Rc<Self>, listener: Listener) {
+        self.listeners.borrow_mut().push(listener);
+        let Some(handle) = self.handle.get() else {
+            return;
+        };
+        if self.forwards.replace(true) {
+            return;
+        }
+        let element = self.clone();
+        handle.on_event(move |event| {
+            let listeners = element.listeners.borrow().clone();
+            for listener in listeners {
+                listener(event);
+            }
+        });
     }
     /// It's leaving, gone from the data it showed: while its exit plays it
     /// takes no input (`NodeHandle::leave`), so a second click or a key acts
@@ -1216,6 +1238,10 @@ pub(crate) struct ElementUd(pub Rc<Element>);
 /// set: a handler setting the text, then selecting in it, selects in the
 /// new text (`Runtime::settle`).
 fn settle(lua: &mlua::Lua) {
+    // Most find nothing due: no clocks read for it, each a system call.
+    if crate::node::env(lua).is_ok_and(|env| env.runtime.nothing_due()) {
+        return;
+    }
     off_clock(lua, |runtime| runtime.settle());
 }
 /// `work` with the runtime, off the calling script's clock: what an input's
@@ -1505,6 +1531,18 @@ impl UserData for ElementUd {
         methods.add_method("blur", |_, e, ()| {
             if let Some(handle) = e.0.handle.get() {
                 handle.blur();
+            }
+            Ok(())
+        });
+        // The pointer locked to the element (the DOM's
+        // `requestPointerLock`): only in a press's, a release's or a key's
+        // handler (or just after); whether it holds it.
+        methods.add_method("lock_pointer", |_, e, ()| {
+            Ok(e.0.handle.get().is_some_and(|h| h.lock_pointer()))
+        });
+        methods.add_method("unlock_pointer", |_, e, ()| {
+            if let Some(handle) = e.0.handle.get() {
+                handle.unlock_pointer();
             }
             Ok(())
         });

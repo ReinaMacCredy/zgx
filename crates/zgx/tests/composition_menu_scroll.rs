@@ -32,6 +32,7 @@ fn long_menu_reveals_keyboard_targets_and_scrolls_without_relayout() {
                 .id(format!("item{i}"))
                 .h(20.)
                 .p(0.)
+                .m(0.)
         })),
     );
     ui.prepare_frame();
@@ -97,6 +98,7 @@ fn dynamic_menu_shrinks_after_overflow_content_is_removed() {
                     .id(format!("item{i}"))
                     .h(20.)
                     .p(0.)
+                    .m(0.)
             },
         )),
     );
@@ -132,6 +134,7 @@ fn a_menu_the_platform_cut_to_its_room_is_laid_out_no_bigger_and_scrolls() {
                     .id(format!("item{i}"))
                     .h(20.)
                     .p(0.)
+                    .m(0.)
             })),
     );
     ui.prepare_frame();
@@ -141,12 +144,20 @@ fn a_menu_the_platform_cut_to_its_room_is_laid_out_no_bigger_and_scrolls() {
     let panel = view.find("panel").unwrap();
     let full = ui.scene.borrow().bounds(panel);
     assert_eq!(full.height, 60. * 20. + 16.);
-    // The compositor gave it 300 points: laid out no taller, it scrolls.
+    // What it paints: the panel and its shadows' ink (GNOME's on Linux),
+    // which the platform's room leaves out (a Wayland popup's window
+    // geometry is its panel).
+    let shadows = ui.scene.borrow().popup_bounds(root).unwrap().height - full.height;
+    // The compositor gave its panel 300 points: laid out no taller, it
+    // scrolls.
     ui.set_popup_limit(root, Some((full.width, 300.)));
     ui.prepare_frame();
     let cut = ui.scene.borrow().bounds(panel);
     assert_eq!((cut.width, cut.height), (160., 300.));
-    assert_eq!(ui.scene.borrow().popup_bounds(root).unwrap().height, 300.);
+    assert_eq!(
+        ui.scene.borrow().popup_bounds(root).unwrap().height,
+        300. + shadows
+    );
     key(&mut ui, Key::End);
     let last = view.find("item59").unwrap();
     assert_eq!(ui.input.focused(), Some(last));

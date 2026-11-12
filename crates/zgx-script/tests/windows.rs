@@ -110,6 +110,58 @@ fn the_window_titlebar_area_and_controls_follow_what_the_host_says() {
     assert!(texts(&h.ui).contains(&"none".to_owned()));
 }
 
+/// `ui.window.maximized` follows the host's window, and can't be written.
+#[test]
+fn the_maximized_state_follows_the_host() {
+    let mut h = Harness::inline(
+        r#"
+        local written = pcall(function() ui.window.maximized:set(true) end)
+        return ui.column {
+            ui.text { id = "max", function() return `max {ui.window.maximized:get()}` end },
+            ui.text { id = "written", `written {written}` },
+        }
+        "#,
+    );
+    let maximized = h.ui.signal(false);
+    h.host.window_maximized(maximized.clone());
+    h.settle();
+    assert_eq!(h.text("max"), "max false");
+    assert_eq!(h.text("written"), "written false");
+    maximized.set(true);
+    h.settle();
+    assert_eq!(h.text("max"), "max true");
+    maximized.set(false);
+    h.settle();
+    assert_eq!(h.text("max"), "max false");
+}
+
+/// A host's calls for `ui.window`'s states don't undo each other, in either
+/// order.
+#[test]
+fn the_maximized_state_goes_on_following_after_the_other_window_states() {
+    let mut h = Harness::inline(
+        r#"return ui.text { id = "max", function() return `max {ui.window.maximized:get()}` end }"#,
+    );
+    let maximized = h.ui.signal(false);
+    h.host.window_maximized(maximized.clone());
+    h.host.window_state(&h.ui);
+    maximized.set(true);
+    h.settle();
+    assert_eq!(h.text("max"), "max true");
+    // Called again, the state follows the new signal alone.
+    let again = h.ui.signal(false);
+    h.host.window_maximized(again.clone());
+    h.settle();
+    assert_eq!(h.text("max"), "max false");
+    maximized.set(false);
+    maximized.set(true);
+    h.settle();
+    assert_eq!(h.text("max"), "max false", "the old signal is let go");
+    again.set(true);
+    h.settle();
+    assert_eq!(h.text("max"), "max true");
+}
+
 /// `ui.window.full_screen` and `full_screen_transition` follow the host
 /// through a round trip into full screen and out (macOS's will and did
 /// notifications), the title bar's `controls` gone while it is there: a

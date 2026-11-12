@@ -10,6 +10,11 @@ use crate::{
 };
 use std::num::NonZeroU32;
 
+/// How much of a draggable a clickable inside it covers for a press on it to
+/// be the draggable's still: a row with its padding is, a tab's close button
+/// isn't (`EventContext::keeps_press_from_drag`).
+const FILLS_DRAG: f32 = 0.75;
+
 /// What text inherits. A colour, size or family that comes from a theme
 /// token stays the token: each text node resolves it from its own theme
 /// scope, so a theme change restyles the text that shows it without
@@ -242,6 +247,7 @@ pub(crate) fn mount_style(
         None,
         None,
         None,
+        false,
     )
 }
 
@@ -736,23 +742,27 @@ pub(crate) fn mount_style_with_intrinsic(
     layout_target: Option<Signal<Option<NodeId>>>,
     object_fit: Option<Signal<crate::style::ImagePlacement>>,
     theme: Option<std::rc::Rc<crate::theme::ThemeScope>>,
+    leaf: bool,
 ) -> Signal<Typography> {
     let mut base = base;
     let mut reactive = variants.reactive;
     // A node setting no typography (nor through a variant or a dynamic
     // style) shows its parent's: it passes that signal on, not a copy.
     // Interaction styles that change might set it.
-    let own = dynamic.is_some()
-        || reactive.is_some()
-        || base.sets_typography()
-        || [
-            &variants.hover,
-            &variants.active,
-            &variants.focus,
-            &variants.disabled,
-        ]
-        .into_iter()
-        .any(|variant| variant.as_deref().is_some_and(Styles::sets_typography));
+    // Nor does one with nothing below it to read a copy: a text's own size
+    // and colour go to it directly.
+    let own = !leaf
+        && (dynamic.is_some()
+            || reactive.is_some()
+            || base.sets_typography()
+            || [
+                &variants.hover,
+                &variants.active,
+                &variants.focus,
+                &variants.disabled,
+            ]
+            .into_iter()
+            .any(|variant| variant.as_deref().is_some_and(Styles::sets_typography)));
     let defaults = variants.defaults;
     debug_assert!(
         defaults
@@ -822,7 +832,21 @@ pub(crate) fn mount_style_with_intrinsic(
                     state.pointer_active = true;
                     state.pressed_outside = false;
                     if event.target == node && presses {
-                        event.capture_pointer();
+                        // Around what covers most of it, nothing much else
+                        // is there to press.
+                        let fills = owner.upgrade().map_or_else(Vec::new, |ui| {
+                            let scene = ui.scene.borrow();
+                            let own = scene.bounds(node);
+                            let area = own.width * own.height;
+                            scene
+                                .ancestors(node)
+                                .take_while(|id| {
+                                    let around = scene.bounds(*id);
+                                    area >= around.width * around.height * FILLS_DRAG
+                                })
+                                .collect()
+                        });
+                        event.capture_filling(fills);
                     }
                 }
                 InputEvent::PointerUp {
@@ -1860,6 +1884,7 @@ fn apply_resolved(
             {
                 outline.offset = offset;
             }
+
             if quad.decoration.is_some()
                 || resolved.paint_background.is_some()
                 || resolved.corners.is_some()
@@ -1921,10 +1946,14 @@ fn apply_resolved(
         },
         _ => scene.kind(node).clone(),
     };
+    // A text's font and kind in one call: one never laid out takes them as
+    // it was appended (`Scene::set_text_kind`).
     if matches!(kind, NodeKind::Text { .. }) {
-        scene.set_font(node, current.font.clone());
+        std::hint::cold_path();
+        scene.set_text_kind(node, current.font.clone(), kind);
+    } else {
+        scene.set_kind(node, kind);
     }
-    scene.set_kind(node, kind);
     // Read again past a barrier, not kept from the test above: the
     // compiler would merge the two reads, and a value live across all of a
     // style's application spilled others on x86 at every node (#1276).
@@ -1938,6 +1967,12 @@ fn apply_resolved(
         }
         if let Some(uniforms) = cold.and_then(|cold| cold.layer_uniforms.as_ref()) {
             scene.set_layer_uniforms(node, *uniforms);
+        }
+        if let Some((bleed, reach)) = cold.and_then(|cold| cold.layer_extent) {
+            scene.set_layer_extent(node, bleed, reach);
+        }
+        if let Some(tag) = cold.and_then(|cold| cold.geometry_tag) {
+            scene.set_geometry_tag(node, tag);
         }
         if let Some(mode) = rare.blend {
             scene.set_blend(node, mode);
@@ -1990,6 +2025,12 @@ fn apply_rare(
             node,
             cold.and_then(|cold| cold.outline_style).unwrap_or_default(),
         );
+        // Inner rings are rare (Windows' focus): nothing to do unless this
+        // style sets one or the scene holds one to take away.
+        let inner = cold.and_then(|cold| cold.outline_inner).flatten();
+        if inner.is_some() || scene.has_outline_inners() {
+            scene.set_outline_inner(node, inner);
+        }
         scene.set_mask_gradient(node, cold.and_then(|cold| cold.mask_gradient().cloned()));
         let gradient = cold.and_then(|cold| cold.text_gradient().cloned());
         if gradient.is_some() || scene.has_text_gradients() {
@@ -2144,6 +2185,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A text passes no copy of its typography on, as nothing below it can
+    /// read one, and shows its own all the same, in place of its parent's and
+    /// leaving its siblings' alone.
+    #[test]
+    fn a_text_shows_its_own_typography_and_its_siblings_their_parents() {
+        use crate::compose::prelude::*;
+        let mut ui = Ui::new(400., 300.);
+        let _handle = ui.mount(
+            column()
+                .text_size(30.)
+                .child(text("own").text_size(20.))
+                .child(text("inherits")),
+        );
+        ui.prepare_frame();
+        let scene = ui.scene.borrow();
+        let size_of = |wanted: &str| {
+            let mut found = None;
+            let mut stack = vec![scene.root()];
+            while let Some(id) = stack.pop() {
+                if let NodeKind::Text {
+                    text, font_size, ..
+                } = scene.kind(id)
+                    && &**text == wanted
+                {
+                    found = Some(*font_size);
+                }
+                stack.extend(scene.children(id).iter().copied());
+            }
+            found
+        };
+        assert_eq!(size_of("own"), Some(20.));
+        assert_eq!(size_of("inherits"), Some(30.));
     }
 
     fn color(value: u8) -> Styles {

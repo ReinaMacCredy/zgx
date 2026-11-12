@@ -220,6 +220,8 @@ fn connect(window: &Window) -> Option<Client> {
     if state.compositor.is_none() || state.wm_base.is_none() {
         return None;
     }
+    #[cfg(zgx_winit_patched)]
+    winit::platform::wayland::wake_for_own_queue(queue_heard);
     Some(Client {
         connection,
         queue,
@@ -232,6 +234,20 @@ fn connect(window: &Window) -> Option<Client> {
 /// `xdg_wm_base`, and winit gives its `xdg_surface`.
 pub(super) fn available(window: &Window) -> bool {
     with_client(window, |_| Some(())).is_some()
+}
+
+/// Whether zgx's queue holds events: winit, having read them for it and heard
+/// nothing for its windows (a pointer over a popup isn't on them), would go back
+/// to sleep on them.
+#[cfg(zgx_winit_patched)]
+fn queue_heard() -> bool {
+    CLIENT.with(|client| {
+        client.try_borrow().ok().is_some_and(|client| {
+            client
+                .as_deref()
+                .is_some_and(|client| client.queue.prepare_read().is_none())
+        })
+    })
 }
 
 /// Dispatch what zgx's queue heard (where the event loop turns: winit read
@@ -288,6 +304,9 @@ struct Shown {
     asked: Rect,
     trigger: Option<Rect>,
     revision: Option<u64>,
+    /// Whether what it shows blurs what's behind it (`super::blurs`), as of
+    /// `revision`.
+    glass: bool,
     /// Its frame's last contained panic (`contain::run`).
     fault: Option<crate::contain::Fault>,
     /// The popup it is a popup of (a submenu's menu), if not the window's.
@@ -500,6 +519,7 @@ impl Popups {
     /// `takes` says whether a node takes the pointer (listening to it, or
     /// disabled: `Some(true)`) or lets it through (`View::pointer_events`:
     /// `Some(false)`), or leaves that to what holds it (`None`).
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         parent: &Window,
@@ -508,6 +528,10 @@ impl Popups {
         scale: f32,
         full: bool,
         takes: &dyn Fn(NodeId) -> Option<bool>,
+        // A popup's glass blurs this renderer's last frame (`set_backdrop`),
+        // and shows what `damage` changes under it.
+        under: &GpuRenderer,
+        damage: &[Rect],
     ) -> Result<(), GpuError> {
         self.wake = None;
         if self.shown.is_empty() && scene.popups().is_empty() {
@@ -519,7 +543,11 @@ impl Popups {
         let wanted: Vec<(NodeId, Rect)> = scene
             .popups()
             .iter()
-            .filter_map(|root| scene.popup_bounds(*root).map(|bounds| (*root, bounds)))
+            .filter_map(|root| {
+                scene
+                    .popup_bounds(*root)
+                    .map(|bounds| (*root, whole_points(bounds, zoom)))
+            })
             .collect();
         let shown = std::mem::take(&mut self.shown);
         let limited = &mut self.limited;
@@ -694,7 +722,12 @@ impl Popups {
                     }
                 }
                 let revision = scene.layer_revision(*root);
-                let due = full || popup.revision != Some(revision);
+                if popup.revision != Some(revision) {
+                    popup.glass = super::blurs(scene, *root);
+                }
+                let due = full
+                    || popup.revision != Some(revision)
+                    || (popup.glass && damage.iter().any(|at| at.intersection(*bounds).is_some()));
                 // The compositor yet to take its last frame: this one waits
                 // for it (its frame callback wakes the loop), drawn then.
                 let surface = popup.surface.id();
@@ -723,6 +756,7 @@ impl Popups {
                 } else if draw {
                     popup.revision = Some(revision);
                     popup.renderer.set_popup(*root, *bounds);
+                    popup.renderer.set_backdrop(popup.glass.then_some(under));
                     let renderer = &mut popup.renderer;
                     let (wl_surface, framing) = (&popup.surface, &mut client.state.framing);
                     let started = Instant::now();
@@ -871,7 +905,7 @@ fn set_input(client: &Client, surface: &WlSurface, input: Option<Rect>, zoom: f3
 /// for its geometry, a card whose shadow reached past the output's foot was
 /// slid up off where the scene drew it, unsaid, and the pointer's moves
 /// over it were read that far off: off its trigger, which closed it.
-fn panel_of(scene: &Scene, root: NodeId, bounds: Rect) -> Rect {
+pub(super) fn panel_of(scene: &Scene, root: NodeId, bounds: Rect) -> Rect {
     scene
         .bounds(root)
         .intersection(bounds)
@@ -887,9 +921,10 @@ fn surface_and_geometry(
     panel: Rect,
     size: (i32, i32),
 ) -> ((i32, i32), (i32, i32, i32, i32)) {
+    // (`whole_points`: whole, but for a zoom's float error.)
     let surface = (
-        rect.width.ceil().max(1.) as i32,
-        rect.height.ceil().max(1.) as i32,
+        rect.width.round().max(1.) as i32,
+        rect.height.round().max(1.) as i32,
     );
     let x = ((panel.x - rect.x).round() as i32).clamp(0, surface.0 - 1);
     let y = ((panel.y - rect.y).round() as i32).clamp(0, surface.1 - 1);
@@ -905,6 +940,24 @@ fn waits(presented: Option<Instant>, now: Instant) -> Option<Instant> {
     presented
         .map(|presented| presented + FRAME_WAIT)
         .filter(|until| *until > now)
+}
+
+/// `rect` (the scene's) grown to the whole surface points round it, at
+/// `zoom`: what a popup shows at. A surface has a whole size in points and a
+/// whole place on its parent. In a box of another size its renderer's buffer,
+/// on the whole pixels round the box, isn't the size its viewport shows: a
+/// menu opened at a pointer between pixels had a buffer a pixel wider than its
+/// surface, all of it resampled to fit, its text blurred.
+fn whole_points(rect: Rect, zoom: f32) -> Rect {
+    let (left, top) = ((rect.x * zoom).floor(), (rect.y * zoom).floor());
+    let right = ((rect.x + rect.width) * zoom).ceil().max(left + 1.);
+    let bottom = ((rect.y + rect.height) * zoom).ceil().max(top + 1.);
+    Rect::new(
+        left / zoom,
+        top / zoom,
+        (right - left) / zoom,
+        (bottom - top) / zoom,
+    )
 }
 
 fn rects_match(a: Rect, b: Rect) -> bool {
@@ -1034,11 +1087,8 @@ fn show(
     let popup = xdg.get_popup(Some(&parent_xdg), &positioner, &qh, ());
     positioner.destroy();
     xdg.set_window_geometry(geometry.0, geometry.1, geometry.2, geometry.3);
-    // The surface's size in the output's pixels.
-    let physical = (
-        (rect.width * display).round().max(1.) as u32,
-        (rect.height * display).round().max(1.) as u32,
-    );
+    // The surface's size in the output's pixels: what its renderer draws.
+    let physical = zgx_gpu::plane_size(scene_rect, scale);
     match &viewport {
         Some(viewport) => viewport.set_destination(width, height),
         None => surface.set_buffer_scale(display.round().max(1.) as i32),
@@ -1106,6 +1156,7 @@ fn show(
         asked,
         trigger,
         revision: None,
+        glass: false,
         fault: None,
         parent: of.map(|(holder, ..)| holder),
         input: None,
@@ -1370,6 +1421,38 @@ delegate_noop!(State: ignore WpViewport);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// At every output scale whose pixels are whole points' multiples, the
+    /// buffer a popup's renderer draws is the surface's size in pixels, one
+    /// to one, wherever between pixels the scene put it.
+    #[test]
+    fn a_popups_buffer_is_its_surface_wherever_it_opens() {
+        for (x, y) in [(10., 20.), (10.5, 20.25), (1058.5, 633.75), (0.1, 0.9)] {
+            for (width, height) in [(376., 369.), (375.5, 368.25), (232.1, 225.9)] {
+                let shown = Rect::new(x, y, width, height);
+                for zoom in [1., 0.9, 1.25, 1.1] {
+                    for display in [1_f32, 2., 3.] {
+                        let bounds = whole_points(shown, zoom);
+                        assert!(bounds.x <= shown.x + 1e-3 && bounds.y <= shown.y + 1e-3);
+                        let zoomed = crate::popup_window::window_rect(bounds, zoom);
+                        let (surface, _) = surface_and_geometry(zoomed, zoomed, (1, 1));
+                        let buffer = zgx_gpu::plane_size(bounds, display * zoom);
+                        let wants = (
+                            surface.0 as u32 * display as u32,
+                            surface.1 as u32 * display as u32,
+                        );
+                        let off = |a: u32, b: u32| a.abs_diff(b) as f32;
+                        // (A zoom's float error may round a side out at most.)
+                        assert!(
+                            off(buffer.0, wants.0) <= if zoom == 1. { 0. } else { display }
+                                && off(buffer.1, wants.1) <= if zoom == 1. { 0. } else { display },
+                            "{shown:?} at zoom {zoom}, display {display}: buffer {buffer:?}, surface {surface:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// A chip with a tooltip card that paints a wide shadow, hovered so
     /// the card shows as a popup root: the card's box, where the popup

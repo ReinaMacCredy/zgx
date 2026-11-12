@@ -134,7 +134,7 @@ ui.task(function() -- steps in order
 end)
 ```
 
-`ui.task` returns its handle: `task:cancel()` stops it at the await it is at, never to go on (`task.cancelled` says so). A fetch it awaited (and nothing else hears) stops: the host's transport sees its `Body` close and its future is dropped. An action it awaited goes on, its answer unheard. Cancel what a closed view started, as React's effects abort a fetch in their cleanup: `ui.on_cleanup(function() task:cancel() end)`. A resource cancels a load it begins again, and its owner going cancels its load; a form cancels its submit with `form.cancel()` and as it goes.
+`ui.task` returns its handle: `task:cancel()` stops it at the await it is at, never to go on (`task.cancelled` says so). A fetch it awaited (and nothing else hears) stops: the host's transport sees its `Body` close and its future is dropped. Other host work it awaited is dropped too, and a promise's own `p:cancel()` drops it the same way: a file dialog's request (Linux's portal closes its picker; a macOS sheet and a Windows dialog stay up until answered, their answer unheard) and `ui.sleep` end, and a file read is no longer waited on (its thread finishes on its own). An action it awaited goes on, its answer unheard. Cancel what a closed view started, as React's effects abort a fetch in their cleanup: `ui.on_cleanup(function() task:cancel() end)`. A resource cancels a load it begins again, and its owner going cancels its load; a form cancels its submit with `form.cancel()` and as it goes.
 
 `ui.async(f)` is a handler that awaits, as React's async handlers do: each call runs `f` as a task with the call's arguments (`on_click = ui.async(save)`, a toast's `action.run`). Its tasks are cancelled as what made the handler goes (a component unmounting, a reload), and what one raises and doesn't catch is reported once as the script's error.
 
@@ -232,7 +232,7 @@ return ui.switch(person.status, {
 
 `ui.paged(load)` loads a list a page at a time (an inbox, a feed, search results): `load(cursor)` returns `{ items, next }` (in a task, so it may await), `cursor` nil for the first page and the last page's `next` after it. It returns `items` (the items of every page so far, a list state its rows show), `loading`, `status` (`"loading"` until the first page answers, then `"ready"` or `"failed"`), `done` (the last page had no `next`), `error` (the last load's `UiError`, tracked, or nil), `more()` and `reload()`. `more()` loads the next page, and does nothing while one loads or once `done`; give it to a list's `on_end` and the list asks as its end comes in reach, filling a short view by itself. As `ui.resource`, it is keyed by what its first page reads: a state it read changing (a search's query), or `reload()`, loads again from the start, a load still out cancelled and an answer to one superseded dropped; a later page's reads key nothing.
 
-`ui.debounced(state, ms)` is a read-only state following `state` once it has stayed unchanged for `ms` (as `ui.computed`'s, a write is an error): a search box's query, so a load keyed by it waits for the typing to stop. Each change begins one timer again (no frames meanwhile), and it is gone with its owner.
+`ui.debounced(state, ms)` is a read-only state following `state` once it has stayed unchanged for `ms` (as `ui.computed`'s, a write is an error): a search box's query, so a load keyed by it waits for the typing to stop. Each change begins one timer again (no frames meanwhile), and it is gone with its owner. `ui.debounced(state, ms, { every = true })` tells what reads it at each rest, even when the value is the one it already held: a view's offset scrolled away and back to where it last rested is still a rest (where the reader stopped, written again). Without `every`, a rest at the value it holds tells nothing, as a state set to what it holds doesn't.
 
 ```luau
 type Message = { subject: string }
@@ -606,7 +606,7 @@ A text template's `{name}` (in `ui.text`, a child string, a span) looks for the 
 
 ## Routing
 
-`ui.router { routes, initial?, scheme? }` keeps where an app is, as React Router does: named routes with `:params`, the history behind and ahead, the platform's back and forward input, and deep links.
+`ui.router { routes, initial?, scheme?, history? }` keeps where an app is, as React Router does: named routes with `:params`, the history behind and ahead, the platform's back and forward input, and deep links. The history keeps the last 100 places behind, as a browser keeps a tab's, so back stops after 100 steps: `history` sets how many (`math.huge` keeps every one, and an app that moves all day then holds every place it has been).
 
 ```lua
 local router = ui.router {
@@ -635,7 +635,7 @@ return ui.column {
 | `navigate(name, params?)` | to a route by its name and params (`navigate("thread", { id = 7 })`): an app's route names and params are typed, so a misspelling is a type error; a name with no such route, or a missing param, is an error as it runs |
 | `replace(name, params?)` | the same, in place of the route now |
 | `open(path, { replace? }?)` | to the route a path matches (`open("/thread/7")`), as a deep link goes; a path no route matches is an error |
-| `back()`, `forward()`, `can_back`, `can_forward` | the history, and whether there is any behind or ahead |
+| `back()`, `forward()`, `can_back`, `can_forward` | the history, and whether there is any behind or ahead (the last `history` places behind, 100 unless set) |
 | `is(name)` | whether the route is `name` now, tracked |
 | `view(cases, props?)` | what each route shows: a node, or a function of its params made again as they change. It takes the mouse's back and forward buttons and a trackpad's swipe between pages (`grow = 1` unless sized) |
 
@@ -735,6 +735,11 @@ A plugin targeting an `id` that is not a declared `hook` reaches the app's inter
 - A plugin requires none of the app's modules; a `.luaurc` defining an `app` or `app-original` alias is an error.
 
 ```lua
+-- file: components/card.luau
+return function(props: { title: string })
+    return ui.column { p = 8, ui.text { props.title, literal = true } }
+end
+
 -- file: plugins/badges/init.luau (granted Capability::OverrideModule("@app/components/card"))
 ui.override { module = "@app/components/card", with = "./card" }
 

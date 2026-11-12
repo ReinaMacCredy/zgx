@@ -99,17 +99,120 @@ pub struct FillShader {
     id: u64,
     source: Arc<str>,
     fps: Option<f32>,
+    /// Whether its source calls `zgx_backdrop` (a layer shader's read of
+    /// what lies behind it: `Scene::set_layer_shader`).
+    reads_backdrop: bool,
+    /// Whether what it draws depends on where things are in the window
+    /// (`FillShader::reads_window`).
+    reads_window: bool,
+    /// Whether its inputs change as frames draw (`FillShader::runs_each_frame`).
+    runs_each_frame: bool,
+    /// What a layer shader reads besides its layer (`FillShader::with_inputs`).
+    inputs: Option<Box<ShaderInputs>>,
+}
+/// How large a pass's texture is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PassSize {
+    /// This many pixels, whatever the box's size (a simulation's grid).
+    Pixels(u32, u32),
+    /// This fraction of its box's device pixels: drawn again from nothing
+    /// when that changes.
+    OfBox(f32),
+}
+/// What a pass's texture holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PassFormat {
+    /// Eight bits a channel, 0 to 1.
+    #[default]
+    Rgba8,
+    /// Sixteen-bit floats a channel: past 1 and below 0, filterable.
+    Rgba16Float,
+}
+/// One step of a layer shader's chain: a WGSL `run(input: PassInput)`,
+/// drawing a texture the passes after it and the shader sample by its name.
+#[derive(Clone, Debug)]
+pub struct ShaderPass {
+    /// Its name: `zgx_<name>(uv)` samples it, `zgx_<name>_texel(xy)` reads a
+    /// texel and `zgx_<name>_size()` is its size. An identifier.
+    pub name: String,
+    /// Its WGSL.
+    pub source: String,
+    /// How large its texture is.
+    pub size: PassSize,
+    /// What its texture holds.
+    pub format: PassFormat,
+    /// Its own last result stays readable (under its name) as it draws the
+    /// next: state from frame to frame. Costs a second texture.
+    pub feedback: bool,
+    /// Times it runs a frame (`PassInput::step` counts them): a solver's
+    /// iterations.
+    pub steps: u32,
+    /// It draws once (again if its size changes), then only its texture is
+    /// read: what doesn't move.
+    pub once: bool,
+}
+/// What a layer shader reads besides its layer: see `FillShader::with_inputs`.
+#[derive(Clone, Debug, Default)]
+pub struct ShaderInputs {
+    /// Passes, in the order they draw each frame.
+    pub passes: Vec<ShaderPass>,
+    /// Pictures to sample by name, as passes are.
+    pub images: Vec<(String, Arc<crate::image::ImageData>)>,
+    /// GPU views (`GpuView::id`) to sample by name, as passes are: each
+    /// drawn into a texture of its box's size before each frame by its
+    /// painter, with the renderer's device and an encoder of its own, so a
+    /// Rust effect can run anything its device has (a compute pass). The
+    /// caller keeps its `GpuView`.
+    pub views: Vec<(String, u64)>,
+    /// A tag: the rounded boxes of the nodes carrying it
+    /// (`Styled::geometry_tag`), as data for the passes and the shader.
+    pub geometry: Option<u64>,
+}
+/// The tag `name` is, for `ShaderInputs::geometry` and `Styled::geometry_tag`.
+pub fn geometry_tag(name: &str) -> u64 {
+    // FNV-1a: stable, and no table to keep.
+    name.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
 }
 impl FillShader {
     /// `source`, its time advancing at most `fps` times a second (a dither
     /// drifting at 30 fps redraws at 30 fps): `None` for every frame.
     pub fn new(source: impl Into<Arc<str>>, fps: Option<f32>) -> Arc<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let source: Arc<str> = source.into();
         Arc::new(Self {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            source: source.into(),
+            reads_backdrop: source.contains("zgx_backdrop"),
+            reads_window: names_window(&source),
+            runs_each_frame: false,
+            source,
             fps: fps.filter(|fps| fps.is_finite() && *fps > 0.),
+            inputs: None,
         })
+    }
+    /// A layer shader that also samples `inputs`: passes the renderer runs
+    /// before each frame showing it, pictures, and tagged nodes' boxes. One
+    /// such shader is one running effect, with one set of textures: made
+    /// when it first draws, freed with it, and nothing for a shader without.
+    /// The nodes showing it share them, so give each effect its own.
+    pub fn with_inputs(
+        source: impl Into<Arc<str>>,
+        fps: Option<f32>,
+        inputs: ShaderInputs,
+    ) -> Arc<Self> {
+        let mut shader = Self::new(source, fps);
+        let made = Arc::get_mut(&mut shader).expect("just made");
+        made.reads_window |= inputs.geometry.is_some()
+            || inputs.passes.iter().any(|pass| names_window(&pass.source));
+        made.runs_each_frame =
+            !inputs.views.is_empty() || inputs.passes.iter().any(|pass| !pass.once);
+        made.inputs = Some(Box::new(inputs));
+        shader
+    }
+    /// What it reads besides its layer (`with_inputs`).
+    pub fn inputs(&self) -> Option<&ShaderInputs> {
+        self.inputs.as_deref()
     }
     /// Stable for this shader's lifetime: renderers cache its pipeline by it.
     pub fn id(&self) -> u64 {
@@ -123,11 +226,65 @@ impl FillShader {
     pub fn fps(&self) -> Option<f32> {
         self.fps
     }
+    /// Whether, as a layer shader, it reads what lies behind it
+    /// (`zgx_backdrop`): its source names it.
+    pub fn reads_backdrop(&self) -> bool {
+        self.reads_backdrop
+    }
+    /// Whether, as a layer shader, what it draws depends on where things are
+    /// in the window, so that it doesn't move with its node: its source or a
+    /// pass's names `zgx_window`, `zgx_rect` or a pass's `area`, or it reads
+    /// tagged nodes' boxes.
+    pub fn reads_window(&self) -> bool {
+        self.reads_window
+    }
+    /// Whether what it samples changes with each frame rendered that shows
+    /// its box, damaged or not: a pass that isn't `once`, or a GPU view.
+    pub fn runs_each_frame(&self) -> bool {
+        self.runs_each_frame
+    }
+}
+/// Whether WGSL `source` names what places it in the window.
+fn names_window(source: &str) -> bool {
+    source.contains("zgx_window")
+        || source.contains("zgx_rect")
+        || source.contains("zgx_origin")
+        || source.contains(".area")
 }
 impl PartialEq for FillShader {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
+}
+static DECLARED_LAYERS: std::sync::Mutex<Vec<std::sync::Weak<FillShader>>> =
+    std::sync::Mutex::new(Vec::new());
+static LAYERS_DECLARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Have every renderer start compiling layer shader `shader` ahead of its
+/// first draw: for what must show at once when it does (a one-shot), where it
+/// holds no layer until then.
+pub fn declare_layer_shader(shader: &Arc<FillShader>) {
+    let mut declared = DECLARED_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
+    declared.retain(|shader| shader.strong_count() > 0);
+    declared.push(Arc::downgrade(shader));
+    LAYERS_DECLARED.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+/// How many layer shaders were declared (`declare_layer_shader`).
+#[inline]
+pub fn layer_shaders_declared() -> u64 {
+    LAYERS_DECLARED.load(std::sync::atomic::Ordering::Acquire)
+}
+/// Those declared, if any were since `seen` (updated).
+pub fn declared_layer_shaders(seen: &mut u64) -> Vec<Arc<FillShader>> {
+    let count = layer_shaders_declared();
+    if count == *seen {
+        return Vec::new();
+    }
+    *seen = count;
+    let declared = DECLARED_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
+    declared
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect()
 }
 /// A shader fill's per-node uniforms (`Scene::set_shader_uniforms`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

@@ -23,7 +23,10 @@ use std::{
 mod animation;
 #[path = "compose_variable.rs"]
 mod variable;
-pub use variable::{VariableHeights, measured_rows, measured_virtual_list, variable_virtual_list};
+pub use variable::{
+    RowsWatch, VariableHeights, measured_rows, measured_rows_watched, measured_virtual_list,
+    variable_virtual_list,
+};
 
 /// A local UI future, supplied to a platform's wake-driven executor.
 pub type LocalFuture = Pin<Box<dyn Future<Output = ()>>>;
@@ -50,10 +53,14 @@ impl TaskToken {
             check: finished,
         }))
     }
+    /// Whether its task has finished.
+    pub fn finished(&self) -> bool {
+        self.0.finished()
+    }
 }
 /// Provider bridging components to a native or headless executor.
 #[derive(Clone)]
-pub struct TaskRunner(Rc<dyn Fn(LocalFuture) -> TaskToken>);
+pub struct TaskRunner(pub(crate) Rc<dyn Fn(LocalFuture) -> TaskToken>);
 impl TaskRunner {
     /// Runs each future with `spawn`, which returns the token that cancels it.
     pub fn new(spawn: impl Fn(LocalFuture) -> TaskToken + 'static) -> Self {
@@ -237,6 +244,12 @@ pub(crate) struct ListOptions {
     pub(crate) contain: bool,
     pub(crate) edges: Option<Box<ListEdges>>,
 }
+impl ListOptions {
+    /// `View::list_ahead`.
+    pub(crate) fn ahead(&self) -> Option<f32> {
+        self.edges.as_ref().and_then(|edges| edges.ahead)
+    }
+}
 /// What a virtual list reports of its edges: its end and its start coming
 /// in reach (`View::on_end`, `View::on_start`) and whether it rests at its
 /// end (`View::on_at_end`). Boxed: few lists have any.
@@ -245,6 +258,11 @@ pub(crate) struct ListEdges {
     end: Option<EdgeWatch>,
     start: Option<EdgeWatch>,
     at_end: Option<Box<dyn FnMut(bool)>>,
+    /// `View::list_ahead`.
+    ahead: Option<f32>,
+    /// `View::scrollbar_style` (a scroll view's too): with what few views
+    /// have, so `Rare` stays the size it was.
+    scrollbar_style: Option<Rc<crate::compose_scrollbar::ScrollbarStyle>>,
     /// `View::virtualize_in_ancestor`: it scrolls with the scroll view
     /// around it, building the rows that view shows.
     pub(crate) ancestor: bool,
@@ -304,6 +322,8 @@ pub(crate) fn watch_edges(
         start,
         mut at_end,
         ancestor: _,
+        ahead: _,
+        scrollbar_style: _,
     } = edges;
     let runtime = ui.runtime.clone();
     let weak = ui.downgrade();
@@ -467,11 +487,22 @@ pub struct View {
     events: Vec<EventListener>,
     focusable: Option<bool>,
     id: Option<String>,
-    contents: bool,
+    contents: Contents,
     mounted: Vec<Box<dyn FnOnce(NodeHandle)>>,
     /// What few views set, boxed: views move by value through every
     /// builder call and mount level, and most carry none of it.
     rare: Option<Box<Rare>>,
+}
+/// Whose box a view lays out as (`View::contents`).
+#[derive(Clone, Copy, PartialEq)]
+enum Contents {
+    /// Its own.
+    Own,
+    /// Its last child's, in its place.
+    Child,
+    /// Its child's unless it is styled, and so asked for a box of its own:
+    /// what a region showing one view at a time starts as (`switch`).
+    ChildIfUnstyled,
 }
 /// Ranges of a text marked with a colour (`View::decorations`).
 type Decorations = Vec<(std::ops::Range<usize>, crate::scene::Color)>;
@@ -512,6 +543,10 @@ pub(crate) struct Rare {
     follow_end: Option<bool>,
     /// `View::overscroll_contain`: a wheel over it stays with it.
     overscroll_contain: bool,
+    /// `View::wheel_across`: a mouse wheel moves it sideways.
+    wheel_across: bool,
+    /// `View::paging`: it comes to rest on whole pages.
+    paging: bool,
     animation: Option<animation::Animated>,
     keyboard_navigation: Option<bool>,
     /// `View::on_end`, `on_start`, `at_end`: a virtual list's edges.
@@ -552,8 +587,9 @@ pub(crate) struct Rare {
     line_numbers: Option<bool>,
     /// What a code editor adds to a text area (`View::highlighter`, …).
     code: Option<Box<CodeOptions>>,
-    /// `WINDOW_DRAG` (`View::window_drag`), `HOLLOW` (`View::hollow`) and an
-    /// editor's `AUTOCORRECT` and `SMART_PUNCTUATION`: rare, tested together
+    /// `WINDOW_DRAG` (`View::window_drag`), `HOLLOW` (`View::hollow`),
+    /// `KEEPS_FOCUS` (`View::focus_on_press`) and an editor's `AUTOCORRECT`
+    /// and `SMART_PUNCTUATION`: rare, tested together
     /// as the element mounts.
     mount_flags: u8,
     /// `View::selectable`.
@@ -569,6 +605,25 @@ pub(crate) struct Rare {
     grid_fill: Option<Box<dyn FnMut() -> Option<crate::scene::GridFill>>>,
     /// Conditional children (`child_when`), mounted after the others.
     conditional: Vec<RegionBuilder>,
+}
+/// `Rare::merge_into`'s part for assistive technology (a control a row already
+/// stands for, hidden from outside it): each part the outer view set wins.
+#[cold]
+#[inline(never)]
+fn merge_accessibility(
+    label: Option<String>,
+    accessibility: Option<Box<Accessibility>>,
+    inner: &mut Rare,
+) {
+    if label.is_some() {
+        inner.accessible_label = label;
+    }
+    if let Some(outer) = accessibility {
+        match &mut inner.accessibility {
+            Some(own) => (*outer).merge_into(own),
+            None => inner.accessibility = Some(outer),
+        }
+    }
 }
 impl Rare {
     /// `View::refine`'s part: what an outer view sets over its inner one.
@@ -599,6 +654,12 @@ impl Rare {
         }
         if self.overscroll_contain {
             inner.overscroll_contain = true;
+        }
+        if self.wheel_across {
+            inner.wheel_across = true;
+        }
+        if self.paging {
+            inner.paging = true;
         }
         if self.drag_preview.is_some() {
             inner.drag_preview = self.drag_preview;
@@ -667,6 +728,11 @@ impl Rare {
         inner.keymap.extend(self.keymap);
         inner.mount_flags |= self.mount_flags;
         inner.conditional.extend(self.conditional);
+        // What it is to assistive technology, as set outside a component
+        // over what the component set: rare, so out of line.
+        if self.accessible_label.is_some() || self.accessibility.is_some() {
+            merge_accessibility(self.accessible_label, self.accessibility, inner);
+        }
     }
 }
 impl View {
@@ -838,7 +904,7 @@ impl View {
             events: Vec::new(),
             focusable: None,
             id: None,
-            contents: false,
+            contents: Contents::Own,
             mounted: Vec::new(),
 
             rare: None,
@@ -853,14 +919,14 @@ impl View {
     /// origin. For a region that shows one view at a time (`switch`) and
     /// should not be a layout box of its own; see `Scene::set_contents`.
     pub fn contents(mut self) -> Self {
-        self.contents = true;
+        self.contents = Contents::Child;
         self
     }
     /// Undo `contents`: a box of its own again, for a host that puts a
     /// region it built in a flow of its own choosing after all (with
     /// `display_contents`, its children in its parent's).
     pub fn not_contents(mut self) -> Self {
-        self.contents = false;
+        self.contents = Contents::Own;
         self
     }
     /// A checkbox's mixed state, while `mixed` is true: a dash in place of
@@ -889,6 +955,13 @@ impl View {
         self.rare_mut().scrollbar = Some(visible);
         self
     }
+    /// `scrollbar(true)`, drawn and timed as `style` says over the
+    /// platform's look (an app's own floating rail).
+    pub fn scrollbar_style(mut self, style: crate::compose_scrollbar::ScrollbarStyle) -> Self {
+        self.rare_mut().scrollbar = Some(true);
+        self.edges_mut().scrollbar_style = Some(Rc::new(style));
+        self
+    }
     /// Keep a wheel or trackpad gesture that starts over this scroll view,
     /// virtual list or text area with it at its edges, as CSS's
     /// `overscroll-behavior: contain`: what it can't scroll goes to none of
@@ -897,6 +970,30 @@ impl View {
     /// goes on to them.
     pub fn overscroll_contain(mut self) -> Self {
         self.rare_mut().overscroll_contain = true;
+        self
+    }
+    /// Let a mouse wheel, which has no sideways axis, move this `scroll_x`:
+    /// with Shift held, always and only it, at its edges too; without, once
+    /// the pointer has been moved onto it. A view that slid under a resting
+    /// pointer leaves the wheel alone, so a page being read isn't caught by
+    /// what scrolls past. Without Shift, at its edge the rest of the wheel's
+    /// gesture stops there, as at any scroll view's edge (the gesture is
+    /// latched to it), and after a pause, or once the pointer moves, the wheel
+    /// goes on to the views around it. A trackpad, which has a sideways axis,
+    /// moves it as any `scroll_x`, except that a swipe mostly down leaves it
+    /// still rather than moving it by the swipe's drift. A Mac reports Shift and the wheel as sideways motion
+    /// itself, which every `scroll_x` takes.
+    pub fn wheel_across(mut self) -> Self {
+        self.rare_mut().wheel_across = true;
+        self
+    }
+    /// Let a scroll view come to rest only on whole pages, a page its own
+    /// length along the way it scrolls, as `UIScrollView.pagingEnabled`: a
+    /// gesture's lift picks the next page if it is quick and the nearest if not,
+    /// never more than one from where it began; a mouse wheel goes a page a
+    /// notch; anything else that moves it settles on the nearest page.
+    pub fn paging(mut self, paging: bool) -> Self {
+        self.rare_mut().paging = paging;
         self
     }
     /// Keep a scroll viewport at its end while its content grows, as long as
@@ -936,6 +1033,14 @@ impl View {
     /// to the latest" button shows while it does not. For a virtual list.
     pub fn on_at_end(mut self, changed: impl FnMut(bool) + 'static) -> Self {
         self.edges_mut().at_end = Some(Box::new(changed));
+        self
+    }
+    /// How many of its viewports of rows a virtual list builds ahead of each
+    /// edge of its view in a window's spare time (`crate::spare`), 1 unless
+    /// set, and keeps as it scrolls away. 0: it builds what shows and its
+    /// overscan alone, and drops the rest.
+    pub fn list_ahead(mut self, viewports: f32) -> Self {
+        self.edges_mut().ahead = Some(viewports);
         self
     }
     fn edges_mut(&mut self) -> &mut ListEdges {
@@ -1202,6 +1307,14 @@ impl View {
         self.rare_mut().pointer_events = Some(Box::new(enabled));
         self
     }
+    /// `false`: a press on the view (or anything in it) leaves focus where
+    /// it is, as the web's `mousedown` with `preventDefault()` does. Its
+    /// clicks still come. A list hanging from a field: its rows and tabs
+    /// take clicks, the field keeping the keys and its caret.
+    pub fn focus_on_press(mut self, moves: bool) -> Self {
+        self.set_mount_flag(KEEPS_FOCUS, !moves);
+        self
+    }
     /// A box laid out around content that may be put away: while nothing
     /// it holds is displayed (`hidden` or `invisible`), the pointer passes
     /// through it as `pointer_events(false)` lets it, to what is under it.
@@ -1405,6 +1518,14 @@ impl View {
         self.accessibility_mut().live = Some(live);
         self
     }
+    /// Read after the name, as a hint (`aria-description`), followed: a
+    /// sheet grabber's "Double tap to expand" or "collapse" as the sheet
+    /// stands. Worked out only while assistive technology listens, as
+    /// `accessible_label_when`; empty says none.
+    pub fn description_when(mut self, description: impl FnMut() -> String + 'static) -> Self {
+        self.accessibility_mut().description_when = Some(Box::new(description));
+        self
+    }
     /// Read after the name, as a hint (`aria-description`).
     pub fn accessible_description(mut self, description: impl Into<String>) -> Self {
         self.accessibility_mut().description = Some(description.into());
@@ -1422,6 +1543,13 @@ impl View {
     /// (`aria-hidden`): decoration, or what is said elsewhere already.
     pub fn accessible_hidden(mut self) -> Self {
         self.accessibility_mut().hidden = true;
+        self
+    }
+    /// While this shows, assistive technology reads it alone, not what lies
+    /// behind it (`aria-modal`): a sheet or dialog an app builds itself.
+    /// `modal` views are so already.
+    pub fn accessible_modal(mut self) -> Self {
+        self.accessibility_mut().modal = true;
         self
     }
     /// One Tab stop for the focusable views inside, the arrows along
@@ -1487,6 +1615,17 @@ impl View {
                 ui.on_document_event(handle.node, listener);
             }
         })
+    }
+    /// Keep this view's shader as `make` says, read again when what it reads
+    /// changes, its time stepped by the engine while it runs: see
+    /// `crate::shader_drive`. A shader with none of that wants only
+    /// `Styled::layer_shader`. Last in its chain: what it returns wraps the
+    /// view, already styled.
+    pub fn shader_drive(
+        self,
+        make: impl FnMut() -> crate::shader_drive::ShaderDrive + 'static,
+    ) -> View {
+        component(move |cx| crate::shader_drive::attach(cx, self, make))
     }
     /// Run `f` with the mounted node once the view has mounted.
     pub fn on_mount(mut self, f: impl FnOnce(NodeHandle) + 'static) -> Self {
@@ -1856,6 +1995,11 @@ impl View {
         self.rare_mut().row_text = Some(std::rc::Rc::new(text));
         self
     }
+    /// A virtual list's rows for a selection: their text and its keys.
+    pub(crate) fn list_rows(mut self, rows: crate::selection::RowText) -> Self {
+        self.rare_mut().row_text = Some(rows);
+        self
+    }
     /// A canvas's drawing placed by `view` (pan and zoom), following the
     /// reactive values it reads: a change repaints the drawing as it is,
     /// drawing nothing again (`Scene::set_canvas_view`). For a canvas.
@@ -1880,7 +2024,9 @@ impl View {
         if self.focusable.is_some() {
             inner.focusable = self.focusable;
         }
-        inner.contents |= self.contents;
+        if self.contents != Contents::Own {
+            inner.contents = self.contents;
+        }
         inner.styles.merge(&self.styles);
         inner.children.extend(self.children);
         fn merge_variant(base: &mut Option<Box<Styles>>, patch: Option<Box<Styles>>) {
@@ -2001,11 +2147,157 @@ pub fn overlay() -> View {
         .items_stretch()
         .justify_stretch()
 }
+/// How menus, popovers and tooltips are shaped: zgx's own, or (on
+/// Windows) WinUI 3's. Constants, chosen as zgx is built: a platform's shape
+/// costs nothing where it isn't, and a theme doesn't restyle them (a view's
+/// own styles do).
+pub(crate) struct OverlayLook {
+    /// A menu's panel: its corner radius and padding (across, down).
+    pub(crate) menu_radius: crate::theme::Themed<f32>,
+    pub(crate) menu_padding: (f32, f32),
+    /// A menu item: its padding, how far its highlight is inset from the
+    /// panel (across, down), and that highlight's corner radius.
+    pub(crate) menu_item_padding: (f32, f32),
+    /// The least a menu item is tall (its text centred in it), if any.
+    pub(crate) menu_item_min_height: Option<f32>,
+    pub(crate) menu_item_inset: (f32, f32),
+    pub(crate) menu_item_radius: f32,
+    /// A popover's panel's corner radius and padding.
+    pub(crate) popover_radius: crate::theme::Themed<f32>,
+    pub(crate) popover_padding: f32,
+    /// How far a menu item's shortcut sits from its label.
+    pub(crate) shortcut_gap: f32,
+    /// The shadows a menu's and a popover's panel cast, if any.
+    pub(crate) panel_shadows: Option<&'static [crate::scene::BoxShadow]>,
+    /// A text tooltip: its padding (across, above, below), corner radius
+    /// and font size.
+    pub(crate) tooltip_padding: (f32, f32, f32),
+    pub(crate) tooltip_radius: crate::theme::Themed<f32>,
+    pub(crate) tooltip_font_size: crate::theme::Themed<f32>,
+    /// A text tooltip's panel, its text (`None`: inherited) and its border
+    /// (width, colour).
+    pub(crate) tooltip_bg: crate::theme::Themed<crate::scene::Color>,
+    pub(crate) tooltip_text: Option<crate::theme::Themed<crate::scene::Color>>,
+    pub(crate) tooltip_border: (f32, crate::theme::Themed<crate::scene::Color>),
+}
+/// zgx's own.
+pub(crate) const BUILT_IN_OVERLAY: OverlayLook = OverlayLook {
+    menu_radius: crate::theme::Themed::Token(tok::RADIUS_MD.0),
+    menu_padding: (16., 16.),
+    menu_item_padding: (12., 8.),
+    menu_item_min_height: None,
+    menu_item_inset: (0., 0.),
+    menu_item_radius: 0.,
+    popover_radius: crate::theme::Themed::Token(tok::RADIUS_MD.0),
+    popover_padding: 16.,
+    shortcut_gap: 24.,
+    panel_shadows: None,
+    tooltip_padding: (8., 4., 4.),
+    tooltip_radius: crate::theme::Themed::Token(tok::RADIUS_SM.0),
+    tooltip_font_size: crate::theme::Themed::Token(tok::FONT_SIZE_XS.0),
+    tooltip_bg: crate::theme::Themed::Token(tok::POPOVER_BG.0),
+    tooltip_text: None,
+    tooltip_border: (0.5, crate::theme::Themed::Token(tok::BORDER.0)),
+};
+/// Windows 11's, as WinUI 3 draws its MenuFlyout, FlyoutPresenter and
+/// ToolTip (microsoft-ui-xaml's `CommonStyles`): a menu's panel rounded as
+/// overlays are (`OverlayCornerRadius`, 8) with 2 above and below its items
+/// and none across (`MenuFlyoutPresenterThemePadding`), each item's
+/// highlight inset 4 across and 2 down (`MenuFlyoutItemMargin`) and rounded
+/// as controls are (`ControlCornerRadius`, 4), padded 11 by 4 (the narrow
+/// padding a mouse or keyboard opens it with); a popover rounded 8; a
+/// tooltip padded 9 across, 6 above and 8 below (`ToolTipBorderPadding`)
+/// in 12-point text (`ToolTipContentThemeFontSize`). Colours stay the
+/// theme's. No border on menus and popovers: in windows of their own, the
+/// default, DWM draws their rim, its corner matching the panel's 8.
+pub(crate) const WINDOWS_OVERLAY: OverlayLook = OverlayLook {
+    menu_radius: crate::theme::Themed::Value(8.),
+    menu_padding: (0., 2.),
+    menu_item_padding: (11., 4.),
+    menu_item_inset: (4., 2.),
+    menu_item_radius: 4.,
+    popover_radius: crate::theme::Themed::Value(8.),
+    tooltip_padding: (9., 6., 8.),
+    tooltip_radius: crate::theme::Themed::Token(tok::RADIUS_SM.0),
+    tooltip_font_size: crate::theme::Themed::Value(12.),
+    ..BUILT_IN_OVERLAY
+};
+/// GNOME's, as libadwaita draws its popover menus and popovers
+/// (`_common.scss`, `widgets/_menus.scss`, `_popovers.scss`): a menu's
+/// panel rounded as popovers are (`$popover_radius`, 15) holding its items
+/// 6 in (`$menu_margin`), each item 32 tall (`min-height`), padded 12
+/// across (`$menu_padding`) and rounded 9 (`$menu_radius`), its shortcut
+/// 12 from its label (`accelerator`); a popover rounded 15 and padded 8.
+/// Colours stay the theme's but the highlight (`linux_look`).
+pub(crate) const LINUX_OVERLAY: OverlayLook = OverlayLook {
+    menu_radius: crate::theme::Themed::Value(15.),
+    menu_padding: (6., 6.),
+    menu_item_padding: (12., 0.),
+    menu_item_min_height: Some(32.),
+    menu_item_inset: (0., 0.),
+    menu_item_radius: 9.,
+    popover_radius: crate::theme::Themed::Value(15.),
+    popover_padding: 8.,
+    shortcut_gap: 12.,
+    panel_shadows: Some(&GNOME_PANEL_SHADOWS),
+    // A tooltip as libadwaita's (`widgets/_tooltip.scss`): dark and
+    // translucent in either scheme, white text, a 1 border of white at 10%,
+    // padded 10 by 6, rounded 9, its text the body's less a step. (When it
+    // shows is `TooltipTiming`'s, GTK's by default on Linux.)
+    tooltip_padding: (10., 6., 6.),
+    tooltip_radius: crate::theme::Themed::Value(9.),
+    tooltip_font_size: crate::theme::Themed::Token(tok::FONT_SIZE_SM.0),
+    tooltip_bg: crate::theme::Themed::Value(crate::scene::Color(0, 0, 6, 204)),
+    tooltip_text: Some(crate::theme::Themed::Value(crate::scene::Color(
+        255, 255, 255, 255,
+    ))),
+    tooltip_border: (
+        1.,
+        crate::theme::Themed::Value(crate::scene::Color(255, 255, 255, 26)),
+    ),
+};
+/// libadwaita's popover shadow (`popover > contents { box-shadow }`, its
+/// CSS blur halved to a Gaussian sigma): a 1 outline of black at 5%, then
+/// 1 down blurred 2.5 spread 1 at 9%, and 2 down blurred 7 spread 3 at 5%.
+const GNOME_PANEL_SHADOWS: [crate::scene::BoxShadow; 3] = [
+    panel_shadow(0., 0., 1., 13),
+    panel_shadow(1., 2.5, 1., 23),
+    panel_shadow(2., 7., 3., 13),
+];
+/// A black shadow `y` down, blurred `blur_radius`, grown `spread`.
+const fn panel_shadow(y: f32, blur_radius: f32, spread: f32, alpha: u8) -> crate::scene::BoxShadow {
+    crate::scene::BoxShadow {
+        color: crate::scene::Color(0, 0, 0, alpha),
+        offset: crate::scene::Transform { x: 0., y },
+        blur_radius,
+        spread,
+    }
+}
+pub(crate) const OVERLAY: OverlayLook = if cfg!(windows) {
+    WINDOWS_OVERLAY
+} else if cfg!(target_os = "linux") {
+    LINUX_OVERLAY
+} else {
+    BUILT_IN_OVERLAY
+};
+
 /// A control's default focus ring: an accent border. Where the control has
 /// no border of its own it paints over the control (an inset stroke, taking
 /// no layout room), so focusing never moves its content; otherwise it
-/// colours the control's own border. (Made when first focused.)
+/// colours the control's own border. On Windows, a ring outside it as
+/// WinUI draws one, and on Linux an outline inset over it as GNOME draws
+/// one, taking no room either. (Made when first focused.)
 fn focus_ring(styles: &Styles) -> fn() -> Styles {
+    // Windows draws keyboard focus outside the control, bordered or not, as
+    // WinUI's focus visual does (`focus_outside`).
+    if cfg!(windows) {
+        return || widget_style(|w| &w.focus_outside);
+    }
+    // GNOME draws keyboard focus as an outline inset over the control,
+    // bordered or not (`focus_inset`).
+    if cfg!(target_os = "linux") {
+        return || widget_style(|w| &w.focus_inset);
+    }
     match bordered(styles) {
         true => || widget_style(|w| &w.focus_recolor),
         false => || widget_style(|w| &w.focus_ring),
@@ -2207,8 +2499,11 @@ pub use crate::compose_context_menu::{ContextMenuEvent, ContextMenuSpan};
 /// Where anchored popovers and menus open (`View::placement`).
 pub use crate::compose_modal::ModalPlacement;
 pub use crate::compose_popover::{Edge as PlacementEdge, Placement, Side as PlacementSide};
-pub use crate::compose_rich::{RichTextView, SpanHover, SpanIcon, TextSpan, rich_text, text_span};
-pub use crate::compose_tooltip::Tooltip;
+pub use crate::compose_rich::{
+    RichTextView, SpanHover, SpanIcon, TextFade, TextSpan, fade_now, rich_text, text_span,
+};
+pub use crate::compose_scrollbar::{ScrollbarEase, ScrollbarStyle};
+pub use crate::compose_tooltip::{Tooltip, TooltipTiming, set_tooltip_timing};
 /// Reactive inline children; equal resolved content preserves paragraph layout/paint.
 pub fn rich_text_signal(compute: impl FnMut() -> Vec<TextSpan> + 'static) -> View {
     View::new(Kind::RichText(Box::new(compute)))
@@ -2744,12 +3039,23 @@ pub fn scrollbar(offset: Signal<f32>, mut extent: impl FnMut() -> f32 + 'static)
         crate::compose_scrollbar::mount(ui, root, offset, size, length, false);
     })))
 }
-/// A conditional region. Equal selector values retain their component and local state.
+/// A conditional region. Equal selector values retain their component and
+/// local state. It lays out as what it shows, in its place (`View::contents`):
+/// a percentage in that view resolves against this region's parent. Styled
+/// (`switch(..).w_full()`), it is a box of its own that holds the view.
 pub fn switch<K: PartialEq + Clone + 'static>(
     select: impl FnMut() -> K + 'static,
-    build: impl FnMut(K, &mut Context) -> View + 'static,
+    mut build: impl FnMut(K, &mut Context) -> View + 'static,
 ) -> View {
-    switch_with::<K, false>(select, build)
+    switch_with::<K, false, _>((), select, move |key, cx| Some(build(key, cx)))
+}
+/// A [`switch`] whose cases may show nothing (`None`): the region holds no
+/// child then, not an empty one (a closed `ui.show`: one node, not two).
+pub fn switch_or_none<K: PartialEq + Clone + 'static>(
+    select: impl FnMut() -> K + 'static,
+    build: impl FnMut(K, &mut Context) -> Option<View> + 'static,
+) -> View {
+    switch_with::<K, false, _>((), select, build)
 }
 /// [`switch`], focus in a branch it replaces found again in the next: a
 /// focusable node of the same role and accessible name (a list's row,
@@ -2760,13 +3066,70 @@ pub fn switch_keeping_focus<K: PartialEq + Clone + 'static>(
     select: impl FnMut() -> K + 'static,
     build: impl FnMut(K, &mut Context) -> View + 'static,
 ) -> View {
-    switch_with::<K, true>(select, build)
+    switch_keeping_focus_held(FocusHold::default(), select, build)
 }
-fn switch_with<K: PartialEq + Clone + 'static, const KEEP_FOCUS: bool>(
-    mut select: impl FnMut() -> K + 'static,
+/// [`switch_keeping_focus`], where focus was taken when `hold` is
+/// ([`FocusHold::take`]) rather than as it switches: for a host that runs
+/// what may move focus (a script's load, setting state the shown branch
+/// reads) before it switches.
+pub fn switch_keeping_focus_held<K: PartialEq + Clone + 'static>(
+    hold: FocusHold,
+    select: impl FnMut() -> K + 'static,
     mut build: impl FnMut(K, &mut Context) -> View + 'static,
 ) -> View {
-    View::new(Kind::Region(Box::new(move |ui, root, environment| {
+    switch_with::<K, true, _>(hold, select, move |key, cx| Some(build(key, cx)))
+}
+/// Where focus is in a [`switch_keeping_focus_held`]'s branch, taken before
+/// it switches.
+#[derive(Clone, Default)]
+pub struct FocusHold(Rc<FocusHeld>);
+#[derive(Default)]
+struct FocusHeld {
+    /// The branch shown.
+    shown: RefCell<Option<(WeakUi, NodeId)>>,
+    /// Taken: where focus was in it (`None`: not in it).
+    taken: RefCell<Option<Option<crate::widgets::Refocus>>>,
+}
+impl FocusHold {
+    /// Where focus is in the branch shown, for the next switch to find
+    /// again in the branch it builds; what moves focus meanwhile doesn't
+    /// count.
+    pub fn take(&self) {
+        let trail = match &*self.0.shown.borrow() {
+            Some((ui, node)) => ui.upgrade().and_then(|ui| ui.focus_trail(*node)),
+            None => None,
+        };
+        *self.0.taken.borrow_mut() = Some(trail);
+    }
+    /// Forget what was taken (the switch it was for doesn't come): the next
+    /// switch takes focus as it switches.
+    pub fn release(&self) {
+        self.0.taken.borrow_mut().take();
+    }
+}
+/// What a switch keeps of focus across its branches: nothing (`()`), or a
+/// [`FocusHold`].
+trait Hold: 'static {
+    fn shows(&self, _ui: &WeakUi, _node: NodeId) {}
+    fn taken(&self) -> Option<Option<crate::widgets::Refocus>> {
+        None
+    }
+}
+impl Hold for () {}
+impl Hold for FocusHold {
+    fn shows(&self, ui: &WeakUi, node: NodeId) {
+        *self.0.shown.borrow_mut() = Some((ui.clone(), node));
+    }
+    fn taken(&self) -> Option<Option<crate::widgets::Refocus>> {
+        self.0.taken.borrow_mut().take()
+    }
+}
+fn switch_with<K: PartialEq + Clone + 'static, const KEEP_FOCUS: bool, H: Hold>(
+    hold: H,
+    mut select: impl FnMut() -> K + 'static,
+    mut build: impl FnMut(K, &mut Context) -> Option<View> + 'static,
+) -> View {
+    let mut region = View::new(Kind::Region(Box::new(move |ui, root, environment| {
         let weak = ui.downgrade();
         let runtime = ui.runtime.clone();
         let mut selected: Option<K> = None;
@@ -2784,17 +3147,33 @@ fn switch_with<K: PartialEq + Clone + 'static, const KEEP_FOCUS: bool>(
             }
             runtime.untracked(|| {
                 let mut cx = Context::new(runtime.clone(), environment.clone());
-                let view = build(key.clone(), &mut cx);
+                let Some(view) = build(key.clone(), &mut cx) else {
+                    // Nothing shows: no child at all, and the region, hidden
+                    // while empty, takes no place (no flex item, no gap).
+                    // Marked only now, so that a region that always shows
+                    // something (a `switch`, an open `ui.show`) is restyled
+                    // no more than it was; its old view's removal lays it
+                    // out hidden.
+                    ui.scene.borrow_mut().set_hidden_when_empty(root, true);
+                    if let Some(old) = mounted.take() {
+                        ui.remove(old);
+                    }
+                    return;
+                };
                 let mut transaction = MountTransaction::new(&ui, root);
                 let node = mount(&mut ui, root, view, environment.clone());
                 cx.finish(&mut ui, node);
                 transaction.commit();
+                // Where focus was: as the host took it, else now.
                 let trail = match (KEEP_FOCUS, mounted) {
-                    (true, Some(old)) => ui.focus_trail(old),
+                    (true, Some(old)) => hold.taken().unwrap_or_else(|| ui.focus_trail(old)),
                     _ => None,
                 };
                 if let Some(old) = mounted.replace(node) {
                     ui.remove(old);
+                }
+                if KEEP_FOCUS {
+                    hold.shows(&weak, node);
                 }
                 if let Some(trail) = trail {
                     ui.refocus_trail(node, trail);
@@ -2802,7 +3181,9 @@ fn switch_with<K: PartialEq + Clone + 'static, const KEEP_FOCUS: bool>(
             });
             selected = Some(key);
         });
-    })))
+    })));
+    region.contents = Contents::ChildIfUnstyled;
+    region
 }
 /// Keyed children retain their local state and subscriptions across reorder.
 /// Duplicate keys are rejected before mutating the mounted children.
@@ -2810,90 +3191,227 @@ fn switch_with<K: PartialEq + Clone + 'static, const KEEP_FOCUS: bool>(
 /// set. Application state written by a constructor is not rolled back.
 pub fn keyed<K: Eq + std::hash::Hash + Clone + 'static>(
     mut keys: impl FnMut() -> Vec<K> + 'static,
+    build: impl FnMut(K, &mut Context) -> View + 'static,
+) -> View {
+    keyed_grown(move || Keys::All(keys()), build)
+}
+/// A pass's keys for [`keyed_grown`]: all of them, or those after the
+/// first `unchanged`, which are the last pass's as it had them (a source
+/// that knows: a list grown at its end, its last item changed).
+pub enum Keys<K> {
+    /// Every key, in order.
+    All(Vec<K>),
+    /// The last pass's first `unchanged` keys, then `rest`.
+    Grown {
+        /// How many of the last pass's keys, from the first, stay.
+        unchanged: usize,
+        /// The keys after them.
+        rest: Vec<K>,
+    },
+}
+/// [`keyed`] whose keys say how many are the last pass's: a list growing at
+/// its end (a streamed reply's rows) is passed in what it adds, its keys
+/// neither compared, copied nor dropped whole.
+pub fn keyed_grown<K: Eq + std::hash::Hash + Clone + 'static>(
+    mut keys: impl FnMut() -> Keys<K> + 'static,
     mut build: impl FnMut(K, &mut Context) -> View + 'static,
 ) -> View {
     View::new(Kind::Region(Box::new(move |ui, root, environment| {
         let weak = ui.downgrade();
         let runtime = ui.runtime.clone();
-        let mut entries: HashMap<K, NodeId, crate::KeyHasher> =
+        // Each key's child, where the last pass that saw the key placed it,
+        // and that pass (a key met twice in one pass is a duplicate).
+        let mut entries: HashMap<K, Keyed, crate::KeyHasher> =
             HashMap::with_hasher(crate::key_hasher());
-        // The last pass's keys and their children, in order.
-        let mut last: (Vec<K>, Vec<NodeId>) = (Vec::new(), Vec::new());
+        // The keys last given, and the children the last pass that finished
+        // put in order.
+        let (mut shown, mut order): (Vec<K>, Vec<NodeId>) = (Vec::new(), Vec::new());
+        // This pass, and whether the last one finished: one that did not
+        // (a constructor panicked, the region went) left `entries` and
+        // `order` as they were for keys `shown` no longer holds.
+        let (mut pass, mut finished) = (0u64, true);
+        // The last keys after the prefix (`gone`'s from `gone_at`), a pass's
+        // children by key after it, the keys with none yet (by place) and
+        // those built: kept from pass to pass, so a pass allocates none of
+        // them.
+        let (mut gone, mut nodes): (Vec<K>, Vec<Option<NodeId>>) = (Vec::new(), Vec::new());
+        let (mut fresh, mut added): (Vec<usize>, Vec<(usize, NodeId)>) = (Vec::new(), Vec::new());
         ui.bind(root, move || {
-            let keys = keys();
-            // The same keys in the same order, every child still mounted (a
-            // list whose rows changed in place): nothing to add, remove or
-            // move, and no key hashed to find out.
-            if keys == last.0
-                && let Some(ui) = weak.upgrade()
-            {
-                let scene = ui.scene.borrow();
-                if !scene.contains(root) || last.1.iter().all(|node| scene.contains(*node)) {
-                    return;
+            // Every child the last pass placed still mounted: the root holds
+            // as many (it holds `keyed`'s children alone, and one removed
+            // from elsewhere leaves it).
+            let intact =
+                |ui: &Ui, order: &[NodeId]| ui.scene.borrow().children(root).len() == order.len();
+            // How many first keys are the last pass's, and those it had
+            // after them.
+            let (same, gone_at) = match keys() {
+                Keys::All(keys) => {
+                    // The same keys in the same order, every child still
+                    // mounted (a list whose rows changed in place): nothing
+                    // to add, remove or move, and no key hashed to find out.
+                    if finished
+                        && keys == shown
+                        && let Some(ui) = weak.upgrade()
+                        && (!ui.scene.borrow().contains(root) || intact(&ui, &order))
+                    {
+                        return;
+                    }
+                    let same = keys
+                        .iter()
+                        .zip(&shown)
+                        .take_while(|(now, then)| now == then)
+                        .count();
+                    // (The last keys kept whole, read from `same` on: none
+                    // moved.)
+                    gone = std::mem::replace(&mut shown, keys);
+                    (same, same)
                 }
-            }
-            let mut unique = std::collections::HashSet::with_capacity_and_hasher(
-                keys.len(),
-                crate::key_hasher(),
-            );
-            unique.extend(keys.iter());
-            assert_eq!(unique.len(), keys.len(), "duplicate component child key");
+                Keys::Grown { unchanged, rest } => {
+                    let same = unchanged.min(shown.len());
+                    if finished
+                        && same == shown.len()
+                        && rest.is_empty()
+                        && let Some(ui) = weak.upgrade()
+                        && (!ui.scene.borrow().contains(root) || intact(&ui, &order))
+                    {
+                        return;
+                    }
+                    gone.clear();
+                    gone.extend(shown.drain(same..));
+                    shown.extend(rest);
+                    (same, 0)
+                }
+            };
+            let keys = &shown;
             let Some(mut ui) = weak.upgrade() else {
+                finished = false;
                 return;
             };
+            // The last pass's keys first, as they were, then others (a list
+            // streaming in, growing at its end or its last row built again):
+            // only the rest is hashed, mounted or removed. While every child
+            // of that prefix is still mounted, `entries` holds the last
+            // pass's keys alone, and what is left to hash (the keys after
+            // it, then and now) is well under the whole list's: an edit near
+            // the front passes whole.
+            let from = {
+                let rest = (gone.len() - gone_at) + 2 * (keys.len() - same);
+                if same > 0
+                    && finished
+                    && rest <= keys.len() / 2
+                    && entries.len() == same + gone.len() - gone_at
+                    && intact(&ui, &order)
+                {
+                    same
+                } else {
+                    0
+                }
+            };
+            (pass, finished) = (pass + 1, false);
+            // One look at each key after the prefix: its child, if it has
+            // one, marked as shown this pass where it is now. A key met
+            // twice, or one of the prefix's again (placed before `from`, as
+            // it still is), is a duplicate.
+            nodes.clear();
+            fresh.clear();
+            for (at, key) in keys.iter().enumerate().skip(from) {
+                match entries.get_mut(key) {
+                    Some(entry) => {
+                        assert!(
+                            entry.pass != pass && entry.at >= from,
+                            "duplicate component child key"
+                        );
+                        (entry.pass, entry.at) = (pass, at);
+                        nodes.push(Some(entry.node));
+                    }
+                    None => {
+                        fresh.push(at);
+                        nodes.push(None);
+                    }
+                }
+            }
+            // Those with none yet, among themselves (a stream's: a key or
+            // two, looked through).
+            let repeats = if fresh.len() <= 8 {
+                (1..fresh.len()).any(|i| fresh[..i].iter().any(|&j| keys[j] == keys[fresh[i]]))
+            } else {
+                let mut unique = std::collections::HashSet::with_capacity_and_hasher(
+                    fresh.len(),
+                    crate::key_hasher(),
+                );
+                !fresh.iter().all(|&at| unique.insert(&keys[at]))
+            };
+            assert!(!repeats, "duplicate component child key");
             if !ui.scene.borrow().contains(root) {
                 return;
             }
-            let order = runtime.untracked(|| {
+            runtime.untracked(|| {
                 let mut transaction = MountTransaction::new(&ui, root);
                 // Stage every new child before changing the committed registry
                 // or removing old children. The mount guard disposes staged
                 // roots if any later constructor panics.
-                let mut added = Vec::new();
-                for key in &keys {
-                    if entries
-                        .get(key)
-                        .is_some_and(|node| ui.scene.borrow().contains(*node))
-                    {
+                added.clear();
+                for (i, key) in keys[from..].iter().enumerate() {
+                    if nodes[i].is_some_and(|node| ui.scene.borrow().contains(node)) {
                         continue;
                     }
                     let mut cx = Context::new(runtime.clone(), environment.clone());
                     let view = build(key.clone(), &mut cx);
                     let node = mount(&mut ui, root, view, environment.clone());
                     cx.finish(&mut ui, node);
-                    added.push((key.clone(), node));
+                    added.push((i, node));
                 }
-                entries.extend(added);
+                for &(i, node) in &added {
+                    nodes[i] = Some(node);
+                    let (at, key) = (from + i, keys[from + i].clone());
+                    entries.insert(key, Keyed { node, pass, at });
+                }
                 // Every key shown now is held: only more than that left.
                 // Those go in the order they were in, the same every run (a
                 // map's iteration is not), as what their removal repaints
-                // follows it.
-                if entries.len() > unique.len() {
-                    for (index, key) in last.0.iter().enumerate() {
-                        if !unique.contains(key)
-                            && let Some(node) = entries.remove(key)
+                // follows it. (Those before `same` are shown still.)
+                if entries.len() > keys.len() {
+                    for (index, key) in (same..).zip(&gone[gone_at..]) {
+                        if entries.get(key).is_some_and(|entry| entry.pass != pass)
+                            && let Some(entry) = entries.remove(key)
                         {
-                            ui.remove_indexed(node, index);
+                            ui.remove_indexed(entry.node, index);
                         }
                     }
                     // Any not in the last order (left by a pass that did not finish).
-                    entries.retain(|key, node| {
-                        if unique.contains(key) {
-                            true
-                        } else {
-                            ui.remove_in_effect(*node);
-                            false
-                        }
-                    });
+                    if from == 0 {
+                        entries.retain(|_, entry| {
+                            if entry.pass == pass {
+                                true
+                            } else {
+                                ui.remove_in_effect(entry.node);
+                                false
+                            }
+                        });
+                    }
                 }
-                let order: Vec<_> = keys.iter().map(|key| entries[key]).collect();
-                assert!(ui.scene.borrow_mut().reorder_children(root, &order));
+                order.truncate(from);
+                order.extend(
+                    nodes
+                        .iter()
+                        .map(|node| node.expect("each key has its child")),
+                );
+                assert!(
+                    ui.scene
+                        .borrow_mut()
+                        .reorder_children_from(root, from, &order)
+                );
                 transaction.commit();
-                order
             });
-            last = (keys, order);
+            finished = true;
         });
     })))
+}
+/// A `keyed` child: its node, the last pass that showed its key, and where.
+struct Keyed {
+    node: NodeId,
+    pass: u64,
+    at: usize,
 }
 /// What builds a virtual list's row: its index (a signal following it),
 /// its key and the row's context.
@@ -2926,31 +3444,78 @@ impl<K: 'static> RowSource<K> {
         let build = self.build.clone();
         move |index, key, cx| (build.borrow_mut())(index, key, cx)
     }
-    /// Row `index`'s text, of `len()` rows: the row built as the list builds
-    /// it, not mounted (what it makes ends at once), and read (`view_text`).
-    pub(crate) fn text(
+    /// The list's rows as a selection reads them, of `len()` rows (`None`
+    /// while that can't be read): a row's text, built as the list builds it
+    /// but not mounted (what it makes ends at once), and read (`view_text`);
+    /// a row's key, read as an end is set in it; and where a key is now. One
+    /// allocation, as a plain row text function is.
+    pub(crate) fn rows(
         &self,
-        len: impl Fn() -> usize + 'static,
-    ) -> impl Fn(usize) -> Option<String> + 'static {
-        let (key, build, mounted_in) = (
-            self.key.clone(),
-            self.build.clone(),
-            self.mounted_in.clone(),
-        );
-        move |index| {
-            if index >= len() {
-                return None;
-            }
-            let (runtime, environment) = mounted_in.borrow().clone()?;
-            // Built now (a copy during a row's build): copied as nothing.
-            let row = key.try_borrow_mut().ok().map(|mut key| key(index))?;
-            let mut cx = Context::new(runtime.clone(), environment);
-            let mut view = build
-                .try_borrow_mut()
-                .ok()
-                .map(|mut build| build(runtime.signal(index), row, &mut cx))?;
-            Some(view_text(&mut view))
+        len: impl Fn() -> Option<usize> + 'static,
+    ) -> crate::selection::RowText
+    where
+        K: Eq,
+    {
+        Rc::new(SourceRows {
+            key: self.key.clone(),
+            build: self.build.clone(),
+            mounted_in: self.mounted_in.clone(),
+            len,
+        })
+    }
+}
+/// A virtual list's rows as a selection reads them (`RowSource::rows`).
+struct SourceRows<K, L> {
+    key: Rc<RefCell<dyn FnMut(usize) -> K>>,
+    build: Rc<RefCell<RowBuilder<K>>>,
+    mounted_in: Rc<RefCell<Option<(Runtime, Environment)>>>,
+    len: L,
+}
+impl<K: Eq + 'static, L: Fn() -> Option<usize>> SourceRows<K, L> {
+    /// `read`, untracked, in the runtime the list mounted in.
+    fn untracked<R>(&self, read: impl FnOnce() -> Option<R>) -> Option<R> {
+        let runtime = self
+            .mounted_in
+            .borrow()
+            .as_ref()
+            .map(|(runtime, _)| runtime.clone())?;
+        runtime.untracked(read)
+    }
+}
+impl<K: Eq + 'static, L: Fn() -> Option<usize>> crate::selection::ListRows for SourceRows<K, L> {
+    fn text(&self, index: usize) -> Option<String> {
+        if index >= (self.len)().unwrap_or(0) {
+            return None;
         }
+        let (runtime, environment) = self.mounted_in.borrow().clone()?;
+        // Built now (a copy during a row's build): copied as nothing.
+        let row = self.key.try_borrow_mut().ok().map(|mut key| key(index))?;
+        let mut cx = Context::new(runtime.clone(), environment);
+        let mut view = self
+            .build
+            .try_borrow_mut()
+            .ok()
+            .map(|mut build| build(runtime.signal(index), row, &mut cx))?;
+        Some(view_text(&mut view))
+    }
+    fn key(&self, index: usize) -> Option<Rc<dyn std::any::Any>> {
+        self.untracked(|| {
+            let mut key = self.key.try_borrow_mut().ok()?;
+            Some(Rc::new(key(index)) as Rc<dyn std::any::Any>)
+        })
+    }
+    fn find(&self, wanted: &dyn std::any::Any, seen: usize) -> Option<usize> {
+        let wanted = wanted.downcast_ref::<K>()?;
+        self.untracked(|| {
+            // Asked while the list reads its keys: it stays where it was.
+            let (Some(len), Ok(mut key)) = ((self.len)(), self.key.try_borrow_mut()) else {
+                return Some(seen);
+            };
+            if seen < len && key(seen) == *wanted {
+                return Some(seen);
+            }
+            (0..len).find(|&index| key(index) == *wanted)
+        })
     }
 }
 /// The text `view` shows, as a copy of it takes it: its texts in order, a
@@ -3012,14 +3577,18 @@ pub(crate) type RowReveal = (u64, usize, RowAlign);
 /// on the signal this returns, while it is mounted.
 /// `row_index`: a mounted row's index from its place down the list's
 /// content (find in page tells its rows apart by it).
+/// `line`: how far a wheel's line scrolls it, a row's height
+/// (`Ui::wheel_line_at`).
 pub(crate) fn list_reveal(
     ui: &mut Ui,
     root: NodeId,
     row_index: crate::find::RowIndex,
+    line: f32,
 ) -> Signal<RowReveal> {
     let reveal = ui.signal((0_u64, 0_usize, RowAlign::Nearest));
     ui.list_reveals().borrow_mut().insert(root, reveal.clone());
     ui.storage.list_rows.borrow_mut().insert(root, row_index);
+    ui.storage.wheel_lines.borrow_mut().insert(root, line);
     struct Forget(WeakUi, NodeId);
     impl Drop for Forget {
         fn drop(&mut self) {
@@ -3030,12 +3599,45 @@ pub(crate) fn list_reveal(
                 if let Ok(mut rows) = ui.storage.list_rows.try_borrow_mut() {
                     rows.remove(&self.1);
                 }
+                if let Ok(mut lines) = ui.storage.wheel_lines.try_borrow_mut() {
+                    lines.remove(&self.1);
+                }
             }
         }
     }
     let forget = Forget(ui.downgrade(), root);
     ui.retain(root, forget);
     reveal
+}
+/// `keys`, with what spare time adds (`crate::spare`).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn merge_kept<K: Eq + std::hash::Hash + Clone>(
+    kept: &mut crate::spare::Kept<K>,
+    keys: &mut Vec<(K, usize)>,
+    weak: &WeakUi,
+    entries: &HashMap<K, (NodeId, Signal<usize>, Placed), rustc_hash::FxBuildHasher>,
+    key: &mut dyn FnMut(usize) -> K,
+    view: crate::spare::KeptView,
+    row_height: f32,
+    runtime: &Runtime,
+) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    kept.pass();
+    let last = view.count.saturating_sub(1);
+    *keys = runtime.untracked(|| {
+        kept.merge(
+            &ui,
+            view,
+            std::mem::take(keys),
+            key,
+            &|y| Some(((y.max(0.) as f64 / row_height as f64) as usize).min(last)),
+            &|_| true,
+            &|key| entries.get(key).map(|entry| entry.0),
+        )
+    });
 }
 /// Fixed-height keyed rows; only the visible range plus overscan is mounted.
 /// `count` and `key` track reactive reads. `build` runs once per mounted key;
@@ -3053,14 +3655,21 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
     assert!(row_height.is_finite() && row_height > 0.0);
     let count = Rc::new(RefCell::new(count));
     let rows = RowSource::new(key, build);
-    let text = rows.text({
+    let source = rows.rows({
         let count = count.clone();
-        move || count.try_borrow_mut().map_or(0, |mut count| count())
+        move || count.try_borrow_mut().ok().map(|mut count| count())
     });
     let (mut key, mut build, mounted_in) = (rows.key(), rows.build(), rows.mounted_in.clone());
     let count = move || (count.borrow_mut())();
     View::new(Kind::VirtualList(Box::new(
         move |ui, root, environment, options: ListOptions| {
+            // With spare time its overscan is spare time's too: the frame
+            // builds what shows alone.
+            let tick = ui.signal(0_u64);
+            let mut kept = ui
+                .list_ahead(options.ahead(), tick)
+                .map(|ahead| crate::spare::Kept::new(ahead, overscan));
+            let overscan = if kept.is_some() { 0 } else { overscan };
             let ListOptions {
                 scrollbar,
                 keyboard_navigation,
@@ -3180,6 +3789,7 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 ui,
                 root,
                 Rc::new(move |y: f32| Some((y / row_height).round().max(0.) as usize)),
+                row_height,
             );
             let mut handled_reveal = 0;
             ui.bind(root, move || {
@@ -3229,6 +3839,26 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 let range = model.visible_range(position, height);
                 keys.clear();
                 keys.extend(range.map(|index| (key(index), index)));
+                if let Some(kept) = &mut kept {
+                    merge_kept(
+                        kept,
+                        &mut keys,
+                        &weak,
+                        &entries,
+                        &mut key,
+                        crate::spare::KeptView {
+                            top: position,
+                            height,
+                            count: length,
+                            width,
+                            structure: length as u64,
+                            settled: false,
+                            focus_goes: keyboard_navigation,
+                        },
+                        row_height,
+                        &runtime,
+                    );
+                }
                 // Rows kept are stamped with this run: one shown twice is a
                 // key repeated, and those left unstamped go below.
                 run += 1;
@@ -3385,7 +4015,7 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
             });
         },
     )))
-    .row_text(text)
+    .list_rows(source)
 }
 // Roll back newly appended roots if a component constructor or initial binding
 // panics. Existing siblings are never removed by this guard. This is ownership
@@ -3459,8 +4089,8 @@ fn mount_confined(
         Layout::Overlay,
         crate::scene::Style {
             clip: true,
-            width_percent: Some(100.),
-            height_percent: Some(100.),
+            width_percent: Some(1.),
+            height_percent: Some(1.),
             ..Default::default()
         },
     );
@@ -3476,9 +4106,7 @@ pub(crate) fn mount(
 ) -> NodeId {
     let depth = ui.mount_depth();
     if crate::stack_low(depth) {
-        return stacker::grow(crate::STACK_SEGMENT, || {
-            mount(ui, parent, view, environment)
-        });
+        return crate::on_segment(|| mount(ui, parent, view, environment));
     }
     // Extract closures while retaining the root refinements on their wrapper.
     let kind = std::mem::replace(&mut view.kind, Kind::Container(Layout::Column));
@@ -3884,18 +4512,34 @@ fn mount_portal_panel(
     let mut defaults = if is_layer {
         Styles::new()
     } else {
-        Styles::new()
-            .w(if anchored { 240. } else { 360. })
-            .p(16.)
-            .bg(if is_menu {
-                tok::MENU_BG
-            } else if anchored {
-                tok::POPOVER_BG
-            } else {
-                tok::SURFACE_OVERLAY
-            })
-            .rounded(tok::RADIUS_MD)
-            .overflow_hidden()
+        // A menu's and a popover's shape are the platform's (`OVERLAY`); a
+        // dialog keeps the card's.
+        let (padding, radius) = match (is_menu, anchored) {
+            (true, _) => (OVERLAY.menu_padding, OVERLAY.menu_radius),
+            (false, true) => (
+                (OVERLAY.popover_padding, OVERLAY.popover_padding),
+                OVERLAY.popover_radius,
+            ),
+            (false, false) => ((16., 16.), crate::theme::Themed::Token(tok::RADIUS_MD.0)),
+        };
+        let card = Styles::new().w(if anchored { 240. } else { 360. });
+        let card = match padding {
+            (x, y) if x == y => card.p(x),
+            (x, y) => card.px(x).py(y),
+        };
+        let card = match (OVERLAY.panel_shadows, anchored) {
+            (Some(shadows), true) => card.shadows(shadows.to_vec()),
+            _ => card,
+        };
+        card.bg(if is_menu {
+            tok::MENU_BG
+        } else if anchored {
+            tok::POPOVER_BG
+        } else {
+            tok::SURFACE_OVERLAY
+        })
+        .rounded(radius)
+        .overflow_hidden()
     };
     if is_menu {
         defaults = defaults.items_stretch();
@@ -4221,10 +4865,18 @@ fn mount_portal_panel(
     if anchored {
         let (screens, visible, position) = (screens, portal.visible.clone(), portal.position);
         let weak = ui.downgrade();
+        let role = match (is_menu || is_submenu, is_layer) {
+            (true, _) => crate::scene::PopupRole::Menu,
+            (_, true) => crate::scene::PopupRole::Tooltip,
+            _ => crate::scene::PopupRole::Popover,
+        };
         ui.bind(owner, move || {
             let popup = visible.get() && screens.with(|screens| !screens.is_empty());
             if let Some(ui) = weak.upgrade() {
                 let mut scene = ui.scene.borrow_mut();
+                if popup {
+                    scene.set_popup_role(position, role);
+                }
                 scene.set_popup(position, popup);
                 // Its trigger, which a platform placing it flips it around.
                 if popup && let Some(anchor) = anchor {
@@ -4249,6 +4901,15 @@ struct WidgetStyles {
     /// so focusing moves nothing; with one, its border recoloured.
     focus_ring: Styles,
     focus_recolor: Styles,
+    /// Windows' focus (WinUI's focus visual): a ring 2 wide, 1 outside
+    /// the control, and a contrasting one in that gap (its secondary, 1
+    /// wide), its corners the control's grown by 3.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    focus_outside: Styles,
+    /// GNOME's focus (libadwaita's `focus-ring`): an outline 2 wide inset
+    /// over the control's edge (offset −2), its corners the control's.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    focus_inset: Styles,
     menu_focus_recolor: Styles,
     menu_item: Styles,
     menu_hover: Styles,
@@ -4259,6 +4920,7 @@ struct WidgetStyles {
     progress: Styles,
     slider: Styles,
     editor: Styles,
+    editor_line: Styles,
 }
 impl WidgetStyles {
     fn new() -> Self {
@@ -4268,12 +4930,35 @@ impl WidgetStyles {
                 .border_color(tok::FOCUS_RING)
                 .border_over(true),
             focus_recolor: Styles::new().border_color(tok::FOCUS_RING),
+            focus_outside: Styles::new()
+                .outline_width(2.)
+                .outline_color(tok::FOCUS_RING)
+                .outline_offset(1.)
+                .outline_inner(1., tok::BACKGROUND),
+            focus_inset: Styles::new()
+                .outline_width(2.)
+                .outline_color(tok::FOCUS_RING)
+                .outline_offset(-2.),
             menu_focus_recolor: Styles::new()
                 .bg(tok::MENU_HOVER)
                 .border_color(tok::FOCUS_RING),
             // On the menu's panel: no fill of its own, so a translucent
             // panel (AppKit's material behind it) shows through.
-            menu_item: Styles::new().px(12.).py(8.).items_center(),
+            menu_item: {
+                let (x, y) = OVERLAY.menu_item_padding;
+                let item = Styles::new().px(x).py(y).items_center();
+                let item = match OVERLAY.menu_item_min_height {
+                    Some(height) => item.min_h(height),
+                    None => item,
+                };
+                // Inset and rounded only where the platform's are.
+                let ((x, y), radius) = (OVERLAY.menu_item_inset, OVERLAY.menu_item_radius);
+                if (x, y, radius) == (0., 0., 0.) {
+                    item
+                } else {
+                    item.mx(x).my(y).rounded(radius)
+                }
+            },
             menu_hover: Styles::new().bg(tok::MENU_HOVER),
             menu_focus: Styles::new()
                 .bg(tok::MENU_HOVER)
@@ -4306,6 +4991,17 @@ impl WidgetStyles {
                 .border(1.)
                 .border_color(tok::BORDER)
                 .border_over(true),
+            // A field one line high: a control's height, kept current (the
+            // theme's, and the system text size's: `Themes::set_system_text_scale`
+            // raises it to fit a line). Built once, a larger text would clip.
+            // Made here once, not added to `editor` at each mount.
+            editor_line: Styles::new()
+                .bg(tok::INPUT_BG)
+                .rounded(tok::RADIUS_MD)
+                .border(1.)
+                .border_color(tok::BORDER)
+                .border_over(true)
+                .h(tok::CONTROL_HEIGHT),
         }
     }
 }
@@ -4335,6 +5031,7 @@ fn paragraph_effect<const LOCATING: bool>(
     weak: crate::widgets::WeakUi,
     content_state: Signal<crate::compose_rich::Content>,
     locating: Option<std::rc::Rc<std::cell::RefCell<Vec<crate::compose_rich::Run>>>>,
+    mut fading: Fading,
 ) -> impl FnMut() + 'static {
     move || {
         let base = typography.get();
@@ -4353,11 +5050,28 @@ fn paragraph_effect<const LOCATING: bool>(
             }
             let link = span.action.is_some() || span.href.is_some();
             // Most spans have none of these: one test for all three.
-            let (hover, icon, menu, plain) = match span.extras.take() {
-                None => (None, None, None, false),
+            // With an icon, or room after the text other than before it, the
+            // room is kept apart from the text's run: `room_after` is then
+            // what follows the text. Negative (no room is), otherwise.
+            let (hover, icon, menu, plain, room_after) = match span.extras.take() {
+                None => (None, None, None, false, -1.),
                 Some(extras) => {
                     let extras = *extras;
-                    (extras.hover, extras.icon, extras.menu, extras.plain)
+                    let end = extras.padding_end.unwrap_or(span.padding[0]);
+                    let apart = extras.icon.is_some() || end != span.padding[0];
+                    // Its text's run comes next, after the room before it
+                    // when that's apart. Noted here, where only spans with
+                    // extras come, so a plain span pays nothing for fades.
+                    if let Some(fade) = extras.fade {
+                        fading.note(runs.len() + usize::from(apart), fade);
+                    }
+                    (
+                        extras.hover,
+                        extras.icon,
+                        extras.menu,
+                        extras.plain,
+                        if apart { end } else { -1. },
+                    )
                 }
             };
             let hover = hover.as_ref();
@@ -4378,8 +5092,9 @@ fn paragraph_effect<const LOCATING: bool>(
                 span.background = span.background.or(span.styles.background);
             }
             // An icon keeps its room before the text: a padded
-            // placeholder run of its own.
-            let icon_at = icon.is_some().then(|| {
+            // placeholder run of its own. So does the room before the text
+            // where it isn't the room after it (`padding_end`).
+            let icon_at = (room_after >= 0.).then(|| {
                 let at = content.len();
                 content.push_str(crate::compose_rich::ICON_PLACEHOLDER);
                 at..content.len()
@@ -4451,43 +5166,75 @@ fn paragraph_effect<const LOCATING: bool>(
             // With an icon, the span's padding goes around both: its
             // room takes the padding before, a placeholder after the
             // text the padding after.
-            let lead = if icon.is_some() { span.padding[0] } else { 0. };
-            if let (Some(range), Some(icon)) = (icon_at, icon) {
-                runs.push(crate::rich_text::TextRun {
+            match (icon, icon_at) {
+                // (No icon, the room before alone: a placeholder that wide.)
+                (None, Some(range)) => runs.push(crate::rich_text::TextRun {
                     background: span.background,
                     underline: None,
                     strikethrough: None,
-                    padding: [(lead + icon.size + icon.gap) / 2., span.padding[1]],
+                    padding: [span.padding[0] / 2., span.padding[1]],
                     radius: span.radius,
-                    range: range.clone(),
+                    range,
                     font: font.clone(),
                     font_size,
                     color,
-                });
-                icons.push(crate::compose_rich::InlineIcon {
-                    range,
-                    svg: match icon.tint {
-                        Some(crate::theme::Themed::Value(tint)) => {
-                            std::sync::Arc::new(icon.svg.tinted(tint))
-                        }
-                        Some(crate::theme::Themed::Token(token)) => std::sync::Arc::new(
-                            icon.svg.tinted(
-                                theme
-                                    .get(token)
-                                    .color()
-                                    .unwrap_or(crate::scene::Color(0, 0, 0, 0)),
+                }),
+                (Some(icon), Some(range)) => {
+                    let lead = span.padding[0];
+                    // (A well takes its room round the icon too.)
+                    let pad = if icon.bg.is_some() { icon.pad } else { 0. };
+                    runs.push(crate::rich_text::TextRun {
+                        background: span.background,
+                        underline: None,
+                        strikethrough: None,
+                        padding: [
+                            (lead + icon.size + 2. * pad + icon.gap) / 2.,
+                            span.padding[1],
+                        ],
+                        radius: span.radius,
+                        range: range.clone(),
+                        font: font.clone(),
+                        font_size,
+                        color,
+                    });
+                    icons.push(crate::compose_rich::InlineIcon {
+                        range,
+                        svg: match icon.tint {
+                            Some(crate::theme::Themed::Value(tint)) => {
+                                std::sync::Arc::new(icon.svg.tinted(tint))
+                            }
+                            Some(crate::theme::Themed::Token(token)) => std::sync::Arc::new(
+                                icon.svg.tinted(
+                                    theme
+                                        .get(token)
+                                        .color()
+                                        .unwrap_or(crate::scene::Color(0, 0, 0, 0)),
+                                ),
                             ),
-                        ),
-                        None if icon.svg.follows_text_color() => {
-                            std::sync::Arc::new(icon.svg.tinted(color))
-                        }
-                        None => icon.svg,
-                    },
-                    size: icon.size,
-                    inset: lead,
-                });
+                            None if icon.svg.follows_text_color() => {
+                                std::sync::Arc::new(icon.svg.tinted(color))
+                            }
+                            None => icon.svg,
+                        },
+                        size: icon.size,
+                        inset: lead,
+                        well: icon.bg.and_then(|bg| {
+                            let color = match bg {
+                                crate::theme::Themed::Value(color) => Some(color),
+                                crate::theme::Themed::Token(token) => theme.get(token).color(),
+                            }?;
+                            Some(crate::compose_rich::IconWell {
+                                color,
+                                radius: icon.radius,
+                                pad,
+                            })
+                        }),
+                    });
+                }
+                _ => {}
             }
             let text_end = content.len();
+            // (An icon alone has no text of its own: no run to copy or read.)
             if text_end > start {
                 runs.push(crate::rich_text::TextRun {
                     background: span.background,
@@ -4495,9 +5242,7 @@ fn paragraph_effect<const LOCATING: bool>(
                         let underline = span.underline.or(inherited);
                         match span.underline_color {
                             None => underline,
-                            Some(crate::theme::Themed::Value(tint)) => {
-                                underline.map(|d| d.color(tint))
-                            }
+                            Some(crate::theme::Themed::Value(tint)) => underline.map(|d| d.color(tint)),
                             Some(crate::theme::Themed::Token(token)) => underline.map(|d| {
                                 d.color(
                                     theme
@@ -4509,7 +5254,7 @@ fn paragraph_effect<const LOCATING: bool>(
                         }
                     },
                     strikethrough: span.strikethrough,
-                    padding: if lead > 0. {
+                    padding: if room_after >= 0. {
                         [0., span.padding[1]]
                     } else {
                         span.padding
@@ -4521,13 +5266,14 @@ fn paragraph_effect<const LOCATING: bool>(
                     color,
                 });
             }
-            if lead > 0. {
+            // The room after the text: a placeholder of its own.
+            if room_after > 0. {
                 content.push_str(crate::compose_rich::ICON_PLACEHOLDER);
                 runs.push(crate::rich_text::TextRun {
                     background: span.background,
                     underline: None,
                     strikethrough: None,
-                    padding: [lead / 2., span.padding[1]],
+                    padding: [room_after / 2., span.padding[1]],
                     radius: span.radius,
                     range: text_end..content.len(),
                     font,
@@ -4547,6 +5293,9 @@ fn paragraph_effect<const LOCATING: bool>(
         if content_state.with_untracked(|current| {
             *current.rich == rich && current.links == links && current.icons == icons
         }) {
+            if fading.state.is_some() {
+                fading.runs(&weak, root, paragraph);
+            }
             return;
         }
         let Some(ui) = weak.upgrade() else {
@@ -4565,6 +5314,11 @@ fn paragraph_effect<const LOCATING: bool>(
             let shown = scene.rich_with_languages(paragraph, rich.clone());
             scene.set_leaf_kind(paragraph, NodeKind::RichText { text: shown });
         }
+        // Runs fading in: drawn as they are now, then a frame at a time
+        // while they fade (`Fading`), all of it out of this effect.
+        if fading.state.is_some() {
+            fading.drawn(&weak, root, paragraph);
+        }
         // Icons' placeholders aren't text to read out.
         let content = if icons.is_empty() {
             content
@@ -4572,14 +5326,276 @@ fn paragraph_effect<const LOCATING: bool>(
             content.replace(crate::compose_rich::ICON_PLACEHOLDER, "")
         };
         content_state.set(crate::compose_rich::Content { rich, links, icons });
-        ui.semantics.borrow_mut().update(paragraph, |node| {
-            node.label = content.clone();
-            node.value = Some(content);
-        });
+        ui.semantics
+            .borrow_mut()
+            .set_text_content(paragraph, content);
         update_button_labels(&ui, root);
     }
 }
 
+/// A paragraph's runs fading in (`TextSpan::fade_in`): which, the paragraph as
+/// drawn without them, and the frame loop that recolours them. Each frame while
+/// they fade, the loop writes the paragraph again with its runs' colours as they
+/// are then: alike in shape, so nothing lays out and the renderer recolours
+/// glyphs. No script runs for it, and none of the paragraph's spans are made
+/// again. A paragraph no run of which has faded holds none of it, and starts
+/// nothing.
+pub(crate) struct Fading {
+    /// Where its frame loop's runner and frame clock are, if the host runs
+    /// one (a copy of a scope is two counts).
+    services: ServiceScope,
+    /// What a paragraph that has a run fading keeps for it, made as its
+    /// first fade is noted: a paragraph none of whose runs fades holds a
+    /// scope and an empty box, and asks one question as it's drawn.
+    state: Option<Box<FadingState>>,
+}
+#[derive(Default)]
+struct FadingState {
+    /// The runs fading in, by their place among the runs being made: noted
+    /// as the paragraph's spans are, taken as it's drawn.
+    pending: Vec<(usize, crate::compose_rich::TextFade)>,
+    active: Option<ActiveFades>,
+}
+struct ActiveFades {
+    runs: Rc<FadingRuns>,
+    /// Its frame loop, cancelled with the paragraph (`Ui::retain`).
+    task: Rc<RefCell<Option<TaskToken>>>,
+}
+#[derive(Default)]
+struct FadingRuns {
+    runs: RefCell<Vec<(usize, crate::compose_rich::TextFade)>>,
+    base: RefCell<Option<std::sync::Arc<crate::rich_text::RichText>>>,
+}
+impl FadingRuns {
+    /// `rich`, the paragraph drawn without `fades`, as it shows at `now`.
+    fn faded(
+        &self,
+        rich: &std::sync::Arc<crate::rich_text::RichText>,
+        fades: &[(usize, crate::compose_rich::TextFade)],
+        now: f64,
+    ) -> std::sync::Arc<crate::rich_text::RichText> {
+        if fades.is_empty() {
+            *self.base.borrow_mut() = None;
+            return rich.clone();
+        }
+        *self.base.borrow_mut() = Some(rich.clone());
+        std::sync::Arc::new(rich.recoloured(
+            |i, color| match fades.iter().find(|(at, _)| *at == i) {
+                Some((_, fade)) => {
+                    let alpha = (color.3 as f32 * fade.at(now)).round().clamp(0., 255.);
+                    crate::scene::Color(color.0, color.1, color.2, alpha as u8)
+                }
+                None => color,
+            },
+        ))
+    }
+}
+impl Fading {
+    fn new(services: ServiceScope) -> Self {
+        Self {
+            services,
+            state: None,
+        }
+    }
+    /// Run `at` of those being made fades in.
+    #[cold]
+    #[inline(never)]
+    fn note(&mut self, at: usize, fade: crate::compose_rich::TextFade) {
+        self.state.get_or_insert_default().pending.push((at, fade));
+    }
+    /// The runs fading now, of a paragraph unchanged: those done let go.
+    #[cold]
+    #[inline(never)]
+    fn runs(&mut self, weak: &crate::widgets::WeakUi, root: NodeId, paragraph: NodeId) {
+        let mut fades = self.take_pending();
+        let now = crate::compose_rich::fade_now();
+        fades.retain(|(_, fade)| fade.fading(now));
+        self.set_runs(fades, weak, root, paragraph);
+    }
+    /// The paragraph just drawn as it is, with `fades` among its runs: drawn
+    /// again as they show now, kept as the frame loop's base, and the loop
+    /// started. With none fading, what was kept for them is let go.
+    #[cold]
+    #[inline(never)]
+    fn drawn(&mut self, weak: &crate::widgets::WeakUi, root: NodeId, paragraph: NodeId) {
+        let mut fades = self.take_pending();
+        let now = crate::compose_rich::fade_now();
+        fades.retain(|(_, fade)| fade.fading(now));
+        let Some(mut ui) = weak.upgrade() else {
+            return;
+        };
+        if !fades.is_empty() {
+            self.begin(&mut ui, root);
+        }
+        if let Some(active) = self.active() {
+            let mut scene = ui.scene.borrow_mut();
+            let shown = match scene.kind(paragraph) {
+                NodeKind::RichText { text } => text.clone(),
+                _ => return,
+            };
+            let faded = active.runs.faded(&shown, &fades, now);
+            if !std::sync::Arc::ptr_eq(&faded, &shown) {
+                scene.set_leaf_kind(paragraph, NodeKind::RichText { text: faded });
+            }
+        }
+        drop(ui);
+        self.set_runs(fades, weak, root, paragraph);
+    }
+    /// The fades noted since it was last drawn; a paragraph with none
+    /// noted and none running lets go of what it kept for them.
+    fn take_pending(&mut self) -> Vec<(usize, crate::compose_rich::TextFade)> {
+        let Some(state) = self.state.as_mut() else {
+            return Vec::new();
+        };
+        let fades = std::mem::take(&mut state.pending);
+        if fades.is_empty() && state.active.is_none() {
+            self.state = None;
+        }
+        fades
+    }
+    fn active(&self) -> Option<&ActiveFades> {
+        self.state.as_ref()?.active.as_ref()
+    }
+    /// A run fades: what it takes, once, kept as long as `root` is.
+    fn begin(&mut self, ui: &mut Ui, root: NodeId) {
+        let state = self.state.get_or_insert_default();
+        if state.active.is_none() {
+            let task: Rc<RefCell<Option<TaskToken>>> = Default::default();
+            ui.retain(root, task.clone());
+            state.active = Some(ActiveFades {
+                runs: Default::default(),
+                task,
+            });
+        }
+    }
+    fn set_runs(
+        &mut self,
+        fades: Vec<(usize, crate::compose_rich::TextFade)>,
+        weak: &crate::widgets::WeakUi,
+        root: NodeId,
+        paragraph: NodeId,
+    ) {
+        let Some(mut ui) = weak.upgrade() else {
+            return;
+        };
+        let any = !fades.is_empty();
+        if any {
+            self.begin(&mut ui, root);
+        }
+        let Some(active) = self.active() else {
+            return;
+        };
+        *active.runs.runs.borrow_mut() = fades;
+        if any && !active.task.borrow().as_ref().is_some_and(|t| !t.finished()) {
+            let token = ui.runtime.clone().untracked(|| {
+                spawn_fades(&self.services, active.runs.clone(), weak.clone(), paragraph)
+            });
+            *active.task.borrow_mut() = token;
+        }
+    }
+}
+
+/// The frame loop of a paragraph's fading runs (`Fading`): a frame at a time
+/// until none fades, then drawn as they end. Without a task runner or a frame
+/// clock (a host that draws no frames), fades show as they were when last built.
+fn spawn_fades(
+    services: &ServiceScope,
+    fading: Rc<FadingRuns>,
+    weak: crate::widgets::WeakUi,
+    paragraph: NodeId,
+) -> Option<TaskToken> {
+    let runner = services.get::<TaskRunner>()?;
+    let frames = (*services.get::<crate::frame::FrameClock>()?).clone();
+    Some(runner.spawn(Box::pin(async move {
+        loop {
+            frames.next().await;
+            let now = crate::compose_rich::fade_now();
+            let fades = fading.runs.borrow().clone();
+            let Some(base) = fading.base.borrow().clone() else {
+                return;
+            };
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let mut scene = ui.scene.borrow_mut();
+            if !scene.contains(paragraph) {
+                return;
+            }
+            let shown = fading.faded(&base, &fades, now);
+            scene.set_leaf_kind(paragraph, NodeKind::RichText { text: shown });
+            drop(scene);
+            let left: Vec<_> = fades.into_iter().filter(|(_, f)| f.fading(now)).collect();
+            let done = left.is_empty();
+            *fading.runs.borrow_mut() = left;
+            if done {
+                return;
+            }
+        }
+    })))
+}
+
+#[cfg(test)]
+mod fading_tests {
+    use super::*;
+
+    /// Without a run fading a paragraph holds nothing for it, draws the text it
+    /// was given, and reads no clock: fades cost what has them.
+    #[test]
+    fn a_paragraph_with_no_fade_holds_nothing_for_one() {
+        let ui = Ui::new(100., 100.);
+        let weak = ui.downgrade();
+        let root = ui.scene.borrow().root();
+        let mut fading = Fading::new(ServiceScope::new());
+        let rich = empty_rich_text();
+        fading.set_runs(Vec::new(), &weak, root, root);
+        assert!(fading.state.is_none());
+        // A run fading: held from then, with no frame loop where no host runs one.
+        let fade = crate::compose_rich::TextFade {
+            start: 0.,
+            ms: 100.,
+            power: 2.,
+        };
+        fading.set_runs(vec![(0, fade)], &weak, root, root);
+        let active = fading.active().expect("it fades");
+        assert_eq!(active.runs.runs.borrow().len(), 1);
+        assert!(active.task.borrow().is_none());
+        // With a host, one frame loop, however often the runs change; none
+        // for a paragraph without fades.
+        let spawned = Rc::new(std::cell::Cell::new(0));
+        let mut services = ServiceScope::new();
+        let counted = spawned.clone();
+        services.provide(TaskRunner::new(move |_future| {
+            counted.set(counted.get() + 1);
+            TaskToken::new((), |_| false)
+        }));
+        services.provide(crate::frame::FrameClock::new());
+        let mut hosted = Fading::new(services);
+        hosted.set_runs(Vec::new(), &weak, root, root);
+        assert_eq!(spawned.get(), 0);
+        hosted.set_runs(vec![(0, fade)], &weak, root, root);
+        hosted.set_runs(vec![(0, fade), (1, fade)], &weak, root, root);
+        assert_eq!(spawned.get(), 1);
+        // Done: nothing left of it to run or keep.
+        fading.set_runs(Vec::new(), &weak, root, root);
+        let active = fading.active().expect("kept");
+        assert!(active.runs.runs.borrow().is_empty());
+        assert!(std::sync::Arc::ptr_eq(
+            &active.runs.faded(&rich, &[], 0.),
+            &rich
+        ));
+        assert!(active.runs.base.borrow().is_none());
+    }
+}
+
+/// A paragraph's content before its first runs (`mount_rich`): one made
+/// a thread, not one a paragraph mounted.
+fn empty_rich_text() -> std::sync::Arc<crate::rich_text::RichText> {
+    thread_local! {
+        static EMPTY: std::sync::Arc<crate::rich_text::RichText> =
+            std::sync::Arc::new(crate::rich_text::RichText::new("", Vec::new()).unwrap());
+    }
+    EMPTY.with(std::sync::Arc::clone)
+}
 /// A paragraph of spans' content (`rich_text`): its runs, built again as
 /// they change, and its links' and icons' boxes. Out of line: few views
 /// are paragraphs, and `mount_element` stays as small as they need.
@@ -4598,7 +5614,7 @@ fn mount_rich(
         let locator = crate::compose_rich::SpanLocator {
             paragraph,
             content: ui.signal(crate::compose_rich::Content {
-                rich: std::sync::Arc::new(crate::rich_text::RichText::new("", Vec::new()).unwrap()),
+                rich: empty_rich_text(),
                 links: Vec::new(),
                 icons: Vec::new(),
             }),
@@ -4612,7 +5628,7 @@ fn mount_rich(
         Some(locator) => (locator.content.clone(), Some(locator.boxes.clone())),
         None => (
             ui.signal(crate::compose_rich::Content {
-                rich: std::sync::Arc::new(crate::rich_text::RichText::new("", Vec::new()).unwrap()),
+                rich: empty_rich_text(),
                 links: Vec::new(),
                 icons: Vec::new(),
             }),
@@ -4634,6 +5650,7 @@ fn mount_rich(
     let weak = ui.downgrade();
     let typography = environment.typography.clone();
     let theme = environment.theme.clone();
+    let fading = Fading::new(environment.services.clone());
     match locating {
         Some(kept) => ui.bind(
             root,
@@ -4647,6 +5664,7 @@ fn mount_rich(
                 weak,
                 content_state,
                 Some(kept),
+                fading,
             ),
         ),
         None => ui.bind(
@@ -4661,6 +5679,7 @@ fn mount_rich(
                 weak,
                 content_state,
                 None,
+                fading,
             ),
         ),
     }
@@ -4737,6 +5756,9 @@ fn mount_element(
     );
     let scrollbar = rare.as_ref().and_then(|r| r.scrollbar).unwrap_or(false);
     let follow_end = rare.as_ref().and_then(|r| r.follow_end).unwrap_or(false);
+    if scrollbar {
+        hold_scrollbar_style(ui, &mut rare);
+    }
     let mut opened = open_element(
         ui,
         parent,
@@ -4748,11 +5770,36 @@ fn mount_element(
         scrollbar,
         follow_end,
     );
+    if scrollbar {
+        keep_scrollbar_style(ui, opened.root);
+    }
     ui.open_element(opened.root);
     for child in std::mem::take(&mut opened.children) {
         mount(ui, opened.child_parent, child, opened.environment.clone());
     }
     close_element(ui, opened)
+}
+/// A scroll view's or a list's own scrollbar style, taken before its
+/// element opens (a list's edges go to its region there) and held for the
+/// node its bar mounts on (`keep_scrollbar_style`). Apart: every other
+/// element's mount reads nothing of it, nor allocates for it.
+#[cold]
+#[inline(never)]
+fn hold_scrollbar_style(ui: &Ui, rare: &mut Option<Box<Rare>>) {
+    let style = rare
+        .as_mut()
+        .and_then(|rare| rare.edges.as_mut())
+        .and_then(|edges| edges.scrollbar_style.take());
+    ui.hold_scrollbar_style(style);
+}
+/// The style held for the element just opened, kept by `root` for its bar
+/// to take as it mounts (`compose_scrollbar::mount`).
+#[cold]
+#[inline(never)]
+fn keep_scrollbar_style(ui: &Ui, root: NodeId) {
+    if let Some(style) = ui.held_scrollbar_style() {
+        ui.keep_scrollbar_style(root, style);
+    }
 }
 /// An element mounted up to its children: what the rest of its mounting
 /// needs once they are in (`mount_element`).
@@ -4770,7 +5817,7 @@ struct Opened {
     root: NodeId,
     child_parent: NodeId,
     submenu_indicator: bool,
-    scroll_offset: Option<(Signal<f32>, bool, bool)>,
+    scroll_offset: Option<ScrollOpen>,
     scroll_nodes: Option<(NodeId, NodeId)>,
     scrollbar: bool,
     follow_end: bool,
@@ -4798,6 +5845,8 @@ fn open_element(
     scrollbar: bool,
     follow_end: bool,
 ) -> Opened {
+    // A text holds no views (above): no one reads what it passes on.
+    let leaf = matches!(kind, Kind::Text(_) | Kind::BoundText(_));
     let is_scroll = matches!(kind, Kind::Scroll { .. });
     let mut scroll_offset = None;
     let is_image = matches!(kind, Kind::Image { .. });
@@ -4985,6 +6034,13 @@ fn open_element(
             // (an icon, the label, a shortcut): the label stays its
             // accessible name and what typing finds it by.
             let mut defaults = widget_style(|w| &w.menu_item);
+            // A height the app gives the item is its height: the platform's
+            // least (GNOME's 32) is for items sized by their content.
+            if OVERLAY.menu_item_min_height.is_some()
+                && (view.styles.height.is_some() || view.styles.height_percent.is_some())
+            {
+                defaults = defaults.min_h(0.);
+            }
             defaults.merge(&view.styles);
             view.styles = defaults;
             if view.variants.hover.is_none() {
@@ -5034,7 +6090,7 @@ fn open_element(
                 if let Some(keys) = shortcut {
                     view.children.push(
                         text(keys)
-                            .ml(24.)
+                            .ml(OVERLAY.shortcut_gap)
                             .text_color(tok::TEXT_TERTIARY)
                             .accessible_hidden(),
                     );
@@ -5147,7 +6203,10 @@ fn open_element(
             multiline,
         } => {
             dim_when_disabled(&mut view);
-            let mut defaults = widget_style(|w| &w.editor);
+            let mut defaults = widget_style(|w| match multiline {
+                true => &w.editor,
+                false => &w.editor_line,
+            });
             // The default outline is drawn over; a border the app gives
             // takes room, as CSS's does, unless it says otherwise.
             let own_border =
@@ -5180,7 +6239,14 @@ fn open_element(
             });
             ui.semantics.borrow_mut().set(root, semantics);
             let contain = rare.as_deref().is_some_and(|r| r.overscroll_contain);
-            scroll_offset = Some((offset, horizontal, contain));
+            let across = rare.as_deref().is_some_and(|r| r.wheel_across);
+            scroll_offset = Some(ScrollOpen {
+                offset,
+                horizontal,
+                contain,
+                across,
+                paging: rare.as_deref().is_some_and(|r| r.paging),
+            });
             root
         }
         Kind::VirtualList(build) => {
@@ -5233,7 +6299,10 @@ fn open_element(
         }
         _ => unreachable!(),
     };
-    if view.contents {
+    if view.contents != Contents::Own
+        && (view.contents == Contents::Child
+            || (view.styles.set_bits() == 0 && view.reactive_style.is_none()))
+    {
         ui.scene.borrow_mut().set_contents(root, true);
     }
     if let Some(active) = rare.as_deref_mut().and_then(|r| r.active_descendant.take()) {
@@ -5377,8 +6446,10 @@ fn open_element(
                 {
                     // Where menus are windows of their own (AppKit's), the
                     // chosen item flashes, then the menu closes, then its
-                    // action runs, as AppKit sends it.
+                    // action runs, as AppKit sends it. Windows' and GNOME's
+                    // menus close at once, as WinUI's and GTK's do.
                     if let (Some(runner), Some(ui)) = (&runner, weak_ui.upgrade())
+                        && !cfg!(any(windows, target_os = "linux"))
                         && ui.popup_screens().with_untracked(|s| !s.is_empty())
                     {
                         let (click, modifiers) = (menu_click.clone(), cx.pointer_modifiers());
@@ -5423,6 +6494,7 @@ fn open_element(
         layout_target,
         image_fit.clone(),
         Some(environment.theme.clone()),
+        leaf,
     );
     if let Some(compute) = rich_compute {
         mount_rich(
@@ -5693,7 +6765,7 @@ fn open_element(
             },
         );
     }
-    let scroll_nodes = scroll_offset.as_ref().map(|(_, horizontal, _)| {
+    let scroll_nodes = scroll_offset.as_ref().map(|ScrollOpen { horizontal, .. }| {
         let viewport = ui.container(root, Layout::Overlay, Default::default());
         let content = ui.container(
             viewport,
@@ -5814,12 +6886,8 @@ fn close_element(ui: &mut Ui, opened: Opened) -> NodeId {
         let indicator = mount(ui, root, text("›"), environment.clone());
         ui.semantics.borrow_mut().remove(indicator);
     }
-    if let (Some((offset, horizontal, contain)), Some((viewport, content))) =
-        (scroll_offset, scroll_nodes)
-    {
-        mount_scroll(
-            ui, root, viewport, content, offset, horizontal, scrollbar, follow_end, contain,
-        );
+    if let (Some(scroll), Some((viewport, content))) = (scroll_offset, scroll_nodes) {
+        mount_scroll(ui, root, viewport, content, scroll, scrollbar, follow_end);
     }
     if let Some(mut compute) = compute {
         let weak = ui.downgrade();
@@ -5918,8 +6986,11 @@ const SMART_PUNCTUATION: u8 = 8;
 /// `Rare::mount_flags`: its descendants' container queries read it
 /// (`View::container`).
 const CONTAINER: u8 = 16;
-/// `View::window_drag`, `View::hollow`, `View::container`, and an editor's
-/// `autocorrect` and `smart_punctuation`, rare: apart from the element's
+/// `Rare::mount_flags`: a press on it leaves focus where it is
+/// (`View::focus_on_press`).
+const KEEPS_FOCUS: u8 = 32;
+/// `View::window_drag`, `View::hollow`, `View::focus_on_press`,
+/// `View::container`, and an editor's `autocorrect` and `smart_punctuation`, rare: apart from the element's
 /// common path.
 #[cold]
 #[inline(never)]
@@ -5959,6 +7030,11 @@ fn mount_flagged(
         ui.input
             .set_options(root, ui.input.options(root).unwrap_or_default());
         ui.input.set_hollow(root);
+    }
+    if flags & KEEPS_FOCUS != 0 {
+        ui.input
+            .set_options(root, ui.input.options(root).unwrap_or_default());
+        ui.input.set_keeps_focus(root);
     }
 }
 /// `View::window_drag`: a primary press on `region`, or on a descendant
@@ -6284,20 +7360,35 @@ pub(crate) fn reveal_in_list(
         ui.prepare_frame();
     }
 }
+/// A scroll view's own say, from its opening to `mount_scroll`.
+struct ScrollOpen {
+    offset: Signal<f32>,
+    horizontal: bool,
+    /// `View::overscroll_contain`: a wheel at its edge stays here.
+    contain: bool,
+    /// `View::wheel_across`: a mouse wheel moves it sideways.
+    across: bool,
+    /// `View::paging`.
+    paging: bool,
+}
 #[allow(clippy::too_many_arguments)]
 fn mount_scroll(
     ui: &mut Ui,
     root: NodeId,
     viewport: NodeId,
     content: NodeId,
-    offset: Signal<f32>,
-    horizontal: bool,
+    scroll: ScrollOpen,
     scrollbar: bool,
     follow_end: bool,
-    // `View::overscroll_contain`: a wheel at its edge stays here.
-    contain: bool,
 ) {
     use crate::scene::{Style, Transform};
+    let ScrollOpen {
+        offset,
+        horizontal,
+        contain,
+        across,
+        paging,
+    } = scroll;
     let main_size = move |size: (f32, f32)| if horizontal { size.0 } else { size.1 };
     // The offset counts from the start: right to left, a horizontal
     // view's start is its right, and moving on reveals what is left of it.
@@ -6326,6 +7417,18 @@ fn mount_scroll(
         extent.clone(),
         offset.clone(),
     );
+    // `View::paging`: its record, which what scrolls it goes through.
+    let paged = paging.then(|| {
+        let paged =
+            crate::paging::register(ui, horizontal, size.clone(), extent.clone(), offset.clone());
+        let (watching, weak) = (paged.clone(), ui.downgrade());
+        ui.bind(root, move || {
+            if let Some(ui) = weak.upgrade() {
+                crate::paging::observe(&ui, &watching);
+            }
+        });
+        paged
+    });
     if scrollbar {
         let main_extent = ui.signal(main_size(extent.get()));
         let read_extent = extent.clone();
@@ -6346,9 +7449,19 @@ fn mount_scroll(
     let wheel_extent = extent.clone();
     let wheel_offset = offset.clone();
     let weak = ui.downgrade();
+    // `across`: the pointer was moved onto it, rather than it sliding under
+    // the pointer (which moves hover, but no pointer).
+    let pointed = std::cell::Cell::new(false);
     ui.on_event(root, false, move |cx| {
         if cx.phase == EventPhase::Capture {
             return;
+        }
+        if across {
+            match cx.event {
+                InputEvent::PointerMove { .. } => pointed.set(true),
+                InputEvent::PointerLeave => pointed.set(false),
+                _ => {}
+            }
         }
         if matches!(cx.event, InputEvent::Focus) && cx.target != root {
             let Some(ui) = weak.upgrade() else {
@@ -6403,8 +7516,25 @@ fn mount_scroll(
                 }
                 _ => (delta_x, delta_y),
             };
-            let delta = if horizontal { delta_x } else { delta_y };
+            // A mouse wheel going sideways; Shift's holds at the edges too.
+            let shift = crate::input::mouse_wheel_shift();
+            let wheeled = across
+                && delta_x == 0.
+                && delta_y != 0.
+                && shift.is_some_and(|shift| shift || pointed.get());
+            let delta = if wheeled {
+                delta_y
+            } else if horizontal {
+                delta_x
+            } else {
+                delta_y
+            };
             if !delta.is_finite() {
+                return;
+            }
+            // Mostly the other way, this swipe isn't this view's: it stays
+            // still, and the swipe goes to the views around it.
+            if across && !wheeled && delta_y.abs() > delta_x.abs() {
                 return;
             }
             // A wheel's horizontal delta is physical: to the right is back
@@ -6413,11 +7543,31 @@ fn mount_scroll(
                 Some(ui) if rtl_of(&ui.scene.borrow()) => -delta,
                 _ => delta,
             };
+            if let Some(paged) = &paged
+                && let Some(ui) = weak.upgrade()
+                && paged.scrolled(&ui, delta)
+            {
+                cx.prevent_default();
+                cx.scrolled(horizontal);
+                return;
+            }
             let before = wheel_offset.get();
             let limit =
                 (main_size(wheel_extent.get()) as f64 - main_size(wheel_size.get()) as f64).max(0.);
             let after = (before as f64 + delta as f64).clamp(0., limit) as f32;
-            if before != after {
+            if wheeled {
+                // The wheel's one axis is this view's now: nothing goes on,
+                // unless it's at its edge (and without Shift, says the wheel).
+                if before != after {
+                    wheel_offset.set(after);
+                }
+                if before != after || shift == Some(true) {
+                    cx.prevent_default();
+                    cx.stop_propagation();
+                } else if contain {
+                    cx.scrolled(horizontal);
+                }
+            } else if before != after {
                 wheel_offset.set(after);
                 cx.scrolled(horizontal);
             } else if contain && delta != 0. {
@@ -6872,11 +8022,12 @@ fn mount_progress(
             if sweeping.borrow().is_none()
                 && let Some(runner) = &runner
             {
-                let (phase, start) = (phase.clone(), std::time::Instant::now());
+                let (phase, start) = (phase.clone(), crate::clock::now());
                 *sweeping.borrow_mut() = Some(runner.spawn(Box::pin(async move {
                     loop {
                         crate::timer::sleep(std::time::Duration::from_millis(16)).await;
-                        let t = (start.elapsed().as_secs_f32() / SWEEP.as_secs_f32()).fract();
+                        let t = (crate::clock::since(start).as_secs_f32() / SWEEP.as_secs_f32())
+                            .fract();
                         phase.set(t);
                     }
                 })));
@@ -7205,13 +8356,69 @@ pub(crate) struct Accessibility {
     numeric: Option<(f64, f64, NumericValue)>,
     live: Option<Live>,
     description: Option<String>,
+    /// `View::description_when`: a hint worked out from state.
+    description_when: Option<Box<dyn FnMut() -> String>>,
     error: Option<Box<dyn FnMut() -> Option<String>>>,
     hidden: bool,
+    /// `View::accessible_modal`: while it shows, nothing else is read.
+    modal: bool,
     focus_group: Option<crate::input::FocusGroup>,
     label: Option<Box<dyn FnMut() -> String>>,
     /// `View::adjustable`: what moves a custom slider (boxed: few views
     /// have one).
     adjust: Option<Box<Adjust>>,
+}
+impl Accessibility {
+    /// `Rare::merge_into`'s part for assistive technology: what the outer
+    /// view set, over the inner's.
+    fn merge_into(self, inner: &mut Accessibility) {
+        let outer = self;
+        if outer.role.is_some() {
+            inner.role = outer.role;
+        }
+        if outer.level.is_some() {
+            inner.level = outer.level;
+        }
+        if outer.selected.is_some() {
+            inner.selected = outer.selected;
+        }
+        if outer.checked.is_some() {
+            inner.checked = outer.checked;
+        }
+        inner.radio_item |= outer.radio_item;
+        if outer.expanded.is_some() {
+            inner.expanded = outer.expanded;
+        }
+        if outer.value.is_some() {
+            inner.value = outer.value;
+        }
+        if outer.numeric.is_some() {
+            inner.numeric = outer.numeric;
+        }
+        if outer.live.is_some() {
+            inner.live = outer.live;
+        }
+        if outer.description.is_some() {
+            inner.description = outer.description;
+        }
+        if outer.description_when.is_some() {
+            inner.description_when = outer.description_when;
+        }
+        if outer.error.is_some() {
+            inner.error = outer.error;
+        }
+        inner.hidden |= outer.hidden;
+        inner.modal |= outer.modal;
+        if outer.focus_group.is_some() {
+            inner.focus_group = outer.focus_group;
+        }
+        if outer.label.is_some() {
+            inner.label = outer.label;
+        }
+        if outer.adjust.is_some() {
+            inner.adjust = outer.adjust;
+        }
+    }
 }
 /// What moves a custom slider or spin button (`View::adjustable`): its
 /// step, whether the keys do as well as assistive technology, and what
@@ -7255,8 +8462,10 @@ fn apply_accessibility(ui: &mut Ui, root: NodeId, accessibility: Accessibility, 
         numeric,
         live,
         description,
+        description_when,
         error,
         hidden,
+        modal,
         focus_group,
         label,
         adjust,
@@ -7312,6 +8521,7 @@ fn apply_accessibility(ui: &mut Ui, root: NodeId, accessibility: Accessibility, 
             node.live = live.or(node.live);
             node.description = description.or(node.description.take());
             node.hidden |= hidden;
+            node.modal |= modal;
         });
     }
     // A name or value worked out from state is read by assistive technology
@@ -7328,6 +8538,19 @@ fn apply_accessibility(ui: &mut Ui, root: NodeId, accessibility: Accessibility, 
             }
             let label = label();
             tree.borrow_mut().update(root, |node| node.label = label);
+        });
+    }
+    if let Some(mut description) = description_when {
+        let tree = ui.semantics.clone();
+        let assistive = assistive.clone();
+        ui.bind(root, move || {
+            if !assistive.get() {
+                return;
+            }
+            let text = description();
+            tree.borrow_mut().update(root, |node| {
+                node.description = (!text.is_empty()).then_some(text)
+            });
         });
     }
     if let Some(mut checked) = checked {
@@ -7426,12 +8649,24 @@ fn update_button_labels(ui: &Ui, node: NodeId) {
         #[cfg(test)]
         LABEL_STEPS.with(|steps| steps.set(steps.get() + 1));
         if named_by_content(&semantics, id) {
-            drop(semantics);
-            name_content(ui, &scene, id);
-            semantics = ui.semantics.borrow();
+            semantics = name_ancestor(ui, &scene, id, semantics);
         }
         current = scene.parent(id);
     }
+}
+/// `update_button_labels`'s rare step, out of its loop: lets go of the
+/// semantics to name `id` from its content, and borrows them again.
+#[cold]
+#[inline(never)]
+fn name_ancestor<'a>(
+    ui: &'a Ui,
+    scene: &crate::scene::Scene,
+    id: NodeId,
+    semantics: std::cell::Ref<'a, crate::semantics::Semantics>,
+) -> std::cell::Ref<'a, crate::semantics::Semantics> {
+    drop(semantics);
+    name_content(ui, scene, id);
+    ui.semantics.borrow()
 }
 /// Text node `id`'s label from its text, and the buttons it names, as its
 /// text binding sets them: deferred while no assistive technology reads
@@ -7509,6 +8744,34 @@ impl NodeHandle {
     /// The mounted node.
     pub fn node(&self) -> NodeId {
         self.node
+    }
+    /// Whether `other` lies inside this node (a descendant, not the node
+    /// itself), in the same window; `false` once either or the UI is gone.
+    pub fn holds(&self, other: &NodeHandle) -> bool {
+        // (Another window's node: ids say nothing across scenes.)
+        if !self.ui.same(&other.ui) {
+            return false;
+        }
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        let scene = ui.scene.borrow();
+        let other = other.node;
+        other != self.node
+            && scene.contains(other)
+            && scene.contains(self.node)
+            && scene.ancestors(other).any(|id| id == self.node)
+    }
+    /// Listen for input at the node as long as it is mounted, ahead of what
+    /// listens already: `View::on_event`, for a listener that comes later.
+    /// A node takes the pointer once it listens. `false` once the UI is gone.
+    pub fn on_event(&self, callback: impl FnMut(&mut EventContext) + 'static) -> bool {
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        let binding = ui.input.listen_first(self.node, callback);
+        self.retain(binding);
+        true
     }
     /// Where the node shows in the window, in points, through whatever
     /// transforms and zooms it lies under; `None` once it or its UI is gone.
@@ -7607,6 +8870,12 @@ impl NodeHandle {
             .contains(self.node)
             .then(|| ui.observe_size(self.node))
     }
+    /// A number that changes when text's geometry may have: the window's
+    /// scale factor (`Scene::pixel_scale`) or the font backend changed. For
+    /// what measures text by device pixels, to measure again.
+    pub fn observe_text_geometry(&self) -> Option<Signal<u64>> {
+        Some(self.ui.upgrade()?.observe_text_geometry_revision())
+    }
     /// Whether any of the node shows (inside every clip and viewport above
     /// it), republished after each frame's layout: for building what only
     /// matters on screen.
@@ -7616,6 +8885,24 @@ impl NodeHandle {
             .borrow()
             .contains(self.node)
             .then(|| ui.observe_visibility(self.node))
+    }
+    /// As [`NodeHandle::observe_visibility`], but true once any of the node
+    /// comes within `margin` points of showing (its box grown by `margin` on
+    /// every side, inside the same clips and viewports: an
+    /// IntersectionObserver's `rootMargin`): for building what is about to
+    /// scroll into view before it does. A node observed both ways takes the
+    /// margin.
+    pub fn observe_visibility_within(&self, margin: f32) -> Option<Signal<bool>> {
+        let ui = self.ui.upgrade()?;
+        ui.scene
+            .borrow()
+            .contains(self.node)
+            .then(|| ui.observe_visibility_within(self.node, margin))
+    }
+    /// Whether its window shows (not hidden, minimized or covered), as it
+    /// changes (`Ui::observe_shown`).
+    pub fn observe_shown(&self) -> Option<Signal<bool>> {
+        self.ui.upgrade().map(|ui| ui.observe_shown())
     }
     /// Sweep the node's mask (`Styled::mask`) from where its style puts it
     /// by `by`, over and over every `period`, at `max_rate` steps a second
@@ -7807,6 +9094,28 @@ impl NodeHandle {
             ui.input.focus(&ui.scene, None);
         }
     }
+    /// Lock the pointer to the node (`InputDispatcher::lock_pointer`): only
+    /// just after a press, a release or a key. Whether it holds it now.
+    pub fn lock_pointer(&self) -> bool {
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        ui.input.lock_pointer(&ui.scene, self.node)
+    }
+    /// Let the pointer go, if the node holds its lock.
+    pub fn unlock_pointer(&self) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        if ui.input.pointer_lock(&ui.scene.borrow()) == Some(self.node) {
+            ui.input.unlock_pointer(&ui.scene);
+        }
+    }
+    /// Where the pointer last was over the window (where it stays while it
+    /// is locked), in the window's points; None outside it.
+    pub fn pointer(&self) -> Option<(f32, f32)> {
+        self.ui.upgrade()?.input.pointer()
+    }
 }
 /// Reference to a Ui-owned component tree. Drop does not unmount; call `unmount`.
 #[derive(Clone)]
@@ -7956,8 +9265,9 @@ pub mod prelude {
         Context, Slot, VariableHeights, View, button, checkbox, column, component, div, image,
         image_signal, keyed, measured_rows, measured_virtual_list, menu, menu_item, modal, overlay,
         popover, progress, provide, provide_with, radio, radio_group, row, scroll, scroll_x,
-        scrollbar, slider, submenu, switch, text, text_area, text_area_value, text_input,
-        text_input_value, text_message, text_signal, variable_virtual_list, virtual_list,
+        scrollbar, slider, submenu, switch, switch_or_none, text, text_area, text_area_value,
+        text_input, text_input_value, text_message, text_signal, variable_virtual_list,
+        virtual_list,
     };
     pub use super::{RichTextView, TextSpan, rich_text, rich_text_signal, text_span};
     pub use super::{SplitOptions, split};
@@ -8015,7 +9325,7 @@ mod environment_tests {
     fn an_environment_stays_small() {
         // Cloned for every component and region mounted: growing it costs
         // every mount (a flag beside its portal took 8 bytes).
-        assert_eq!(std::mem::size_of::<super::Environment>(), 112);
+        assert_eq!(std::mem::size_of::<super::Environment>(), 72);
     }
 }
 #[cfg(test)]

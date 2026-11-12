@@ -338,9 +338,10 @@ fn encode(_: &Lua, (value, options): (mlua::Value, Option<Table>)) -> mlua::Resu
 /// `ui.json.decode(text)`: the data JSON `text` holds, as tables the script
 /// may change; an error says where JSON that isn't fails.
 fn decode(lua: &Lua, text: mlua::LuaString) -> mlua::Result<mlua::Value> {
-    let parsed = serde_json::from_slice::<serde_json::Value>(&text.as_bytes())
-        .map_err(|e| mlua::Error::runtime(format!("ui.json.decode: {e}")))?;
-    crate::value::to_lua(&crate::node::from_json(parsed), lua, false)
+    crate::json::decode_to_lua(lua, &text.as_bytes()).map_err(|error| match error {
+        crate::json::DecodeError::Json(e) => mlua::Error::runtime(format!("ui.json.decode: {e}")),
+        crate::json::DecodeError::Lua(e) => e,
+    })
 }
 
 pub(crate) fn install(lua: &Lua, ui: &Table) -> mlua::Result<()> {

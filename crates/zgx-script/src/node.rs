@@ -42,7 +42,8 @@ pub(crate) struct Node {
     /// A container's `label`: the name assistive technology reads for it
     /// (a switch, an icon button). Widgets read their own `label`.
     pub label: Option<Rc<str>>,
-    /// `role`, `heading`, `selected`, `live`, `description`, `aria_hidden`:
+    /// `role`, `heading`, `selected`, `live`, `description`, `aria_hidden`,
+    /// `aria_modal`:
     /// what assistive technology hears beyond the name, boxed (most nodes
     /// say none of it).
     pub a11y: Option<Box<A11y>>,
@@ -67,8 +68,9 @@ pub(crate) struct Node {
     /// `bg_shader`, `shader_params`, `layer_shader` and `layer_params`
     /// (boxed: few nodes have any).
     pub shaders: Option<Box<Shaders>>,
-    /// `window_drag = true`: a press on it moves the window.
-    pub window_drag: bool,
+    /// `window_drag = true` (`WINDOW_DRAG`) and `focus_on_press = false`
+    /// (`KEEPS_FOCUS`): rare, tested together where the node is styled.
+    pub press_flags: u8,
     /// `hook = false` or `private = true`: no plugin may target it
     /// (`ui.contribute { target }`), whatever matches it.
     pub private: bool,
@@ -416,11 +418,11 @@ impl UserData for WebUd {
 }
 /// JSON as script data (objects as maps, arrays as lists).
 pub(crate) fn json_value(json: &str) -> Value {
-    serde_json::from_str(json)
-        .map(from_json)
-        .unwrap_or_else(|_| Value::Str(json.into()))
+    crate::json::parse(json).unwrap_or_else(|_| Value::Str(json.into()))
 }
-/// Parsed JSON as a value.
+/// Parsed JSON as a value, through serde_json's tree: the old path, kept as
+/// the reader's test oracle.
+#[cfg(test)]
 pub(crate) fn from_json(v: serde_json::Value) -> Value {
     match v {
         serde_json::Value::Null => Value::Nil,
@@ -508,16 +510,157 @@ pub(crate) struct Shaders {
     pub layer: Option<Arc<zgx::decoration::FillShader>>,
     /// `layer_params`: the layer shader's sixteen values, as four vec4s.
     pub layer_params: Option<[[f32; 4]; 4]>,
+    /// `layer_bleed`: how far past the box the layer shader paints.
+    pub layer_bleed: Option<f32>,
+    /// `layer_reach`: how far past that its `zgx_backdrop` reads.
+    pub layer_reach: Option<f32>,
+    /// `layer_clock`, `shader_clock`, `layer_on`, `layer_params` as a function:
+    /// the engine keeps it up (boxed: few shaders are).
+    pub drive: Option<DriveBox>,
+}
+/// How a `ui.glass` looks: its props, each a value or state.
+#[derive(Clone)]
+pub(crate) struct GlassSpec {
+    pub clear: Option<Source>,
+    pub tint: Option<Source>,
+    pub radius: Option<Source>,
+    /// Each corner's own (`{ tl, tr, br, bl }` or four numbers).
+    pub corners: Option<Source>,
+}
+/// `ui.glass`, made the first time a script names it.
+pub(crate) fn install_glass(lua: &Lua, ui: &Table) -> mlua::Result<()> {
+    ui.set(
+        "glass",
+        lua.create_function(|lua, table: Table| {
+            let take = |name: &str, ty: Ty| -> mlua::Result<Option<Source>> {
+                let value = table.get::<mlua::Value>(name)?;
+                table.raw_set(name, mlua::Value::Nil)?;
+                match value {
+                    mlua::Value::Nil => Ok(None),
+                    value => source(lua, ty, name, value).map(Some),
+                }
+            };
+            let spec = GlassSpec {
+                clear: take("clear", Ty::Bool)?,
+                tint: take("tint", Ty::Color)?,
+                radius: take("radius", Ty::Num)?,
+                corners: take("corners", Ty::Corners)?,
+            };
+            let node = fill(
+                lua,
+                Node::new(owner(lua)?, Kind::Glass(Box::new(spec))),
+                Some(&table),
+            )?;
+            node_ud(lua, node)
+        })?,
+    )
+}
+/// A box of `DriveProps` dropped out of line, so what drops a node stays as
+/// small as with no such field: every node's drop inlines this one's check.
+#[derive(Clone, Default)]
+pub(crate) struct DriveBox(std::mem::ManuallyDrop<Box<DriveProps>>);
+impl Drop for DriveBox {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: dropped once, here, and never read after.
+        drop_drive(unsafe { std::mem::ManuallyDrop::take(&mut self.0) });
+    }
+}
+#[cold]
+#[inline(never)]
+fn drop_drive(_: Box<DriveProps>) {}
+impl std::ops::Deref for DriveBox {
+    type Target = DriveProps;
+    fn deref(&self) -> &DriveProps {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for DriveBox {
+    fn deref_mut(&mut self) -> &mut DriveProps {
+        &mut self.0
+    }
+}
+/// What has the engine keep a node's shader up.
+#[derive(Clone, Default)]
+pub(crate) struct DriveProps {
+    /// `layer_clock`: the engine steps the layer shader's time.
+    pub layer_clock: bool,
+    /// `shader_clock`: the engine steps the shader fill's time.
+    pub shader_clock: bool,
+    /// `layer_on`: while false, no layer shader and no layer.
+    pub layer_on: Option<Source>,
+    /// `layer_params` as a function: followed.
+    pub layer_params_of: Option<Function>,
 }
 /// `ui.layer_shader(source, opts)`: a compiled layer shader, for
 /// `layer_shader` (see `zgx::scene::LayerShader`).
 pub(crate) struct LayerShaderUd(pub Arc<zgx::decoration::FillShader>);
 impl UserData for LayerShaderUd {}
 
+/// `ui.layer_shader`'s `passes`, `images` and `geometry`, if any.
+fn shader_inputs(opts: &Table) -> mlua::Result<Option<zgx::decoration::ShaderInputs>> {
+    use zgx::decoration::{PassFormat, PassSize, ShaderInputs, ShaderPass};
+    let wrong = |message: String| mlua::Error::runtime(format!("ui.layer_shader: {message}"));
+    let passes: Option<Table> = opts.get("passes")?;
+    let images: Option<Table> = opts.get("images")?;
+    let geometry: Option<String> = opts.get("geometry")?;
+    if passes.is_none() && images.is_none() && geometry.is_none() {
+        return Ok(None);
+    }
+    let mut inputs = ShaderInputs {
+        geometry: geometry.as_deref().map(zgx::decoration::geometry_tag),
+        ..Default::default()
+    };
+    for pass in passes
+        .iter()
+        .flat_map(|passes| passes.sequence_values::<Table>())
+    {
+        let pass = pass?;
+        let name: String = pass
+            .get::<Option<String>>("name")?
+            .ok_or_else(|| wrong("a pass needs a `name`".into()))?;
+        let source: String = pass
+            .get::<Option<String>>("shader")?
+            .ok_or_else(|| wrong(format!("pass `{name}` needs a `shader`")))?;
+        let size = match (
+            pass.get::<Option<Table>>("size")?,
+            pass.get::<Option<f32>>("scale")?,
+        ) {
+            (Some(size), _) => PassSize::Pixels(size.get(1)?, size.get(2)?),
+            (None, scale) => PassSize::OfBox(scale.unwrap_or(1.).clamp(0.01, 4.)),
+        };
+        let format = match pass.get::<Option<String>>("format")?.as_deref() {
+            None | Some("rgba8") => PassFormat::Rgba8,
+            Some("rgba16float") => PassFormat::Rgba16Float,
+            Some(other) => return Err(wrong(format!("no format `{other}`"))),
+        };
+        inputs.passes.push(ShaderPass {
+            name,
+            source,
+            size,
+            format,
+            feedback: pass.get::<Option<bool>>("feedback")?.unwrap_or(false),
+            steps: pass.get::<Option<u32>>("steps")?.unwrap_or(1).clamp(1, 128),
+            once: pass.get::<Option<bool>>("once")?.unwrap_or(false),
+        });
+    }
+    if let Some(images) = images {
+        for pair in images.pairs::<String, mlua::AnyUserData>() {
+            let (name, image) = pair?;
+            let image = image
+                .borrow::<BitmapUd>()
+                .map_err(|_| wrong(format!("image `{name}` isn't a ui.bitmap")))?
+                .0
+                .clone();
+            inputs.images.push((name, image));
+        }
+    }
+    Ok(Some(inputs))
+}
 /// `shader_params` and `layer_params`: up to four vec4s, lists of numbers
 /// or colors (0 to 1); theme colours (`"$accent"`) bind to `tokens`' slots
 /// where it has them.
-fn shader_params(
+pub(crate) fn shader_params(
     lua: &Lua,
     value: &mlua::Value,
     name: &str,
@@ -598,6 +741,13 @@ pub(crate) struct LayoutAnim {
     pub hit: bool,
 }
 impl Node {
+    fn set_press_flag(&mut self, flag: u8, on: bool) {
+        if on {
+            self.press_flags |= flag;
+        } else {
+            self.press_flags &= !flag;
+        }
+    }
     /// The hook the app declares here (`hook = "name"`), if any.
     pub fn hook(&self) -> Option<&str> {
         self.a11y.as_ref()?.hook.as_deref()
@@ -622,7 +772,7 @@ impl Node {
             layout_id: None,
             mask: None,
             shaders: None,
-            window_drag: false,
+            press_flags: 0,
             private: false,
             selectable: None,
             selection_colors: None,
@@ -676,32 +826,36 @@ impl Node {
     /// Animations, scroll offsets, widget bindings and overlays need a
     /// component context.
     pub fn needs_context(&self) -> bool {
-        matches!(
-            self.kind,
+        (match self.kind {
             Kind::Scroll { .. }
-                | Kind::Checkbox { .. }
-                | Kind::Input { .. }
-                | Kind::Progress { .. }
-                | Kind::Slider { .. }
-                | Kind::Split { .. }
-                | Kind::List { .. }
-                | Kind::Modal { .. }
-                | Kind::Popover { .. }
-                | Kind::Menu { .. }
-                | Kind::Submenu { .. }
-                | Kind::Presence { .. }
-                | Kind::Each {
-                    motion: Some(_),
-                    ..
-                }
-        ) || self.kind.library_needs_context()
-            || self.kind.is_scene3d()
+            | Kind::Checkbox { .. }
+            | Kind::Input { .. }
+            | Kind::Progress { .. }
+            | Kind::Slider { .. }
+            | Kind::Split { .. }
+            | Kind::List { .. }
+            | Kind::Modal { .. }
+            | Kind::Popover { .. }
+            | Kind::Menu { .. }
+            | Kind::Submenu { .. }
+            | Kind::Presence { .. }
+            | Kind::Each {
+                motion: Some(_), ..
+            } => true,
+            // A 3D scene: its effects and bindings live in a component
+            // context. In this one test, no other for every node.
+            #[cfg(feature = "scene3d")]
+            Kind::Scene3d(_) => true,
+            _ => false,
+        }) || self.kind.library_needs_context()
             || self.props.iter().any(|(_, s)| matches!(s, Source::Anim(_)))
             // An icon's tint may be a theme token: it reads the scope.
             || matches!(self.kind, Kind::Svg { .. })
                 && self.props.iter().any(|(p, _)| *p == Prop::Tint)
             // A sweeping mask runs on the component's frame clock.
             || self.mask.as_ref().is_some_and(|m| m.sweep.is_some())
+            // So does a shader the engine keeps up.
+            || self.shaders.as_ref().is_some_and(|s| s.drive.is_some())
     }
     /// The element kind selectors match (`button`, `text`…).
     pub fn tag(&self) -> &'static str {
@@ -718,6 +872,7 @@ impl Node {
             Kind::Image { .. } => "image",
             Kind::Svg { .. } => "svg",
             Kind::Canvas(..) => "canvas",
+            Kind::Glass(_) => "glass",
             #[cfg(feature = "scene3d")]
             Kind::Scene3d(_) => "scene3d",
             Kind::WebView(_) => "webview",
@@ -798,6 +953,10 @@ pub(crate) struct Events {
     /// `fn(visible, element)` when any of the node comes into view or all
     /// of it leaves, and once at first layout.
     pub visible: Option<Function>,
+    /// `visible_margin = 600`: `on_visible` counts the node as in view once
+    /// it comes within that many points of it (an IntersectionObserver's
+    /// `rootMargin`): for building what is about to scroll in.
+    pub visible_margin: Option<f32>,
     /// Drag and drop within the window (payloads are script values):
     /// `on_drag() -> payload` starts a drag after a 4-point move;
     /// `drag_preview(payload) -> node` follows the pointer;
@@ -871,6 +1030,10 @@ pub(crate) struct RareEvents {
     /// on one spot, as the DOM's `dblclick`, heard as the second is let go;
     /// the innermost node with one takes it.
     pub double_click: Option<Handler>,
+    /// `fn(locked)`: the node took the pointer's lock (`el:lock_pointer()`,
+    /// `true`) or lost it (`false`): let go, Escape, the window losing
+    /// focus, the node leaving or another taking it.
+    pub pointer_lock: Option<Handler>,
     /// `capture_keys = true`: while focus is in it, every key goes to what
     /// is focused, no shortcut or menu taking one (a shortcut recorder).
     pub capture_keys: bool,
@@ -901,6 +1064,7 @@ impl Events {
         mount: None,
         resize: None,
         visible: None,
+        visible_margin: None,
         drag: None,
         drag_preview: None,
         drag_preview_anchor: None,
@@ -949,6 +1113,10 @@ pub(crate) struct ListRare {
     /// start coming in reach calls. Taken as `fill` walks the table.
     pub(crate) start: Option<Function>,
     pub(crate) start_distance: Option<f32>,
+    /// `ahead`: viewports of rows built ahead (`View::list_ahead`).
+    pub(crate) ahead: Option<f32>,
+    /// `estimate = { … }`, with `measured`: how a row's data makes its height.
+    pub(crate) estimate: Option<Rc<crate::estimate::Rule>>,
     /// `at_end = state`: kept saying whether it rests at its end.
     pub(crate) at_end: Option<Signal<Value>>,
     /// `overscroll = "contain"`: a wheel over it stays with it.
@@ -1011,10 +1179,15 @@ pub(crate) enum Kind {
         offset: Option<Signal<Value>>,
         horizontal: bool,
         follow: bool,
-        /// `scrollbar = true`: an interactive scrollbar over its edge.
-        scrollbar: bool,
+        /// `scrollbar = true` (or a table of how it looks): an interactive
+        /// scrollbar over its edge.
+        scrollbar: Option<Box<ScrollbarSpec>>,
         /// `overscroll = "contain"`: a wheel over it stays with it.
         contain: bool,
+        /// `wheel_across = true` (`ui.scroll_x`): a mouse wheel moves it.
+        wheel_across: bool,
+        /// `paging = true`: it comes to rest on whole pages.
+        paging: bool,
         /// `scroll_padding`: kept clear as what it holds scrolls into view.
         padding: Option<Box<ScrollPadding>>,
     },
@@ -1043,9 +1216,8 @@ pub(crate) enum Kind {
     /// reads changes; with its `view` and `grid`, if any.
     /// `draw` may be absent when `each` draws it.
     Canvas(Option<Function>, Option<Box<CanvasOptions>>),
-    /// `ui.scene3d { … }`: a 3D scene (zgx-3d) in a GPU view.
-    #[cfg(feature = "scene3d")]
-    Scene3d(Rc<crate::scene3d::Scene3dSpec>),
+    /// `ui.glass { ... }`: the system's glass where it has one.
+    Glass(Box<GlassSpec>),
     /// `ui.webview { ... }`: a native web view laid out like a div.
     WebView(Box<WebSpec>),
     /// `ui.terminal { term = ui.term(id) }`: a terminal session, shown
@@ -1147,8 +1319,9 @@ pub(crate) enum Kind {
         /// end, it stays there as rows come and are measured (a chat).
         follow: bool,
         offset: Option<Signal<Value>>,
-        /// `scrollbar = true`: an interactive scrollbar over its edge.
-        scrollbar: bool,
+        /// `scrollbar = true` (or a table of how it looks): an interactive
+        /// scrollbar over its edge.
+        scrollbar: Option<Box<ScrollbarSpec>>,
         /// `keyboard = true`: its rows are one Tab stop, and the arrows,
         /// Page Up and Down, Home and End move focus through all of them.
         keyboard: bool,
@@ -1239,6 +1412,12 @@ pub(crate) enum Kind {
         /// Only what this script (a plugin's name) contributes.
         from: Option<String>,
     },
+    /// `ui.scene3d { … }`: a 3D scene (zgx-3d) in a GPU view. Last: one in
+    /// the middle moves the others' discriminants, and what tests them for
+    /// every node (`styled`) takes more instructions with the feature on, a
+    /// scene on screen or not.
+    #[cfg(feature = "scene3d")]
+    Scene3d(Rc<crate::scene3d::Scene3dSpec>),
 }
 impl Kind {
     fn takes_children(&self) -> bool {
@@ -1247,6 +1426,7 @@ impl Kind {
             Kind::Column
                 | Kind::Row
                 | Kind::Div
+                | Kind::Glass(_)
                 | Kind::Overlay
                 | Kind::Button
                 | Kind::Scroll { .. }
@@ -1261,18 +1441,23 @@ impl Kind {
     }
     /// A component of the library holding children (a disclosure's content,
     /// an accordion's sections), which it lowers itself.
+    /// Whether `size` is its width and height: a box's, not the field of a
+    /// widget or the leaf a script may mean a type size on (`fill_from`).
+    fn takes_size(&self) -> bool {
+        matches!(
+            self,
+            Kind::Column
+                | Kind::Row
+                | Kind::Div
+                | Kind::Overlay
+                | Kind::Scroll { .. }
+                | Kind::Presence { .. }
+        )
+    }
     pub(crate) fn library_takes_children(&self) -> bool {
         #[cfg(feature = "components")]
         if let Kind::Library(library) = self {
             return library.takes_children();
-        }
-        false
-    }
-    /// A 3D scene (its effects and bindings live in a component context).
-    fn is_scene3d(&self) -> bool {
-        #[cfg(feature = "scene3d")]
-        if let Kind::Scene3d(_) = self {
-            return true;
         }
         false
     }
@@ -1362,11 +1547,18 @@ fn rare_mut(span: &mut Span) -> &mut SpanRare {
 pub(crate) struct SpanRare {
     /// An icon before the text, in the line.
     pub icon: Option<SpanIcon>,
+    /// Room after the text, given apart from the room before it
+    /// (`padding = { before, after, down }`).
+    pub padding_end: Option<f32>,
     /// `context_menu = function(e) return { … } end`: its own menu (a
     /// link's in place of Open Link and Copy Link).
     pub menu: Option<Function>,
+    /// `fade_in = { start = ui.now(), ms = 200, power = 1.6 }`: its text
+    /// fading in, drawn in Rust a frame at a time (`TextSpan::fade_in`).
+    pub fade: Option<zgx::compose::TextFade>,
 }
-/// `ui.span { icon = { src = …, size = 12, gap = 4, tint = … } }`.
+/// `ui.span { icon = { src = …, size = 12, gap = 4, tint = …, bg = …,
+/// radius = 4, pad = 2 } }`.
 #[derive(Clone)]
 pub(crate) struct SpanIcon {
     /// A file, `https://…`, or `code:<svg …>`.
@@ -1375,7 +1567,17 @@ pub(crate) struct SpanIcon {
     pub gap: f32,
     /// A colour, or `"currentColor"` (the span's text colour).
     pub tint: Option<Value>,
+    /// The well the icon sits on: its fill (a colour or token), its
+    /// corner, and its room round the icon on every side.
+    pub bg: Option<Value>,
+    pub radius: f32,
+    pub pad: f32,
 }
+
+/// `Node::press_flags`: a press on it moves the window.
+pub(crate) const WINDOW_DRAG: u8 = 1;
+/// `Node::press_flags`: a press on it leaves focus where it is.
+pub(crate) const KEEPS_FOCUS: u8 = 2;
 
 /// A node's tooltip (`tooltip`, `tooltip_placement`).
 #[derive(Default, Clone)]
@@ -1561,6 +1763,70 @@ pub(crate) struct Anim {
     pub from: Option<Value>,
     pub to: Option<Value>,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct SpringParams {
+    pub stiffness: f32,
+    pub damping: f32,
+    pub delay_ms: f32,
+}
+/// How far from its goal a spring is `t` seconds on and how fast it is going, from
+/// `left` away at `speed`: stiffness and damping for a mass of 1, in closed form.
+fn spring_at(left: f64, speed: f64, stiffness: f64, damping: f64, t: f64) -> (f64, f64) {
+    let half = damping / 2.;
+    let rest = half * half - stiffness;
+    if rest > 1e-6 {
+        let root = rest.sqrt();
+        let (fast, slow) = (-half - root, -half + root);
+        let a = (speed - fast * left) / (slow - fast);
+        let b = left - a;
+        let (a_now, b_now) = (a * (slow * t).exp(), b * (fast * t).exp());
+        (a_now + b_now, a_now * slow + b_now * fast)
+    } else if rest < -1e-6 {
+        let turn = (-rest).sqrt();
+        let (a, b) = (left, (speed + half * left) / turn);
+        let (cos, sin) = ((turn * t).cos(), (turn * t).sin());
+        let decay = (-half * t).exp();
+        let now = decay * (a * cos + b * sin);
+        (now, decay * (b * turn * cos - a * turn * sin) - half * now)
+    } else {
+        let b = speed + half * left;
+        let decay = (-half * t).exp();
+        let now = (left + b * t) * decay;
+        (now, b * decay - half * now)
+    }
+}
+
+impl SpringParams {
+    /// From a table: `response` (ms, the time of one undamped swing) and `bounce`
+    /// (0 settles without overshoot, higher overshoots more) as SwiftUI's springs
+    /// say it, or `stiffness` and `damping`; and `delay`. What it leaves out is
+    /// `base`'s.
+    fn read(table: &Table, base: Self) -> mlua::Result<Self> {
+        let mut params = base;
+        if let Some(response) = table.get::<Option<f32>>("response")? {
+            let bounce = table.get::<Option<f32>>("bounce")?.unwrap_or(0.);
+            let rate = std::f32::consts::TAU / (response.max(1.) / 1000.);
+            let fraction = if bounce >= 0. {
+                1. - bounce
+            } else {
+                1. / (1. + bounce)
+            };
+            params.stiffness = rate * rate;
+            params.damping = 2. * fraction * rate;
+        }
+        if let Some(stiffness) = table.get::<Option<f32>>("stiffness")? {
+            params.stiffness = stiffness;
+        }
+        if let Some(damping) = table.get::<Option<f32>>("damping")? {
+            params.damping = damping;
+        }
+        if let Some(delay) = table.get::<Option<f32>>("delay")? {
+            params.delay_ms = delay;
+        }
+        Ok(params)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Curve {
     /// `ms`: the duration in milliseconds, as everywhere in scripts.
@@ -1706,6 +1972,7 @@ props! {
     "lang" => Lang: Str,
     "drop_shadow" => DropShadow: Shadow,
     "slice" => Slice: Corners,
+    "geometry" => Geometry: Str,
     // Transforms: after layout, about `origin` (fractions of the node).
     // Last, so that `is_transform` is a single comparison.
     "x" => X: Num, "y" => Y: Num,
@@ -3018,7 +3285,11 @@ pub(crate) struct A11y {
     pub expanded: Option<Source>,
     pub live: Option<zgx::semantics::Live>,
     pub description: Option<Rc<str>>,
+    /// A `description` given as a state or function.
+    pub description_of: Option<Source>,
     pub hidden: bool,
+    /// `aria_modal = true`: while it shows, nothing else is read.
+    pub modal: bool,
     pub focus_group: Option<zgx::input::FocusGroup>,
     /// A `label` given as a state or function.
     pub label: Option<Source>,
@@ -3074,7 +3345,8 @@ fn read_range(lua: &Lua, node: &mut Node, table: &Table) -> mlua::Result<()> {
     node.a11y.get_or_insert_default().range = Some(Box::new(range));
     Ok(())
 }
-/// A slider's `value_text` from `table`, if it has one.
+/// What an element reads as besides its name (`value_text`), a slider's
+/// or any other's, from `table`, if it has one.
 #[inline(never)]
 fn read_value_text(lua: &Lua, node: &mut Node, table: &Table) -> mlua::Result<()> {
     let text = table.get::<mlua::Value>("value_text")?;
@@ -3290,6 +3562,7 @@ const WIDGET_FIELDS: &[&str] = &[
     "overscan",
     "heights",
     "measured",
+    "estimate",
     "row_text",
     "sticky",
     "placement",
@@ -3383,9 +3656,12 @@ const LATE_FIELDS: &[&str] = &[
     "keep_focus",
     "on_start",
     "start_distance",
+    "ahead",
     "at_end",
     "on_paste",
     "overscroll",
+    "wheel_across",
+    "paging",
     "capture_keys",
     "scroll_padding",
     "read_only",
@@ -3497,7 +3773,7 @@ fn late_field(lua: &Lua, node: &mut Node, name: &str, value: mlua::Value) -> mlu
                 }
             }
         }
-        "on_start" | "start_distance" | "at_end" => {
+        "on_start" | "start_distance" | "ahead" | "at_end" => {
             if let Kind::List { rare, .. } = &mut node.kind {
                 let rare = rare.get_or_insert_default();
                 match name {
@@ -3506,6 +3782,7 @@ fn late_field(lua: &Lua, node: &mut Node, name: &str, value: mlua::Value) -> mlu
                         let distance: f32 = lua.unpack(value)?;
                         rare.start_distance = distance.is_finite().then_some(distance);
                     }
+                    "ahead" => rare.ahead = Some(lua.unpack(value)?),
                     _ => rare.at_end = Some(expect_state(&value, "`at_end`")?),
                 }
             }
@@ -3528,11 +3805,30 @@ fn late_field(lua: &Lua, node: &mut Node, name: &str, value: mlua::Value) -> mlu
         }
         "capture_keys" => {
             if lua.unpack::<bool>(value)? {
-                node.events
-                    .get_or_insert_default()
-                    .rare
-                    .get_or_insert_default()
-                    .capture_keys = true;
+                let events = node.events.get_or_insert_default();
+                events.rare.get_or_insert_default().capture_keys = true;
+                // No handler sets it for this one (`any_input`).
+                events.input = true;
+            }
+        }
+        "wheel_across" => {
+            let across = lua.unpack::<bool>(value)?;
+            match &mut node.kind {
+                Kind::Scroll {
+                    horizontal: true,
+                    wheel_across,
+                    ..
+                } => *wheel_across = across,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "`wheel_across` is for a `ui.scroll_x`",
+                    ));
+                }
+            }
+        }
+        "paging" => {
+            if let Kind::Scroll { paging, .. } = &mut node.kind {
+                *paging = lua.unpack::<Option<bool>>(value)?.unwrap_or(false);
             }
         }
         "overscroll" => {
@@ -3596,6 +3892,7 @@ fn set_handler(
                 | "drop_when"
                 | "drag_export"
                 | "drag_moves_window"
+                | "visible_margin"
         ))
     {
         return Ok(Some(value));
@@ -3629,6 +3926,7 @@ fn set_handler(
         "on_release" => &mut events.release,
         "on_aux_click" => &mut events.rare.get_or_insert_default().aux_click,
         "on_double_click" => &mut events.rare.get_or_insert_default().double_click,
+        "on_pointer_lock" => &mut events.rare.get_or_insert_default().pointer_lock,
         "on_navigate" => &mut events.rare.get_or_insert_default().navigate,
         "on_swipe" => &mut events.rare.get_or_insert_default().swipe,
         "on_file_drop" => &mut events.rare.get_or_insert_default().file_drop,
@@ -3660,6 +3958,19 @@ fn set_handler(
                 return Err(mlua::Error::runtime("on_visible takes a function"));
             };
             events.visible = Some(f);
+            return Ok(None);
+        }
+        "visible_margin" => {
+            let margin = match value {
+                mlua::Value::Number(n) => n,
+                mlua::Value::Integer(n) => n as f64,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "visible_margin takes a number of points",
+                    ));
+                }
+            };
+            events.visible_margin = margin.is_finite().then_some(margin.max(0.) as f32);
             return Ok(None);
         }
         "context_menu" => {
@@ -3872,7 +4183,8 @@ fn fill_from(
                 }
             },
             "focusable" => node.focusable = Some(lua.unpack(value)?),
-            "window_drag" => node.window_drag = lua.unpack(value)?,
+            "window_drag" => node.set_press_flag(WINDOW_DRAG, lua.unpack(value)?),
+            "focus_on_press" => node.set_press_flag(KEEPS_FOCUS, !lua.unpack::<bool>(value)?),
             "selectable" => node.selectable = lua.unpack(value)?,
             "selection_color" | "selected_text_color" => {
                 let at = usize::from(key == "selected_text_color");
@@ -3946,8 +4258,38 @@ fn fill_from(
                     Some(ud.borrow::<LayerShaderUd>()?.0.clone());
             }
             "layer_params" => {
-                node.shaders.get_or_insert_default().layer_params =
-                    Some(shader_params(lua, &value, "layer_params", None)?);
+                let shaders = node.shaders.get_or_insert_default();
+                match &value {
+                    mlua::Value::Function(f) => {
+                        shaders.drive.get_or_insert_default().layer_params_of = Some(f.clone());
+                    }
+                    _ => {
+                        shaders.layer_params =
+                            Some(shader_params(lua, &value, "layer_params", None)?);
+                    }
+                }
+            }
+            "layer_clock" | "shader_clock" => {
+                let on = lua.unpack::<bool>(value)?;
+                let shaders = node.shaders.get_or_insert_default();
+                let drive = shaders.drive.get_or_insert_default();
+                match key {
+                    "layer_clock" => drive.layer_clock = on,
+                    _ => drive.shader_clock = on,
+                }
+            }
+            "layer_on" => {
+                let on = source(lua, Ty::Bool, key, value)?;
+                let shaders = node.shaders.get_or_insert_default();
+                shaders.drive.get_or_insert_default().layer_on = Some(on);
+            }
+            "layer_bleed" | "layer_reach" => {
+                let length = lua.unpack::<f32>(value)?;
+                let shaders = node.shaders.get_or_insert_default();
+                match key {
+                    "layer_bleed" => shaders.layer_bleed = Some(length),
+                    _ => shaders.layer_reach = Some(length),
+                }
             }
             "mask" => {
                 let (bitmap, t) = match &value {
@@ -4258,16 +4600,40 @@ fn fill_from(
             "error" => {
                 node.a11y.get_or_insert_default().error = Some(source(lua, Ty::Str, "error", value)?);
             }
-            "description" => {
-                node.a11y.get_or_insert_default().description =
-                    Some(lua.unpack::<String>(value)?.into());
-            }
+            "description" => match value {
+                mlua::Value::String(text) => {
+                    node.a11y.get_or_insert_default().description = Some(text.to_str()?.as_ref().into());
+                }
+                // Followed: a state or a function giving the hint as things stand.
+                value => {
+                    node.a11y.get_or_insert_default().description_of =
+                        Some(source(lua, Ty::Str, "description", value)?);
+                }
+            },
             "aria_hidden" => {
                 node.a11y.get_or_insert_default().hidden = lua.unpack(value)?;
+            }
+            "aria_modal" => {
+                node.a11y.get_or_insert_default().modal = lua.unpack(value)?;
             }
             "focus_group" => {
                 let axis: String = lua.unpack(value)?;
                 node.a11y.get_or_insert_default().focus_group = Some(focus_group(&axis)?);
+            }
+            // What it reads as besides its name (`aria-valuetext`), any
+            // element's: read here, among the keys a table has, so elements
+            // without one never look it up. A slider's range reads it again.
+            "value_text" => {
+                let range = (node.a11y.get_or_insert_default().range).get_or_insert_default();
+                range.value_text = Some(source(lua, Ty::Str, "value_text", value)?);
+            }
+            // A box's width and height at once. On a split it is the state
+            // its divider follows, and on anything else it does nothing
+            // (`size-inert`), as it did everywhere: those scripts go on working.
+            // So does a box a component hands its own `size = "sm"` along to.
+            "size" if node.kind.takes_size() && !matches!(value, mlua::Value::String(_)) => {
+                let source = source_linted(lua, Prop::Size.ty(), "size", value, lint)?;
+                node.props.push((Prop::Size, source));
             }
             name if WIDGET_FIELDS.contains(&name) => {}
             name => {
@@ -4482,6 +4848,27 @@ const SPAN_FOLLOWS: &[(&str, Ty)] = &[
 
 /// `ui.span { "text", bold = true, color = "#f80", on_click = fn }`;
 /// `href = "https://…"` makes it a link that opens it.
+/// `fade_in = { start = ui.now(), ms = 200, power = 1.6 }`: from clear at
+/// `start` to its colour `ms` later, easing out by `power` (2 if not given).
+#[cold]
+#[inline(never)]
+fn span_fade_in(lua: &Lua, given: mlua::Value, span: &mut Span) -> mlua::Result<()> {
+    let fade: Table = lua.unpack(given)?;
+    let (Some(start), Some(ms)) = (
+        fade.get::<Option<f64>>("start")?,
+        fade.get::<Option<f32>>("ms")?,
+    ) else {
+        return Err(mlua::Error::runtime(
+            "a span's fade_in takes `start` (ui.now()'s milliseconds) and `ms`",
+        ));
+    };
+    rare_mut(span).fade = Some(zgx::compose::TextFade {
+        start,
+        ms: ms.max(0.),
+        power: fade.get::<Option<f32>>("power")?.unwrap_or(2.).max(0.01),
+    });
+    Ok(())
+}
 fn span(lua: &Lua, arg: mlua::Value, literal: bool) -> mlua::Result<Span> {
     let (content, table) = match arg {
         mlua::Value::Table(t) => (t.get::<mlua::Value>(1)?, Some(t)),
@@ -4556,12 +4943,20 @@ fn span(lua: &Lua, arg: mlua::Value, literal: bool) -> mlua::Result<Span> {
                 }
                 // `padding = 4` (across) or `{ 4, 0.5 }` (across, down).
                 b"padding" => {
+                    // `x`, `{ x, y }`, or `{ start, end, y }` (across before
+                    // the text and after it, then down).
                     span.padding = match lua.unpack(given)? {
                         Value::Num(x) => [x as f32, 0.],
-                        Value::List(l) => [
-                            l.first().and_then(Value::as_f64).unwrap_or(0.) as f32,
-                            l.get(1).and_then(Value::as_f64).unwrap_or(0.) as f32,
-                        ],
+                        Value::List(l) => {
+                            let at =
+                                |i: usize| l.get(i).and_then(Value::as_f64).unwrap_or(0.) as f32;
+                            if l.len() >= 3 {
+                                rare_mut(&mut span).padding_end = Some(at(1));
+                                [at(0), at(2)]
+                            } else {
+                                [at(0), at(1)]
+                            }
+                        }
                         _ => [0.; 2],
                     }
                 }
@@ -4603,13 +4998,18 @@ fn span(lua: &Lua, arg: mlua::Value, literal: bool) -> mlua::Result<Span> {
                         }
                     };
                     let tint = icon.get::<Value>("tint")?;
+                    let bg = icon.get::<Value>("bg")?;
                     rare_mut(&mut span).icon = Some(SpanIcon {
                         src,
                         size: icon.get::<Option<f32>>("size")?.unwrap_or(12.),
                         gap: icon.get::<Option<f32>>("gap")?.unwrap_or(4.),
                         tint: (!matches!(tint, Value::Nil)).then_some(tint),
+                        bg: (!matches!(bg, Value::Nil)).then_some(bg),
+                        radius: icon.get::<Option<f32>>("radius")?.unwrap_or(0.).max(0.),
+                        pad: icon.get::<Option<f32>>("pad")?.unwrap_or(0.).max(0.),
                     });
                 }
+                b"fade_in" => span_fade_in(lua, given, &mut span)?,
                 b"on_click" => span.click = Some(handler(given)?),
                 b"href" => span.href = Some(lua.unpack::<String>(given)?.into()),
                 b"context_menu" => match given {
@@ -4838,8 +5238,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                     None => false,
                 };
                 let scrollbar = match &table {
-                    Some(t) => t.get::<Option<bool>>("scrollbar")?.unwrap_or(false),
-                    None => false,
+                    Some(t) => scrollbar_spec(t.get::<mlua::Value>("scrollbar")?)?,
+                    None => None,
                 };
                 let node = fill(
                     lua,
@@ -4852,6 +5252,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                             scrollbar,
                             // Set as `fill` walks the table (`late_field`).
                             contain: false,
+                            wheel_across: false,
+                            paging: false,
                             padding: None,
                         },
                     ),
@@ -5388,7 +5790,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 };
                 // Every row is built and laid out: thousands are slow to
                 // mount and lay out, where `ui.list` builds what shows.
-                let rows = items.with_untracked(|list| list.list().len());
+                let rows = items.with_untracked(|list| list.items().len());
                 if rows > LONG_EACH {
                     crate::warn(
                         lua,
@@ -5443,6 +5845,15 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 return Err(mlua::Error::runtime("ui.list `sticky` needs `heights`"));
             }
             let measured = table.get::<Option<bool>>("measured")?.unwrap_or(false);
+            // (Only a measured list has rows waiting to be measured.)
+            let estimate = if measured {
+                match table.get::<Option<Table>>("estimate")? {
+                    Some(rule) => Some(Rc::new(crate::estimate::Rule::read(&rule)?)),
+                    None => None,
+                }
+            } else {
+                None
+            };
             if measured && heights.is_some() {
                 return Err(mlua::Error::runtime(
                     "ui.list `measured` and `heights` don't go together: measured rows take their content's height",
@@ -5521,7 +5932,13 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                     ));
                 }
             };
-            let rare = (sticky.is_some()
+            if estimate.is_some() && (items.is_none() || (key.is_none() && key_field.is_none())) {
+                return Err(mlua::Error::runtime(
+                    "ui.list `estimate` needs `key` and `data`: it keeps rows' heights by their keys",
+                ));
+            }
+            let rare = (estimate.is_some()
+                || sticky.is_some()
                 || row_text.is_some()
                 || end.is_some()
                 || ancestor
@@ -5530,6 +5947,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 Box::new(ListRare {
                     sticky,
                     sticky_top,
+                    estimate,
                     row_text,
                     end,
                     ancestor,
@@ -5553,7 +5971,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                         measured,
                         follow: table.get::<Option<bool>>("follow")?.unwrap_or(false),
                         offset,
-                        scrollbar: table.get::<Option<bool>>("scrollbar")?.unwrap_or(false),
+                        scrollbar: scrollbar_spec(table.get::<mlua::Value>("scrollbar")?)?,
                         keyboard: table.get::<Option<bool>>("keyboard")?.unwrap_or(false),
 
                     },
@@ -6158,6 +6576,14 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 Some(t) => t.get::<Option<f32>>("fps")?,
                 None => None,
             };
+            if let Some(inputs) = opts.as_ref().map(shader_inputs).transpose()?.flatten() {
+                // A running effect of its own: textures aren't shared.
+                zgx_gpu::check_layer_inputs(&source, &inputs)
+                    .map_err(|e| mlua::Error::runtime(format!("ui.layer_shader: {e}")))?;
+                let shader = zgx::decoration::FillShader::with_inputs(source, fps, inputs);
+                zgx::decoration::declare_layer_shader(&shader);
+                return Ok(LayerShaderUd(shader));
+            }
             // One shader per source and rate: rebuilding a view does not
             // compile it again.
             type Shaders =
@@ -6174,7 +6600,13 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 shaders
                     .borrow_mut()
                     .entry(key.clone())
-                    .or_insert_with(|| zgx::decoration::FillShader::new(key.0.clone(), fps))
+                    .or_insert_with(|| {
+                        // Compiled from now, off the frame, so the first frame
+                        // drawing it (a one-shot's) finds it ready.
+                        let shader = zgx::decoration::FillShader::new(key.0.clone(), fps);
+                        zgx::decoration::declare_layer_shader(&shader);
+                        shader
+                    })
                     .clone()
             });
             Ok(LayerShaderUd(shader))
@@ -6393,6 +6825,97 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             )
         })?,
     )?;
+    // A state run to a value now, by Rust: for what a gesture hands over to a spring,
+    // whose starting speed and ending the binding of `ui.spring` can't say.
+    ui.set(
+        "spring_to",
+        lua.create_function(
+            |lua, (state, target, opts): (mlua::Value, f64, Option<Table>)| {
+                let env = env(lua)?;
+                let state = expect_state(&state, "ui.spring_to's state")?;
+                let opts = match opts {
+                    Some(opts) => opts,
+                    None => lua.create_table()?,
+                };
+                let params = SpringParams::read(
+                    &opts,
+                    SpringParams {
+                        stiffness: 260.,
+                        damping: 24.,
+                        delay_ms: 0.,
+                    },
+                )?;
+                let velocity = Rc::new(std::cell::Cell::new(
+                    opts.get::<Option<f64>>("velocity")?.unwrap_or(0.),
+                ));
+                let most = opts.get::<Option<f64>>("most")?.unwrap_or(5000.) / 1000.;
+                let done = opts.get::<Option<Function>>("done")?;
+                let stopped = Rc::new(std::cell::Cell::new(false));
+                let (running, stop) = (velocity.clone(), stopped.clone());
+                let vm = env.vm.clone();
+                let done = std::cell::RefCell::new(done);
+                let elapsed_cell = std::cell::Cell::new(0f64);
+                let began = std::time::Instant::now();
+                let (speed_from, shown_from) = (
+                    velocity.get(),
+                    state
+                        .with_untracked(|value| value.as_f64())
+                        .unwrap_or(target),
+                );
+                // Where the spring itself begins, if not at the state: the state stays
+                // where it is until the spring has passed it.
+                let from = opts.get::<Option<f64>>("from")?.unwrap_or(shown_from);
+                let delay = f64::from(params.delay_ms) / 1000.;
+                // At rest within a thousandth of the way it goes (half a point at
+                // most): an opacity's 0 to 1 runs to the end, not to 0.5 of it.
+                let span = (from - target).abs().max(speed_from.abs() * 0.1);
+                let rest = (span * 1e-3).clamp(1e-6, 0.5);
+                env.engine.tick_with(Rc::new(move |dt_ms| {
+                    if stopped.get() {
+                        return false;
+                    }
+                    // By the clock from the call: a late frame lands where the curve is,
+                    // and `delay` is how long after the call it starts, as UIKit's do.
+                    // (A test's clock runs ahead of it.)
+                    elapsed_cell.set(
+                        (elapsed_cell.get() + dt_ms / 1000.).max(began.elapsed().as_secs_f64()),
+                    );
+                    // Where the spring is at this time, whatever the frames: the same
+                    // curve on any display, and through a late one.
+                    let (left, speed) = spring_at(
+                        from - target,
+                        speed_from,
+                        f64::from(params.stiffness),
+                        f64::from(params.damping),
+                        (elapsed_cell.get() - delay).max(0.),
+                    );
+                    let at = if (target + left - shown_from) * (target - shown_from) < 0. {
+                        shown_from
+                    } else {
+                        target + left
+                    };
+                    running.set(speed);
+                    let settled =
+                        left.abs() < rest && speed.abs() < rest * 10. || elapsed_cell.get() > most;
+                    state.set(Value::from(if settled { target } else { at }));
+                    if settled {
+                        running.set(0.);
+                        if let (Some(done), Some(vm)) = (done.borrow_mut().take(), vm.upgrade())
+                            && let Err(error) = vm.call::<()>(&done, ())
+                        {
+                            vm.report(error);
+                        }
+                    }
+                    !settled
+                }));
+                // Stops it, and says how fast it was going.
+                lua.create_function(move |_, ()| {
+                    stop.set(true);
+                    Ok(velocity.get())
+                })
+            },
+        )?,
+    )?;
     ui.set(
         "loop",
         lua.create_function(move |lua, opts: Option<Table>| {
@@ -6494,7 +7017,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     ui.set(
         "now",
         lua.create_function(|_, ()| {
-            Ok(std::time::SystemTime::now()
+            Ok(zgx::clock::system_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0., |d| d.as_secs_f64() * 1000.))
         })?,
@@ -6572,6 +7095,36 @@ pub(crate) fn computed_state(_: &Lua, env: &Env, f: Function) -> crate::value::S
                     out.set(v);
                 }
                 Err(e) => vm.report(e),
+            }
+        }
+    });
+    let refresh = effect.refresher();
+    retain(env, Box::new(effect));
+    crate::value::State(signal, Some(crate::value::Fresh::One(refresh)))
+}
+/// A state kept current in Rust by `body` (what it reads followed), as
+/// `ui.computed`'s is by a script function, and owned as that is
+/// (`retain`): `ui.markdown` given a state.
+pub(crate) fn derived_state(
+    env: &Env,
+    mut body: impl FnMut() -> mlua::Result<Value> + 'static,
+) -> crate::value::State {
+    let signal = env.runtime.signal(Value::Nil);
+    let (vm, out) = (env.vm.clone(), signal.clone());
+    let effect = env.runtime.effect_now(move || match body() {
+        Ok(value) => {
+            // (A list grown from the last compares its end alone.)
+            out.mutate(|old| {
+                let changed = !crate::value::same(old, &value);
+                if changed {
+                    *old = value;
+                }
+                changed
+            });
+        }
+        Err(error) => {
+            if let Some(vm) = vm.upgrade() {
+                vm.report(error);
             }
         }
     });
@@ -6729,11 +7282,31 @@ pub(crate) fn retain(env: &Env, resource: Box<dyn Any>) {
         resource
     };
     match &*scope {
-        Some(scope) => scope.retained.borrow_mut().push(resource),
+        Some(scope) => keep_in(&mut scope.retained.borrow_mut(), resource),
         // While its host records its loads, the module running owns it.
         None if crate::reloads::recording() => retain_in_module(env, resource),
-        None => env.retained.borrow_mut().push(resource),
+        None => keep_in(&mut env.retained.borrow_mut(), resource),
     }
+}
+/// `resource` kept in `kept`, which lasts as long as what owns it, the whole
+/// app's life for one made in a handler at no scope. So timers that have ended
+/// go before the list grows: each `ui.after` would otherwise stay for good.
+/// A prune that leaves it over half full makes room for as many again, so
+/// the next waits until it has doubled: each costs no more than the pushes
+/// since the last, not the whole list on every one.
+pub(crate) fn keep_in(kept: &mut Vec<Box<dyn Any>>, resource: Box<dyn Any>) {
+    if kept.len() == kept.capacity() {
+        kept.retain(|resource| {
+            !resource
+                .downcast_ref::<crate::timers::Stop>()
+                .is_some_and(crate::timers::Stop::done)
+        });
+        if kept.len() > kept.capacity() / 2 {
+            let len = kept.len();
+            kept.reserve(len);
+        }
+    }
+    kept.push(resource);
 }
 /// `resource`, made at a top level while its host records its loads: the
 /// module running owns it (a partial reload drops it as that module runs
@@ -6751,9 +7324,158 @@ fn retain_in_module(env: &Env, resource: Box<dyn Any>) {
         },
         None => resource,
     };
-    env.retained.borrow_mut().push(resource)
+    keep_in(&mut env.retained.borrow_mut(), resource)
 }
 
+/// `scrollbar = true`, or a table drawing and timing it as the app's own
+/// (`zgx::compose::ScrollbarStyle`): its `track` and `hint` a state or a
+/// function, read as they change (not as the view scrolls).
+#[derive(Clone, Default)]
+pub(crate) struct ScrollbarSpec {
+    pub(crate) style: zgx::compose::ScrollbarStyle,
+    pub(crate) track: Option<mlua::Value>,
+    pub(crate) hint: Option<mlua::Value>,
+}
+/// `scrollbar`'s value: off (`nil`, `false`), the platform's (`true`), or
+/// a table of what it changes.
+pub(crate) fn scrollbar_spec(value: mlua::Value) -> mlua::Result<Option<Box<ScrollbarSpec>>> {
+    use std::time::Duration;
+    let table = match value {
+        mlua::Value::Nil | mlua::Value::Boolean(false) => return Ok(None),
+        mlua::Value::Boolean(true) => return Ok(Some(Box::default())),
+        mlua::Value::Table(table) => table,
+        _ => {
+            return Err(mlua::Error::runtime(
+                "`scrollbar` takes true or a table of how it looks",
+            ));
+        }
+    };
+    let mut spec = ScrollbarSpec::default();
+    let number = |key: &str, value: mlua::Value| -> mlua::Result<f32> {
+        match value {
+            mlua::Value::Integer(n) if n >= 0 => Ok(n as f32),
+            mlua::Value::Number(n) if n.is_finite() && n >= 0. => Ok(n as f32),
+            _ => Err(mlua::Error::runtime(format!(
+                "`scrollbar.{key}` takes a number, 0 or more"
+            ))),
+        }
+    };
+    let flag = |key: &str, value: mlua::Value| -> mlua::Result<bool> {
+        match value {
+            mlua::Value::Boolean(on) => Ok(on),
+            _ => Err(mlua::Error::runtime(format!(
+                "`scrollbar.{key}` takes true or false"
+            ))),
+        }
+    };
+    let live = |key: &str, value: mlua::Value| -> mlua::Result<mlua::Value> {
+        match &value {
+            mlua::Value::Function(_) => Ok(value),
+            _ if state_of(&value).is_some() => Ok(value),
+            _ => Err(mlua::Error::runtime(format!(
+                "`scrollbar.{key}` takes a state or a function"
+            ))),
+        }
+    };
+    let choice = |key: &str, value: &mlua::Value, of: &[&str]| -> mlua::Result<usize> {
+        let at = value.as_string().and_then(|s| {
+            s.to_str()
+                .ok()
+                .and_then(|s| of.iter().position(|o| *o == &*s))
+        });
+        at.ok_or_else(|| {
+            mlua::Error::runtime(format!(
+                "`scrollbar.{key}` takes {}",
+                of.iter()
+                    .map(|o| format!("\"{o}\""))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ))
+        })
+    };
+    let millis = |n: f32| Duration::from_secs_f64(n as f64 / 1000.);
+    for pair in table.pairs::<String, mlua::Value>() {
+        let (key, value) = pair?;
+        let style = &mut spec.style;
+        match key.as_str() {
+            "platform" => style.platform = Some(flag(&key, value)?),
+            "thickness" => style.thickness = Some(number(&key, value)?),
+            "active_thickness" => style.active_thickness = Some(number(&key, value)?),
+            "strip" => style.strip = Some(number(&key, value)?),
+            "side" => style.side = Some(number(&key, value)?),
+            "ends" => style.ends = Some(number(&key, value)?),
+            "inset" => style.inset = Some(number(&key, value)?),
+            "min" => style.min_thumb = Some(number(&key, value)?),
+            "linger" => style.linger = Some(millis(number(&key, value)?)),
+            "fade" => style.fade = Some(millis(number(&key, value)?)),
+            "fade_in" => style.fade_in = Some(flag(&key, value)?),
+            "ease" => {
+                use zgx::compose::ScrollbarEase::*;
+                style.ease = Some(
+                    [Linear, OutQuad, OutCubic]
+                        [choice(&key, &value, &["linear", "outQuad", "outCubic"])?],
+                )
+            }
+            "active_color" => style.active_color = Some(flag(&key, value)?),
+            "track_fill" => style.track_fill = Some(flag(&key, value)?),
+            "press" => style.press_jumps = Some(choice(&key, &value, &["page", "jump"])? == 1),
+            "linger_from" => {
+                style.linger_from_scroll = Some(choice(&key, &value, &["release", "scroll"])? == 1)
+            }
+            "focusable" => style.focusable = Some(flag(&key, value)?),
+            "always_overlay" => style.always_overlay = Some(flag(&key, value)?),
+            "accessible" => style.accessible = Some(flag(&key, value)?),
+            "track" => spec.track = Some(live(&key, value)?),
+            "hint" => spec.hint = Some(live(&key, value)?),
+            _ => {
+                return Err(mlua::Error::runtime(format!("`scrollbar` has no `{key}`")));
+            }
+        }
+    }
+    Ok(Some(Box::new(spec)))
+}
+impl ScrollbarSpec {
+    /// Its style for a view, `track` and `hint` read through `vm` (each in
+    /// an effect of its own, which follows what it reads).
+    pub(crate) fn style(&self, vm: &Rc<crate::Vm>) -> zgx::compose::ScrollbarStyle {
+        let mut style = self.style.clone();
+        fn now(vm: &crate::Vm, source: &mlua::Value) -> mlua::Result<mlua::Value> {
+            match source {
+                mlua::Value::Function(f) => vm.call::<mlua::Value>(f, ()),
+                other => match state_of(other) {
+                    Some(state) => mlua::IntoLua::into_lua(state.get(), &vm.lua),
+                    None => Ok(other.clone()),
+                },
+            }
+        }
+        if let Some(source) = self.track.clone() {
+            let vm = vm.clone();
+            style.track = Some(Rc::new(move || match now(&vm, &source) {
+                Ok(mlua::Value::Number(n)) => n as f32,
+                Ok(mlua::Value::Integer(n)) => n as f32,
+                Ok(_) => {
+                    vm.report(mlua::Error::runtime("`scrollbar.track` says a number"));
+                    0.
+                }
+                Err(error) => {
+                    vm.report(error);
+                    0.
+                }
+            }));
+        }
+        if let Some(source) = self.hint.clone() {
+            let vm = vm.clone();
+            style.hint = Some(Rc::new(move || match now(&vm, &source) {
+                Ok(value) => value.as_boolean().unwrap_or(false),
+                Err(error) => {
+                    vm.report(error);
+                    false
+                }
+            }));
+        }
+        style
+    }
+}
 /// What `scroll_padding` keeps clear: as given, or what a state or a
 /// function says now (`scroll_padding_now`).
 #[derive(Clone)]
@@ -6815,8 +7537,9 @@ fn scroll_padding(lua: &Lua, value: mlua::Value) -> mlua::Result<zgx::scene::Ins
 mod tests {
     /// The constructors' own fields are matched before style properties
     /// (`fill_from`), so a name in both is the constructor's: `size` is the
-    /// one. A new field named like a style property fails here until it is
-    /// given a meaning on purpose.
+    /// one, a style property on a box alone (`Kind::takes_size`). A new field
+    /// named like a style property fails here until it is given a meaning on
+    /// purpose.
     #[test]
     fn constructor_fields_named_like_style_properties_keep_their_meaning() {
         use super::{Kind, LATE_FIELDS, Node, Prop, WIDGET_FIELDS, fill_from};
@@ -6836,13 +7559,18 @@ mod tests {
             .load("return { size = { 10, 20 }, w = 30 }")
             .eval()
             .unwrap();
-        let mut node = Node::new(Default::default(), Kind::Div);
-        fill_from(&lua, &mut node, &table, None, crate::DesignLint::Off).unwrap();
-        let props: Vec<_> = node.props.iter().map(|(prop, _)| prop.name()).collect();
+        let filled = |kind| {
+            let mut node = Node::new(Default::default(), kind);
+            fill_from(&lua, &mut node, &table, None, crate::DesignLint::Off).unwrap();
+            let mut props: Vec<_> = node.props.iter().map(|(prop, _)| prop.name()).collect();
+            props.sort();
+            props
+        };
+        assert_eq!(filled(Kind::Div), ["size", "w"], "size is a box's");
         assert_eq!(
-            props,
+            filled(Kind::Button),
             ["w"],
-            "size is the constructor's, not a style property"
+            "size is no style property on anything else"
         );
     }
 

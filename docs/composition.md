@@ -246,7 +246,9 @@ contrast makes `border.subtle` and `border` as strong as `text.secondary`,
 `border.strong` as `text.primary`, and `text.tertiary` as `text.secondary`.
 Reduce transparency makes `glass.tint` the raised surface and `glass.blur` zero,
 and any view with a backdrop blur paints its background opaque without the blur
-(a clear one gets the raised surface). The host follows changes as they happen
+(a clear one gets the raised surface). On X11 with no compositor zgx reports it
+too, as nothing can show through a window there, re-read as a window is
+activated. The host follows changes as they happen
 (`NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`). Windows reports
 its animation and contrast settings with the tokens it already sets.
 
@@ -709,10 +711,10 @@ Trackpads' pixel deltas pass as they are.
 
 `Ui::set_elastic_scrolling(true)`, which the macOS host turns on, gives scroll views
 macOS's and Safari's rubber band. A trackpad gesture pushed past an edge stretches
-the view: its content moves on, ever less for each further pixel (AppKit's curve),
+the view: its content moves on a twentieth of the push, in a straight line (AppKit's),
 while the offset an app reads stays in range. Pulling back unwinds the stretch
-before the content scrolls, and lifting the fingers springs it back, critically
-damped, in about 0.4 s. A flick's momentum that reaches an edge bounces. It
+before the content scrolls, as far as the hand moves, and lifting the fingers springs
+it back in about 0.4 s. A flick's momentum that reaches an edge bounces. It
 stretches the view the gesture is latched to; otherwise, as a page bounces rather
 than a box in it, the outermost view under the pointer that scrolls along that
 axis. The host reports the gesture's phases as `InputEvent::ScrollGesture`. A mouse
@@ -745,8 +747,15 @@ ui.mount(scroll_x(offset).w(320.).h(100.).p(8.)
     .children((0..8).map(|n| button().w(100.).h(70.).child(text(format!("Card {n}"))))));
 ```
 
-Horizontal viewports consume finite horizontal wheel deltas; vertical-only wheel
-input bubbles to an enclosing vertical scroller. Accessibility scroll actions use
+Horizontal viewports take the whole of a swipe that moves mostly sideways, its
+drift down included; of one that moves mostly down they take what's sideways and
+the rest bubbles to an enclosing vertical scroller. A gesture stays with the view
+it latched to, its drift included, until a pause or a clear turn to the other
+axis. `.wheel_across()` lets a mouse wheel, which has no sideways axis, move one
+too: with Shift always (never the page), and without once the pointer has been
+moved onto it, going on to the views around it after a pause at its edge. A viewport that slid
+under a resting pointer leaves the wheel to the page, and a swipe mostly down
+leaves it still. Accessibility scroll actions use
 the viewport's declared axis. Focus reveal follows that same axis, including
 mixed horizontal/vertical nesting and batched focus requests. Both scroll variants
 retain offscreen children and apply offset changes through translation without

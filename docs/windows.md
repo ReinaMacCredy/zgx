@@ -210,20 +210,35 @@ corners, shadows' shading), text, clip regions with their rounded corners
 and fades, kept frames, scroll copies, and isolated layers (translucent,
 nested, transformed), each drawn into a texture of its own and composited,
 images the CPU writes (pictures, gradients, canvases' and SVGs' images),
-and canvases' polyline strokes and filled areas. Images a GPU view draws,
-layer effects, backdrop blur and shader fills are not drawn yet (so
-neither are what they make: `radial`
-gradients, blurred inset shadows, masks, blends, content blur, and
-`hue_rotate`, `sepia` and `invert`, layer shaders): a frame
-needing one fails with an error naming it (and panics in a debug build),
-since there is no Direct3D 12 to fall back to. What it draws is Direct3D 12's
+and canvases' polyline strokes and filled areas, and shader fills and
+layer shaders that don't read the backdrop (`radial` gradients, `hue_rotate`,
+`sepia` and `invert`, and zgx-fx's fills and layer effects among them), each
+one's pixel stage compiled by FXC off the frame as Direct3D 12's is, in a
+process of its own, images drawn dithered or as characters
+(image_effects.wgsl's pixel stage, made when one first draws), and layer
+effects: blend modes (over a copy of the target under the layer, as on
+Direct3D 12), content blurs, masks and drop shadows, their passes drawn into the effect atlas with effects.wgsl as on
+Direct3D 12. What it doesn't draw yet, it leaves out where what's
+left can't show a picture a user would wrongly trust, naming each kind once
+on stderr: images a GPU view draws are left
+empty; a backdrop blur, or a layer shader reading the backdrop (glass),
+draws its box opaque in its own colour, as the system's Reduce transparency
+draws glass, so what's over it stays legible. The rest fails the frame
+with an error naming it (and panics in a debug build), since there is no
+Direct3D 12 to fall back to: a backdrop over a box with no colour of its
+own. What it draws (all but the opaque boxes) is Direct3D 12's
 frame byte for byte (`tests/d3d11_parity.rs`, at 1×, 1.5× and 2×). Both run
 the same HLSL compiled by FXC: Direct3D 11 ahead of time (`dxbc/`, written
 again by `python scripts/d3d11_shaders.py`, on Windows), and zgx
 pins wgpu's Direct3D 12 to FXC too. Left to choose, wgpu takes DXC wherever
 dxcompiler.dll is on PATH (a developer shell with the Windows SDK), and DXC's
 code rounds antialiased edges a level apart from FXC's.
-`WGPU_DX12_COMPILER=dxc` still picks it.
+`WGPU_DX12_COMPILER=dxc` still picks it. An app's shaders reach the two APIs
+as different bytecode (Direct3D 12's through wgpu's sampler heap): WARP draws
+them alike to the byte, while a hardware driver may round a value on a
+half-step one level apart, as an RTX 4090 does for three bytes of fire and
+liquid metal. The test allows that, on hardware alone, in up to four bytes of
+a frame of app shaders, and prints each one.
 
 What it trades, measured with the Windows suite on an RTX 4090
 ([results](results/d3d11-proof-windows-2026-10-27/)):
@@ -244,7 +259,11 @@ These are NVIDIA's numbers; AMD's and Intel's drivers have not been measured.
 wgpu runs on Direct3D 12 alone (`WGPU_BACKEND` still overrides, among the
 backends built in). Every Windows 10 and 11 machine has a Direct3D 12
 adapter: where the GPU's driver has no Direct3D 12, Windows' WARP renders in
-software. GPUs that old (Intel before Skylake, AMD before GCN, NVIDIA before
+software. `WGPU_FORCE_FALLBACK_ADAPTER=1` takes WARP even beside a GPU, for
+Direct3D 12 and 11 alike, as CI's runners draw: to run the software lines
+or bless a `warp` family of goldens on a machine with a GPU. It is for
+Windows (WARP) and Linux (a software Vulkan driver); macOS has no software
+Metal adapter, so there the renderer fails to start with it. GPUs that old (Intel before Skylake, AMD before GCN, NVIDIA before
 Kepler) have no Windows Vulkan driver either, so Vulkan is a feature
 (`vulkan`, on zgx-desktop, zgx-script or zgx-gpu), off by default, for a
 driver whose Direct3D 12 fails: with it, Vulkan stands in where Direct3D 12
@@ -425,7 +444,21 @@ Windows present through a DirectComposition visual, so `WindowOptions::transpare
 windows are transparent where zgx paints nothing, and `WindowOptions::glass`
 puts the Windows 11 system backdrop behind them: Acrylic for the heads-up and
 transient materials, Mica for window and page backgrounds, Mica Alt for title
-bars (see [window controls](window-controls.md)). Presentation through the visual
+bars (see [window controls](window-controls.md)). `Glass::plain` has no system
+backdrop: it is the acrylic blur of what is behind the window, untinted (the
+window's accent, `SetWindowCompositionAttribute`'s
+`ACCENT_ENABLE_ACRYLICBLURBEHIND` with a tint of alpha 1), as gpui's
+`WindowBackgroundAppearance::Blurred` is, for apps laying their own tint over
+it; Windows 10 1809 and later. It is not a pure blur: its luminosity pass lets about 83% of what
+is behind through and adds 8 (831 thousandths and 8, measured over flat black, grey and
+white, whatever the accent's state or tint), so a scrim laid over it reads darker over
+something bright than over macOS's material; `WindowCapabilities::blur_pass` and
+`blur_lift` say so, for an app to solve a scrim that comes out as macOS's would. Its frame is not extended under the client
+(as gpui's is not): DWM would draw the frame over the blur. Mica tints with
+the wallpaper alone and blurs nothing behind the window. With Transparency effects off
+Windows stops that blur and shows the accent's black tint, so plain glass then
+takes its material's backdrop, which goes solid, and follows the setting as it
+changes. Presentation through the visual
 measured the same as a window's own swap chain: every frame shown, the same
 keystroke latency and idle cost. Only transparent and glass windows present
 with alpha: an opaque window's swap chain is opaque from the start
@@ -451,7 +484,13 @@ are: `text.secondary` at rest, `text.primary` under the pointer and
 `pressed`, with Close's red and white glyph kept (in a contrast theme, the
 highlight's own text under the pointer). So they follow the app's light
 or dark, not the system's, from the window's root theme: a `theme` scoped over
-an app's title bar alone doesn't reach them. Their line is an outline icon's
+an app's title bar alone doesn't reach them. A theme inks them apart from the
+rest through their own tokens, which default to those: `caption.text`,
+`caption.text.hover` (under the pointer and pressed), `caption.text.inactive`,
+`caption.hover` and `caption.pressed`, and for Close `caption.close`,
+`caption.close.pressed`, `caption.close.text` and `caption.close.text.pressed`
+(`#c42b1c`, `#c42b1ce6` and white by default). In a contrast theme the system's
+colours stand in for all but Close's, whatever a theme sets. Their line is an outline icon's
 weight (1.75 at 24 points, drawn at 16), in whole pixels: 1 at 100% and 125%, 2
 at 150% to 200%. `scripts/windows_caption_smoke.py` checks all of it in a real
 window at 100% and 150% zoom, light and dark.
@@ -482,19 +521,34 @@ title bar is pressed, on Escape and on a press outside it.
 A menu or popover that is one rounded panel gets DWM's rounded corners, rim
 and shadow, as Windows 11 frames its menus.
 
-Known gap: menus and popovers keep the theme's flat background, where Windows
-11's own menus are acrylic. DWM draws a system backdrop
-(`DWMSBT_TRANSIENTWINDOW`) only behind an activated window, and a flat colour
-behind one never activated; a popup must not take activation from its window,
-which keeps the keyboard. The undocumented `SetWindowCompositionAttribute`
-acrylic is not used.
+On Windows 11 a popup whose panel is translucent (a menu's tint) is acrylic,
+as Windows 11's own menus are: its window has the accent plain glass has
+(`SetWindowCompositionAttribute`'s `ACCENT_ENABLE_ACRYLICBLURBEHIND`, its
+tint of alpha 1), which blurs whatever is behind it, the app's window, other
+apps and the desktop, and the panel's tint lies over it. A system backdrop
+(`DWMSBT_TRANSIENTWINDOW`) would not do: DWM draws it only behind an activated
+window, and a flat colour behind one never activated, and a popup must not
+take activation from its window, which keeps the keyboard. The accent's blur
+fills the window, so the window is the panel's box alone, which DWM rounds
+and shadows. The panel's own shadow is not drawn (`GpuRenderer::
+set_unshadowed`): the window cut it past the panel, and zgx draws a box's
+shadow whole under it, so through the translucent fill it darkened the blur,
+by half under a menu's shadow of alpha 0.5. DWM's rim goes too (the panel
+draws its own edge). A small popup's blur takes in its window above it: over
+white, 204 where a large one far from it reads 218, as a plain window's. DWM's corners are 8 or 4 pixels at 100%, so a panel
+rounded otherwise shows a sliver of blur, or loses one, at its corners. A
+popover with an arrow, a drag preview and an opaque panel have no accent. The
+blur can't fade: through a popup's fade it shows whole. With Transparency
+effects off, or on Windows 10 (whose blur would be square past a rounded
+panel's corners), popups have none. `WindowCapabilities::popup_blur_behind`
+says whether they have it, so an app can draw its popups solid where not.
 
-A popup's `backdrop_blur` blurs the app's own pixels: what its window last drew
+Without the accent, a popup's `backdrop_blur` blurs the app's own pixels, as on Linux: what its window last drew
 under the popup, copied into a texture of the popup's size while it shows
 (`GpuRenderer::set_backdrop`), and copied and drawn again when the window
-repaints under it. Where the popup reaches past its window, or over another
-popup, there is nothing of that window's to blur and what is behind it shows
-through its fill.
+repaints under it. Where the popup reaches past its window, that window's edge
+goes on, blurred, so the glass is opaque throughout with nothing sharp through
+it. Over another popup it blurs the window, not that popup.
 
 No popup window exists before the pointer first reaches something that opens
 one, and a closed one is kept hidden for the next: an app that never opens a
@@ -766,7 +820,12 @@ runtime:
   parent until dismissed. Backend failures can appear as cancellation.
 - Rendered application menus are supported; native Win32 menu bars are not.
 - Terminals are drawn by zgx with the `terminal` feature (ConPTY; see
-  [native surfaces](native-surfaces.md#terminals)); Ghostty terminals and
+  [native surfaces](native-surfaces.md#terminals)). Their pictures (kitty
+  graphics, sixel) need Windows Terminal's ConPTY: `conpty.dll` and
+  `OpenConsole.exe` from the `Microsoft.Windows.Console.ConPTY` NuGet package
+  (MIT; tested with 1.25.260930003), shipped beside the app's executable.
+  Windows' own ConPTY drops them, and a session there announces none.
+  Ghostty terminals and
   `NativeContent::Platform` views are macOS only; web views need the
   `webview2` feature (see Web views).
 - The Linux benchmark sampler and the X11/Wayland smoke scripts do not run on
@@ -969,7 +1028,12 @@ The probes for the rest of Windows:
 - `windows_glass_smoke.py` (`glass_counter`): each glass material asks the
   compositor for its system backdrop, read back from outside the app
   (`DWMWA_SYSTEMBACKDROP_TYPE`): Acrylic for the heads-up glass, Mica for a
-  window's background, Mica Alt for a title bar's. Acrylic must also show: an
+  window's background, Mica Alt for a title bar's, none for plain glass
+  (whose blur is the window's accent, which Windows reads back to no one:
+  `GetWindowCompositionAttribute` refuses it; a unit test,
+  `plain_glass_blurs_behind_the_window_and_other_glass_takes_it_away`, sees
+  it taken).
+  Acrylic must also show: an
   empty patch of the window changes as another test window takes the
   activation (Windows draws a solid colour for an inactive window's acrylic),
   where an opaque fill would not.
@@ -1033,7 +1097,7 @@ The probes for the rest of Windows:
   stripes, read from the popup's own capture: even and brighter than its fill
   with `backdrop_blur`, only the fill without; and the CPU time of each with a
   box moving under it. `crates/zgx-gpu/tests/popup_backdrop.rs` covers the crop, the scale,
-  past the window's edge and a new frame under it.
+  the window's edge going on and a new frame under it.
 - `windows_popup_smoke.py` (`popup_probe`): no popup window before the first
   popup; a menu opens past its window's bottom edge within milliseconds of
   the click and shows on screen; hovering and clicking, or pressing the

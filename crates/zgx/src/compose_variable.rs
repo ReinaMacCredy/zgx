@@ -1,13 +1,14 @@
 //! Reactive variable-height virtualization, sharing retained component ownership.
 use super::*;
-use crate::virtual_list::{HeightError, HeightIndex};
+use crate::virtual_list::{HeightError, HeightIndex, THINNEST_ROW};
 use std::cell::Cell;
 
 /// Cloneable indexed heights with logarithmic point updates and no whole-index clones.
 ///
 /// Heights belong to positions; callers must reorder them with their data. A point
 /// update preserves the viewport's first visible index and intra-row offset.
-/// Count changes preserve/clamp the pixel offset. `variable_virtual_list` uses
+/// Count changes preserve/clamp the pixel offset, unless the list's keys find its
+/// anchor row moved (`variable_virtual_list`). `variable_virtual_list` uses
 /// supplied allocations; `measured_virtual_list` updates this cache from mounted
 /// natural content and permanently applies a one-pixel allocation floor.
 #[derive(Clone)]
@@ -15,6 +16,11 @@ pub struct VariableHeights {
     index: Rc<RefCell<HeightIndex>>,
     revision: Signal<u64>,
     end: Rc<Cell<bool>>,
+    /// Bumped as rows may have become other rows (not as they resize): a
+    /// list's rows kept out of view find their places again.
+    structure: Rc<Cell<u64>>,
+    /// A list over it keeps rows (`crate::spare`).
+    keeps: Rc<Cell<bool>>,
 }
 impl VariableHeights {
     /// `count` rows, each `estimate` tall until measured. Panics if `estimate`
@@ -29,6 +35,8 @@ impl VariableHeights {
             index: Rc::new(RefCell::new(HeightIndex::try_new(count, estimate)?)),
             revision: runtime.signal(0),
             end: Default::default(),
+            structure: Default::default(),
+            keeps: Default::default(),
         })
     }
     /// Keep a viewport resting at the end there through height and count
@@ -38,6 +46,19 @@ impl VariableHeights {
     pub fn anchor_end(self) -> Self {
         self.end.set(true);
         self
+    }
+    /// Update many heights, passing once.
+    pub fn set_heights(&self, rows: &[(usize, f32)]) {
+        let mut changed = false;
+        {
+            let mut index = self.index.borrow_mut();
+            for (row, height) in rows {
+                changed |= index.set_height(*row, *height).unwrap_or(false);
+            }
+        }
+        if changed {
+            self.changed();
+        }
     }
     fn changed(&self) {
         self.revision
@@ -57,6 +78,7 @@ impl VariableHeights {
     pub fn resize(&self, count: usize) -> Result<bool, HeightError> {
         let changed = self.index.borrow_mut().resize(count)?;
         if changed {
+            self.structure.set(self.structure.get().wrapping_add(1));
             self.changed();
         }
         Ok(changed)
@@ -65,6 +87,7 @@ impl VariableHeights {
     /// reordered wholesale.
     pub fn replace(&self, heights: impl IntoIterator<Item = f32>) -> Result<(), HeightError> {
         self.index.borrow_mut().replace(heights)?;
+        self.structure.set(self.structure.get().wrapping_add(1));
         self.changed();
         Ok(())
     }
@@ -114,8 +137,10 @@ struct Anchor {
 /// Rows take their allocated height from `heights`; child constructors run once
 /// per mounted key. Point height updates keep the first visible index anchored,
 /// unless the caller also changes `offset`. Keys are unique among mounted rows.
-/// Reordering data must also reorder its indexed heights; it does not relocate
-/// the viewport by key. Persistent offscreen row state belongs in the model.
+/// Reordering data must also reorder its indexed heights. Rows added or removed
+/// above the first visible row keep it where it shows when its key is found as
+/// many rows on (CSS's scroll anchoring); resting at the top, nothing anchors.
+/// Persistent offscreen row state belongs in the model.
 pub fn variable_virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
     offset: Signal<f32>,
     heights: VariableHeights,
@@ -123,7 +148,7 @@ pub fn variable_virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
     key: impl FnMut(usize) -> K + 'static,
     build: impl FnMut(Signal<usize>, K, &mut Context) -> View + 'static,
 ) -> View {
-    variable_list(offset, heights, overscan, key, build, false)
+    variable_list(NoWatch, offset, heights, overscan, key, build, false)
 }
 
 /// Virtualize naturally sized rows, updating a positional height estimate cache.
@@ -143,7 +168,7 @@ pub fn measured_virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
     key: impl FnMut(usize) -> K + 'static,
     build: impl FnMut(Signal<usize>, K, &mut Context) -> View + 'static,
 ) -> View {
-    variable_list(offset, heights, overscan, key, build, true)
+    variable_list(NoWatch, offset, heights, overscan, key, build, true)
 }
 /// Virtualize keyed rows of natural height, keeping each row's height by key.
 ///
@@ -156,6 +181,59 @@ pub fn measured_virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
 /// insertion and removal by key. Configure end anchoring and the default
 /// height on `heights`; mounted rows follow the `measured_virtual_list` rules.
 pub fn measured_rows<K: Eq + std::hash::Hash + Clone + 'static>(
+    offset: Signal<f32>,
+    heights: VariableHeights,
+    overscan: usize,
+    rows: impl FnMut() -> Vec<K> + 'static,
+    estimate: impl FnMut(&[K], usize) -> f32 + 'static,
+    build: impl FnMut(Signal<usize>, K, &mut Context) -> View + 'static,
+) -> View {
+    rows_of(NoWatch, offset, heights, overscan, rows, estimate, build)
+}
+/// `measured_rows`, with `watch` told of each pass of the list.
+pub fn measured_rows_watched<K: Eq + std::hash::Hash + Clone + 'static>(
+    watch: Rc<dyn RowsWatch>,
+    offset: Signal<f32>,
+    heights: VariableHeights,
+    overscan: usize,
+    rows: impl FnMut() -> Vec<K> + 'static,
+    estimate: impl FnMut(&[K], usize) -> f32 + 'static,
+    build: impl FnMut(Signal<usize>, K, &mut Context) -> View + 'static,
+) -> View {
+    rows_of(
+        Watched(watch),
+        offset,
+        heights,
+        overscan,
+        rows,
+        estimate,
+        build,
+    )
+}
+/// The keys of `entries`' rows that hold the node a drag under way (or
+/// starting) started from.
+fn dragged_rows<K: Clone>(
+    ui: &Ui,
+    entries: &HashMap<K, Entry, rustc_hash::FxBuildHasher>,
+) -> Vec<K> {
+    let Some(source) = ui.input.drag_source() else {
+        return Vec::new();
+    };
+    let scene = ui.scene.borrow();
+    if !scene.contains(source) {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|(_, entry)| {
+            entry.node == source || scene.ancestors(source).any(|a| a == entry.node)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn rows_of<K: Eq + std::hash::Hash + Clone + 'static, W: WatchKind>(
+    watch: W,
     offset: Signal<f32>,
     heights: VariableHeights,
     overscan: usize,
@@ -250,6 +328,10 @@ pub fn measured_rows<K: Eq + std::hash::Hash + Clone + 'static>(
                 runtime.untracked(|| {
                     let default = heights.index.borrow().estimate();
                     let old = described.replace(current.clone());
+                    // The same rows (a keyed list's data written in place):
+                    // those kept out of view are where they were.
+                    let same =
+                        (heights.keeps.get() && old == current).then(|| heights.structure.get());
                     let known: HashMap<&K, f32> = {
                         let index = heights.index.borrow();
                         old.iter()
@@ -268,6 +350,9 @@ pub fn measured_rows<K: Eq + std::hash::Hash + Clone + 'static>(
                         })
                         .collect();
                     heights.replace(rows).expect("finite heights");
+                    if let Some(structure) = same {
+                        heights.structure.set(structure);
+                    }
                     {
                         let mut positions = positions.borrow_mut();
                         positions.clear();
@@ -282,10 +367,50 @@ pub fn measured_rows<K: Eq + std::hash::Hash + Clone + 'static>(
             cx.retain(effect);
         }
         let key = move |index: usize| described.borrow()[index].clone();
-        measured_virtual_list(offset, heights, overscan, key, move |index, key, cx| {
-            build(index, key, cx)
-        })
+        variable_list(
+            watch,
+            offset,
+            heights,
+            overscan,
+            key,
+            move |index, key, cx| build(index, key, cx),
+            true,
+        )
     })
+}
+/// Rows added or removed above a list's anchor row (`previous`), `length`
+/// rows now: where the row it showed is, as many rows on, if its key is
+/// there. A list that keeps its place (`on_start`) knows the row's key
+/// (`kept`); any other finds it among the rows its last pass showed, as
+/// CSS's scroll anchoring does. At the top nothing anchors, and what comes
+/// in above shows (a feed's newest). Rows by place have their index as key,
+/// which a change of count moves. Out of the pass's way: only a change of
+/// count gets here, and a list nothing is added to pays the comparison
+/// alone.
+#[cold]
+#[inline(never)]
+fn anchor_moved<K: Eq + Clone>(
+    previous: &Anchor,
+    length: usize,
+    kept: Option<&Option<K>>,
+    entries: &HashMap<K, Entry, rustc_hash::FxBuildHasher>,
+    key: &mut impl FnMut(usize) -> K,
+) -> Option<usize> {
+    let shifted = previous.index as i64 + length as i64 - previous.length as i64;
+    if !(0..length as i64).contains(&shifted) {
+        return None;
+    }
+    let shown = match kept {
+        Some(kept) => kept.clone(),
+        None if previous.position > 0. => entries
+            .iter()
+            .find(|(_, entry)| entry.index.with_untracked(|index| *index) == previous.index)
+            .map(|(key, _)| key.clone()),
+        None => None,
+    };
+    shown
+        .is_some_and(|shown| shown == key(shifted as usize))
+        .then_some(shifted as usize)
 }
 struct Entry {
     node: NodeId,
@@ -312,7 +437,91 @@ fn row_style(width: f32, height: f32, measured: bool) -> crate::scene::Style {
         }
     }
 }
-fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
+/// Told of each pass of a measured list: its width, and which rows are
+/// mounted. It may give rows out of view heights (`VariableHeights::set_heights`).
+pub trait RowsWatch {
+    /// A pass of the list at `width`.
+    fn pass(&self, width: f32, mounted: &mut dyn Iterator<Item = usize>);
+}
+/// A list's watch, as a type: one with none has none of this in its code.
+trait WatchKind: 'static {
+    const ON: bool;
+    fn pass<K>(&self, width: f32, entries: &HashMap<K, Entry, rustc_hash::FxBuildHasher>);
+}
+struct NoWatch;
+impl WatchKind for NoWatch {
+    const ON: bool = false;
+    fn pass<K>(&self, _: f32, _: &HashMap<K, Entry, rustc_hash::FxBuildHasher>) {}
+}
+struct Watched(Rc<dyn RowsWatch>);
+impl WatchKind for Watched {
+    const ON: bool = true;
+    fn pass<K>(&self, width: f32, entries: &HashMap<K, Entry, rustc_hash::FxBuildHasher>) {
+        let mut mounted = entries
+            .values()
+            .map(|entry| entry.index.with_untracked(|i| *i));
+        self.0.pass(width, &mut mounted);
+    }
+}
+/// What a measured list's pass read of its own inputs (`variable_list`):
+/// the same as its last full run's, and no row of its own resized, a run
+/// woken by sizes published elsewhere does nothing.
+#[derive(Clone, Copy, PartialEq)]
+struct PassInputs {
+    revision: u64,
+    mounted: u64,
+    size: (u32, u32),
+    requested: u32,
+    request: Option<(u64, usize)>,
+    reveal: u64,
+}
+/// `keys`, with what spare time adds (`crate::spare`).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn merge_kept<K: Eq + std::hash::Hash + Clone>(
+    kept: &mut crate::spare::Kept<K>,
+    keys: &mut Vec<(K, usize, f32, f32)>,
+    weak: &crate::widgets::WeakUi,
+    heights: &VariableHeights,
+    entries: &HashMap<K, Entry, rustc_hash::FxBuildHasher>,
+    key: &mut dyn FnMut(usize) -> K,
+    view: crate::spare::KeptView,
+    measured: bool,
+    runtime: &Runtime,
+) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    kept.pass();
+    let shown = keys.iter().map(|(key, index, ..)| (key.clone(), *index));
+    let shown = shown.collect();
+    let index = &heights.index;
+    let rows = runtime.untracked(|| {
+        kept.merge(
+            &ui,
+            view,
+            shown,
+            key,
+            &|y| index.borrow().row_at(y),
+            &|row| {
+                measured
+                    || index
+                        .borrow()
+                        .row_height(row)
+                        .is_some_and(|height| height >= THINNEST_ROW)
+            },
+            &|key| entries.get(key).map(|entry| entry.node),
+        )
+    });
+    let model = index.borrow();
+    keys.clear();
+    keys.extend(rows.into_iter().map(|(key, row)| {
+        let height = model.row_height(row).unwrap_or(1.);
+        (key, row, model.row_offset(row), height)
+    }));
+}
+fn variable_list<K: Eq + std::hash::Hash + Clone + 'static, W: WatchKind>(
+    watch: W,
     offset: Signal<f32>,
     heights: VariableHeights,
     overscan: usize,
@@ -321,13 +530,14 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
     measured: bool,
 ) -> View {
     let rows = RowSource::new(key, build);
-    let text = rows.text({
+    let source = rows.rows({
         let heights = heights.clone();
-        move || heights.index.try_borrow().map_or(0, |index| index.count())
+        move || heights.index.try_borrow().ok().map(|index| index.count())
     });
     let (mut key, mut build, mounted_in) = (rows.key(), rows.build(), rows.mounted_in.clone());
     View::new(Kind::VirtualList(Box::new(
         move |ui, root, environment, options: crate::compose::ListOptions| {
+            let ahead = options.ahead();
             let crate::compose::ListOptions {
                 scrollbar,
                 keyboard_navigation,
@@ -446,6 +656,14 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
             let mut run = 0_u64;
             let mut order = Vec::new();
             let mounted_revision = ui.signal(0_u64);
+            // With spare time its overscan is spare time's too: the frame
+            // builds what shows alone. (Its turn wakes the pass by this.)
+            let mut kept = ui
+                .list_ahead(ahead, mounted_revision.clone())
+                .map(|ahead| crate::spare::Kept::new(ahead, overscan));
+            heights.keeps.set(kept.is_some());
+            let overscan = if kept.is_some() { 0 } else { overscan };
+            let published = measured.then(|| ui.content_size_revision());
             let mut discovery: Option<(usize, usize, usize)> = None;
             let mut handled_request = 0;
             // Scroll-to-row requests (`NodeHandle::scroll_to_row`).
@@ -454,8 +672,15 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 ui,
                 root,
                 std::rc::Rc::new(move |y: f32| rows.index.borrow().row_at(y + 0.5)),
+                // Rows of their own heights: a line is the one rows are
+                // taken to have until measured.
+                heights.index.borrow().estimate(),
             );
             let mut handled_reveal = 0;
+            // The pass's inputs as its last full run read them: a run woken
+            // by rows' sizes published elsewhere, with these the same and no
+            // row of its own resized, has nothing to do (`Ui::content_size_revision`).
+            let mut last_inputs: Option<PassInputs> = None;
             // A destination followed through measurement: the row, where it
             // shows, the position it was put at, the focus then, and whether
             // focus goes with it (the keyboard's, not a scroll's).
@@ -468,9 +693,20 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
             let mut anchor_key: Option<K> = None;
             ui.bind(root, move || {
                 heights.revision.get();
-                mounted_revision.get();
+                let mounted = mounted_revision.get();
+                // Rows' sizes, as any is published resized: one read, not one
+                // a row (`Ui::content_size_revision`).
+                if let Some(published) = &published {
+                    published.get();
+                }
                 let (width, mut height) = size.get();
                 let requested = offset.get();
+                // Read here, before any return, so that the pass stays
+                // subscribed to them.
+                let request = navigation
+                    .as_ref()
+                    .map(|navigation| navigation.request.get());
+                let (serial, row, align) = reveal.get();
                 let mut pending_measurement = false;
                 let mut measurement_changed = false;
                 if measured {
@@ -478,9 +714,14 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                     // batched layout publication produces one measurement pass.
                     let mut updates = Vec::new();
                     for (entry_key, entry) in &entries {
-                        let index = entry.index.get();
-                        let (observed_width, observed_height) =
-                            entry.measurement.as_ref().unwrap().get();
+                        // (This pass alone writes it, and goes round again when
+                        // it does: `reindexed`.)
+                        let index = entry.index.with_untracked(|index| *index);
+                        let (observed_width, observed_height) = entry
+                            .measurement
+                            .as_ref()
+                            .unwrap()
+                            .with_untracked(|size| *size);
                         if observed_width != width || width <= 0. || !observed_height.is_finite() {
                             pending_measurement = true;
                             continue;
@@ -505,21 +746,48 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                         heights.changed();
                     }
                 }
+                if W::ON {
+                    runtime.untracked(|| watch.pass(width, &entries));
+                }
                 let revision = heights.revision.get();
+                let inputs = PassInputs {
+                    revision,
+                    mounted,
+                    size: (width.to_bits(), height.to_bits()),
+                    requested: requested.to_bits(),
+                    request,
+                    reveal: serial,
+                };
+                if measured
+                    && !W::ON
+                    && window.is_none()
+                    && pending_reveal.is_none()
+                    && !pending_measurement
+                    && !measurement_changed
+                    && last_inputs == Some(inputs)
+                {
+                    return;
+                }
+                last_inputs = Some(inputs);
                 // Rows added or removed above the anchor row: it is as many
                 // rows on, and the view stays on it if its key is there
                 // (asked before the index is borrowed: `key` is the app's).
-                let moved = match (&anchor, &anchor_key) {
-                    (Some(previous), Some(anchor_key))
+                let moved = match &anchor {
+                    Some(previous)
                         if previous.revision != revision && requested == previous.position =>
                     {
                         let length = heights.index.borrow().count();
-                        let shifted =
-                            previous.index as i64 + length as i64 - previous.length as i64;
-                        (length != previous.length
-                            && (0..length as i64).contains(&shifted)
-                            && *anchor_key == key(shifted as usize))
-                        .then_some(shifted as usize)
+                        if length == previous.length {
+                            None
+                        } else {
+                            anchor_moved(
+                                previous,
+                                length,
+                                keeps_place.then_some(&anchor_key),
+                                &entries,
+                                &mut key,
+                            )
+                        }
                     }
                     _ => None,
                 };
@@ -531,13 +799,9 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                                 .is_some_and(|ui| ui.input.focused() == *focus)
                     })
                     .map(|(index, align, _, _, keys)| (index, align, keys));
-                let request = navigation
-                    .as_ref()
-                    .map(|navigation| navigation.request.get());
-                let (serial, row, align) = reveal.get();
                 let asked = (serial != handled_reveal).then_some((row, align, false));
                 handled_reveal = serial;
-                let (length, total, position, target, geometry, next_anchor) = {
+                let (length, total, position, target, geometry, dragged, next_anchor) = {
                     let model = heights.index.borrow();
                     let length = model.count();
                     let total = model.content_height();
@@ -658,7 +922,27 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                     } else {
                         discovery = None;
                     }
-                    let geometry: Vec<_> = model.rows(range).collect();
+                    // Measured, a row must be built to know its height. Given
+                    // it, one too thin to show isn't: rows folded away would
+                    // otherwise all fit in the view, and all be built.
+                    let mut geometry: Vec<_> = model.rows(range).collect();
+                    // (During a drag, the thin rows wait for their keys,
+                    // below: the dragged row's is kept.)
+                    let thin = !measured && model.may_have_thin_rows();
+                    // A row a drag started from stays built, thin or not: a
+                    // list's dragged row often folds its place away while
+                    // held, and dropped, it is the same node (its focus, hover
+                    // and accessible element with it). Only where a row can be
+                    // too thin to build: a list with none pays nothing for it.
+                    let dragged = if thin {
+                        weak.upgrade()
+                            .map_or_else(Vec::new, |ui| dragged_rows(&ui, &entries))
+                    } else {
+                        Vec::new()
+                    };
+                    if thin && dragged.is_empty() {
+                        geometry.retain(|(_, _, row_height)| *row_height >= THINNEST_ROW);
+                    }
                     // An empty list keeps whether it is at its end (it is):
                     // its first rows then follow the end as later ones do.
                     let next_anchor = match first {
@@ -680,13 +964,50 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                         }),
                         None => None,
                     };
-                    (length, total, position, target, geometry, next_anchor)
+                    (
+                        length,
+                        total,
+                        position,
+                        target,
+                        geometry,
+                        dragged,
+                        next_anchor,
+                    )
                 };
                 // Release the index borrow before application key/build callbacks.
-                let keys: Vec<_> = geometry
+                let mut keys: Vec<_> = geometry
                     .into_iter()
                     .map(|(index, top, row_height)| (key(index), index, top, row_height))
                     .collect();
+                if !dragged.is_empty() {
+                    keys.retain(|(key, _, _, row_height)| {
+                        *row_height >= THINNEST_ROW || dragged.contains(key)
+                    });
+                }
+                if let Some(kept) = &mut kept {
+                    let settled = anchor
+                        .as_ref()
+                        .is_none_or(|anchor| anchor.revision != revision);
+                    merge_kept(
+                        kept,
+                        &mut keys,
+                        &weak,
+                        &heights,
+                        &entries,
+                        &mut key,
+                        crate::spare::KeptView {
+                            top: position,
+                            height,
+                            count: length,
+                            width,
+                            structure: heights.structure.get(),
+                            settled,
+                            focus_goes: keyboard_navigation,
+                        },
+                        measured,
+                        &runtime,
+                    );
+                }
                 // Rows kept are stamped with this run: one shown twice is a
                 // key repeated, and those left unstamped go below.
                 run += 1;
@@ -748,7 +1069,12 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                         anchor_key = (|| {
                             let first = keys.first()?.1;
                             let (key, index, ..) = keys.get(next.index.checked_sub(first)?)?;
-                            (*index == next.index).then(|| key.clone())
+                            if *index == next.index {
+                                return Some(key.clone());
+                            }
+                            // Rows too thin to build are missing from among them.
+                            let at = keys.binary_search_by_key(&next.index, |row| row.1).ok()?;
+                            Some(keys[at].0.clone())
                         })();
                     }
                 }
@@ -814,8 +1140,16 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                             false
                         }
                     });
+                    let mut reindexed = false;
                     for (key, index, ..) in &keys {
-                        entries[key].index.set(*index);
+                        let entry = &entries[key];
+                        if entry.index.with_untracked(|was| was != index) {
+                            entry.index.set(*index);
+                            reindexed = true;
+                        }
+                    }
+                    if reindexed && measured {
+                        mounted_revision.update(|value| *value = value.wrapping_add(1));
                     }
                     {
                         let mut scene = ui.scene.borrow_mut();
@@ -919,5 +1253,5 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
             });
         },
     )))
-    .row_text(text)
+    .list_rows(source)
 }

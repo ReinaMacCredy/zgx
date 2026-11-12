@@ -590,3 +590,134 @@ fn a_shadow_inside_its_clip_draws_while_its_caster_leaves() {
         assert_eq!(pixel(&p, 105, 20)[3], 0, "direct={direct}: clipped");
     }
 }
+
+#[test]
+fn a_blur_planned_in_a_frame_drawn_again_for_its_glyphs_is_drawn() {
+    let _gpu_fixture = gpu_fixture();
+    // Words larger than the glyph atlas holds at first: the frame fails, the
+    // atlas grows and the frame is drawn again. The blur it had planned must
+    // be drawn too, not left as its slot was.
+    for (direct, mut gpu) in renderers() {
+        let mut scene = scene();
+        for (i, word) in ["Quartz", "jumping", "WAXY", "zebras", "BLOCK", "vexing"]
+            .iter()
+            .enumerate()
+        {
+            let id = scene.append(
+                scene.root(),
+                NodeKind::Text {
+                    text: (*word).into(),
+                    color: Color(0, 0, 255, 255),
+                    font_size: 150.,
+                },
+                Style::default(),
+            );
+            scene.set_transform(
+                id,
+                Transform {
+                    x: (i % 2) as f32 * -60. - 20.,
+                    y: (i / 2) as f32 * 60. - 40.,
+                },
+            );
+        }
+        let square = rect(&mut scene, 80., 80., (40., 40.), RED);
+        scene.set_filter_blur(square, 4.);
+        let fonts = gpu.text_system();
+        scene.set_text_measurer(move |text: &str, size: f32, width: Option<f32>| {
+            zgx_gpu::measure_text(&mut fonts.borrow_mut(), text, size, width)
+        });
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        let first = gpu.readback().unwrap();
+        assert!(
+            pixel(&first, 100, 100)[0] > 250,
+            "direct={direct}: the blurred square isn't there: {:?}",
+            pixel(&first, 100, 100)
+        );
+        assert!(
+            pixel(&first, 75, 100)[0] > 0,
+            "direct={direct}: nor its blur"
+        );
+    }
+}
+
+/// A container of `size` at the window's corner, painted as a layer.
+fn group(scene: &mut Scene, parent: NodeId, size: (f32, f32)) -> NodeId {
+    let id = scene.append(
+        parent,
+        NodeKind::Container(Layout::Overlay),
+        Style {
+            width: Some(size.0),
+            height: Some(size.1),
+            ..Default::default()
+        },
+    );
+    scene.set_isolated(id, true);
+    id
+}
+
+#[test]
+fn a_layer_drawn_again_for_the_budget_draws_its_blurred_layers_first() {
+    let _gpu_fixture = gpu_fixture();
+    for (direct, mut gpu) in renderers() {
+        let mut scene = scene();
+        let root = scene.root();
+        // Two layers taking most of the 64 MB budget, then a third that no
+        // longer fits it: it draws again, coarser, in the room left.
+        for _ in 0..2 {
+            let large = group(&mut scene, root, (3000., 2500.));
+            scene.append(
+                large,
+                NodeKind::Rect(Color(0, 0, 40, 255)),
+                Style {
+                    width: Some(3000.),
+                    height: Some(2500.),
+                    ..Default::default()
+                },
+            );
+        }
+        let card = group(&mut scene, root, (2000., 2000.));
+        // Inside it, a blurred layer waiting on a picture, so drawn again
+        // with the card (`LayerCache::incomplete`).
+        let blurred = group(&mut scene, card, (100., 100.));
+        scene.set_transform(blurred, Transform { x: 50., y: 50. });
+        scene.append(
+            blurred,
+            NodeKind::Rect(RED),
+            Style {
+                width: Some(100.),
+                height: Some(100.),
+                ..Default::default()
+            },
+        );
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(400, 400, image::Rgba([0, 255, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let picture = zgx_gpu::assets::decode_image_kept(Arc::from(png)).unwrap();
+        scene.append(
+            blurred,
+            NodeKind::Image(picture),
+            Style {
+                width: Some(10.),
+                height: Some(10.),
+                ..Default::default()
+            },
+        );
+        scene.set_filter_blur(blurred, 4.);
+        // The card's second drawing draws its blurred layer's slot before
+        // compositing it (its first planned it, then gave it up), and no
+        // draw of a layer takes a slot planned for the card's.
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        assert!(
+            gpu.debug_cache_stats().layers_coarser > 0,
+            "direct={direct}"
+        );
+        let centre = pixel(&gpu.readback().unwrap(), 100, 100);
+        assert!(
+            centre[0] > 200 && centre[2] < 60,
+            "direct={direct}: {centre:?}"
+        );
+    }
+}

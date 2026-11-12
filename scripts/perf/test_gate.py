@@ -1,5 +1,6 @@
 """gate.py's counting: each binary warmed once, uncounted, before its first
-count, each with a cache directory of its own.
+count, each with a cache directory of its own; and which cells it explains
+by function, within its budget.
 
     python3 scripts/perf/test_gate.py -v
 """
@@ -91,6 +92,60 @@ class WorkDirTests(unittest.TestCase):
     def test_zgx_perf_dir_still_chooses_it(self):
         self.assertEqual(gate.work_dir('/home/a/gate/wt-one', {'ZGX_PERF_DIR': '/tmp/mine'}),
                          pathlib.Path('/tmp/mine'))
+
+
+
+def row(name, delta):
+    return (name, 1_000_000, 1_000_000, delta, [delta])
+
+
+class ExplainTests(unittest.TestCase):
+    def test_only_cells_past_the_floor_and_their_spread_largest_first(self):
+        rows = [row('quiet', 0.01), row('moved', 0.03), row('most', 0.5), row('shrank', -0.4),
+                row('noisy', 0.1), row('new', None)]
+        chosen = gate.worth_explaining(rows, floor=0.02, spread={'noisy': 0.2}, most=10)
+        self.assertEqual([r[0] for r in chosen], ['most', 'moved'])
+        self.assertEqual([r[0] for r in gate.worth_explaining(rows, floor=0.02, spread={}, most=1)], ['most'])
+
+    def test_explaining_stops_at_its_budget_and_says_what_it_left(self):
+        rows = [row('a', 0.5), row('b', 0.4), row('c', 0.3)]
+        scenes = {name: (name, 'zgx', 'heavy_headless', {}) for name in 'abc'}
+        times = iter([0.0, 0.0, 30.0, 700.0, 700.0])
+        with tempfile.TemporaryDirectory() as out, \
+                patch.object(gate, 'FUNCTIONS', out), \
+                patch.object(gate, 'count', side_effect=OSError('not run here')):
+            table = gate.by_function(rows, scenes, None, budget=600, clock=lambda: next(times))
+        self.assertTrue(any('(out of time)' in line and 'c' in line for line in table), table)
+
+
+
+class FairTests(unittest.TestCase):
+    def fair_counts(self, name, package):
+        asked = []
+
+        def count(binary, env, checkout=None, placement=None, out='/dev/null', fair=False):
+            asked.append(fair)
+            return 100
+
+        with patch.object(gate, 'count', side_effect=count):
+            gate.compared(name, package, {}, ('base', None), ('head', None))
+        return asked
+
+    def test_the_span_scenes_alone_are_counted_under_fair_scheduling(self):
+        self.assertEqual(self.fair_counts('spans-follow', 'zgx-script'), [True, True])
+        self.assertEqual(self.fair_counts('script-update', 'zgx-script'), [True, True])
+        self.assertEqual(self.fair_counts('list-estimate', 'zgx-script'), [False, False])
+        self.assertEqual(self.fair_counts('heavy-both', 'zgx-desktop'), [False, False])
+
+    def test_valgrind_is_asked_for_it(self):
+        with patch.object(gate, 'warm'), patch.object(gate, 'environment', return_value={}), \
+                patch.object(gate.subprocess, 'run') as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout='', stderr='I   refs: 1,000\nsame_run: ok')
+            gate.count(pathlib.Path('bench'), {}, fair=True)
+            gate.count(pathlib.Path('bench'), {})
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn('--fair-sched=yes', commands[0])
+        self.assertNotIn('--fair-sched=yes', commands[1])
 
 
 if __name__ == '__main__':

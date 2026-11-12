@@ -1,0 +1,1144 @@
+//! A composition playing inside an ordinary zgx view.
+mod common;
+use common::*;
+use serde_json::json;
+use std::time::{Duration, Instant};
+use zgx::compose::prelude::*;
+use zgx::scene::Color;
+use zgx_video::{Player, Stage, StageOptions};
+
+const SCRIPT: &str = r##"
+local video = require("@video")
+return video.compositions { video.composition {
+    id = "Bar", w = 100, h = 50, fps = 30, duration = 60, props = { color = "#ff0000" },
+    render = function(props)
+        local f = video.frame()
+        return ui.div { w_full = true, h_full = true, bg = "#000000",
+            ui.div { h = 50, w = function() return f:get() end, bg = props.color } }
+    end,
+} }
+"##;
+
+#[test]
+fn a_player_shows_its_compositions_frame_in_any_view() {
+    let dir = temp_dir("player");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 200.,
+            height: 100.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Bar", json!({ "color": "#00ff00" }), 40);
+            let view = div().w(200.).h(100.).child(player.view().w(200.).h(100.));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let player = held.unwrap();
+    // Its frames come from a thread of their own, in real time: drawn until
+    // the frame shows (as bytes, or on macOS as a pixel buffer).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut pixels = Vec::new();
+    let green = loop {
+        stage.step().unwrap();
+        stage.draw(&mut pixels).unwrap();
+        // 40 points of green bar in a 100-point frame shown 200 wide: 80 pixels.
+        let green = (0..200u32)
+            .filter(|x| pixel(&pixels, 200, *x, 50)[1] > 200 && pixel(&pixels, 200, *x, 50)[0] < 60)
+            .count();
+        if player.frame.with_untracked(|f| *f) == 40 && green > 0 {
+            break green;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no frame came: frame {}, error {:?}, green {green}, centre {:?}",
+            player.frame.with_untracked(|f| *f),
+            player.error.with_untracked(Clone::clone),
+            pixel(&pixels, 200, 100, 50)
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!((76..=84).contains(&green), "{green} green pixels");
+    assert_eq!(
+        player.composition.with_untracked(|c| c.clone()).unwrap().id,
+        "Bar"
+    );
+}
+
+#[test]
+fn a_script_plays_a_player_its_host_exposes() {
+    let dir = temp_dir("player-luau");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            let host = zgx_script::ScriptHost::inline(
+                setting.runtime,
+                "app",
+                r##"
+                local clip = ui.shared("clip", {} :: any)
+                ui.on_mount(function()
+                    ui.call("clip.listen", nil)
+                    ui.invoke("clip.open", { id = "Bar", props = {}, frame = 25 })
+                end)
+                return ui.column { w = 100, h = 50,
+                    ui.image { src = "host:clip", w = 100, h = 50, fit = "contain" } }
+                "##,
+            );
+            host.lint_strip(false);
+            player.expose(&host, "clip");
+            host.reload()?;
+            let view = host.view();
+            held = Some((player, host));
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let (_player, host) = held.unwrap();
+    let state = host.shared("clip", zgx_script::Value::Nil);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        stage.step().unwrap();
+        let frame =
+            serde_json::from_str::<serde_json::Value>(&state.with_untracked(|v| v.to_json()))
+                .unwrap()["frame"]
+                .clone();
+        if frame == json!(25) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no frame came");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    stage.step().unwrap();
+    let mut pixels = Vec::new();
+    stage.draw(&mut pixels).unwrap();
+    let red = (0..100u32)
+        .filter(|x| pixel(&pixels, 100, *x, 25)[0] > 200 && pixel(&pixels, 100, *x, 25)[1] < 60)
+        .count();
+    assert!((23..=27).contains(&red), "{red} red pixels");
+}
+
+#[test]
+fn a_stopped_player_tells_its_script_it_stopped() {
+    // Stopping sends no frame: the script hears it all the same.
+    let dir = temp_dir("player-stop");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            let host = zgx_script::ScriptHost::inline(
+                setting.runtime,
+                "app",
+                r##"
+                local cmd = ui.shared("cmd", "")
+                ui.on_mount(function()
+                    ui.call("clip.listen", nil)
+                    ui.invoke("clip.open", { id = "Bar", props = {}, frame = 0 })
+                end)
+                ui.effect(function()
+                    local c = cmd:get()
+                    if c ~= "" then ui.invoke("clip.play", c == "play") end
+                end)
+                return ui.column { w = 100, h = 50 }
+                "##,
+            );
+            host.lint_strip(false);
+            player.expose(&host, "clip");
+            host.reload()?;
+            let view = host.view();
+            held = Some((player, host));
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let (_player, host) = held.unwrap();
+    let state = host.shared("clip", zgx_script::Value::Nil);
+    let read = |key: &str| {
+        serde_json::from_str::<serde_json::Value>(&state.with_untracked(|v| v.to_json())).unwrap()
+            [key]
+            .clone()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while read("frame") != json!(0) {
+        stage.step().unwrap();
+        assert!(Instant::now() < deadline, "no frame came");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let cmd = host.shared("cmd", zgx_script::Value::Nil);
+    cmd.set(zgx_script::Value::from_json("\"play\"").unwrap());
+    stage.step().unwrap();
+    assert_eq!(read("playing"), json!(true));
+    cmd.set(zgx_script::Value::from_json("\"stop\"").unwrap());
+    stage.step().unwrap();
+    assert_eq!(
+        read("playing"),
+        json!(false),
+        "told it stopped, with no frame to tell it by"
+    );
+}
+
+#[test]
+fn a_players_translucent_picture_shows_over_what_is_behind_it_as_drawn() {
+    let dir = temp_dir("player-translucent");
+    // Half-transparent red over nothing: its frame, premultiplied, is
+    // (128, 0, 0, 128).
+    std::fs::write(
+        dir.join("video.luau"),
+        r##"
+        local video = require("@video")
+        return video.compositions { video.composition {
+            id = "Half", w = 100, h = 50, fps = 30, duration = 10,
+            render = function()
+                return ui.div { w_full = true, h_full = true, bg = "#ff000080" }
+            end,
+        } }
+        "##,
+    )
+    .unwrap();
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Half", json!({}), 0);
+            let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let _player = held.unwrap();
+    // Until the view shows its frame: the first may come as bytes (opened
+    // before the view asked for pixel buffers) and the view's after it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut pixels = Vec::new();
+    loop {
+        stage.step().unwrap();
+        stage.draw(&mut pixels).unwrap();
+        if pixel(&pixels, 100, 50, 25) != [255, 255, 255, 255] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no frame came");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Half red over white: (255, 127, 127). Premultiplied twice, its red
+    // fell to about 191.
+    let [r, g, b, _] = pixel(&pixels, 100, 50, 25);
+    assert!(
+        r >= 250 && (124..=131).contains(&g) && (124..=131).contains(&b),
+        "{r} {g} {b}"
+    );
+}
+
+/// Each frame a different bar, so a picture tells its frame.
+const RUN: &str = r##"
+local video = require("@video")
+return video.compositions { video.composition {
+    id = "Run", w = 100, h = 50, fps = 30, duration = DURATION,
+    render = function()
+        local f = video.frame()
+        return ui.div { w_full = true, h_full = true, bg = "#000000",
+            ui.div { h = 50, w = function() return f:get() % 100 end, bg = "#00ff00" } }
+    end,
+} }
+"##;
+
+/// A player shown in a 200 by 100 stage (`placed` puts its box), stepped
+/// until `done` says so.
+struct Shown {
+    stage: Stage,
+    player: std::rc::Rc<Player>,
+}
+fn shown(dir: &std::path::Path, placed: impl Fn(View) -> View) -> Shown {
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let stage = Stage::new(
+        StageOptions {
+            width: 200.,
+            height: 100.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            let view = div()
+                .w(200.)
+                .h(100.)
+                .overflow_hidden()
+                .child(placed(player.view().w(100.).h(50.)));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    Shown {
+        stage,
+        player: held.unwrap(),
+    }
+}
+impl Shown {
+    fn frame(&self) -> Option<u64> {
+        self.player
+            .image
+            .with_untracked(Option::is_some)
+            .then(|| self.player.frame.with_untracked(|f| *f))
+    }
+    fn until(&mut self, what: impl Fn(Option<u64>) -> bool) -> Option<u64> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            self.stage.step().unwrap();
+            if what(self.frame()) {
+                return self.frame();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "it never came: {:?}",
+                self.frame()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    /// Steps for `time`, returning the frames seen meanwhile.
+    fn watch_for(&mut self, time: Duration) -> Vec<Option<u64>> {
+        let until = Instant::now() + time;
+        let mut seen = Vec::new();
+        while Instant::now() < until {
+            self.stage.step().unwrap();
+            seen.push(self.frame());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    }
+    fn pixels(&self) -> Vec<u8> {
+        self.player
+            .image
+            .with_untracked(|image| image.as_ref().unwrap().pixels().to_vec())
+    }
+}
+
+#[test]
+fn an_unseen_player_draws_nothing_and_seen_again_shows_the_frame_due_then() {
+    let dir = temp_dir("player-unseen");
+    std::fs::write(dir.join("video.luau"), RUN.replace("DURATION", "900")).unwrap();
+    let mut shown = shown(&dir, |view| view);
+    shown.player.open("Run", json!({}), 0);
+    shown.player.play(true);
+    shown.until(|frame| frame.is_some_and(|f| f >= 10));
+    shown.player.watch(false);
+    let hidden = Instant::now();
+    // A frame on its way as it was told may still come; then none.
+    shown.watch_for(Duration::from_millis(100));
+    let held = shown.frame();
+    let meanwhile = shown.watch_for(Duration::from_millis(600));
+    assert!(
+        meanwhile.iter().all(|f| *f == held),
+        "drew unseen: {meanwhile:?}"
+    );
+    // Seen again: the frame its clock is at, not the one it left.
+    let before = held.unwrap();
+    let seen_at = Instant::now();
+    shown.player.watch(true);
+    let resumed = shown.until(|frame| frame != held).unwrap();
+    let elapsed = |at: Instant| (at - hidden).as_secs_f64() * 30.;
+    let (low, high) = (elapsed(seen_at) - 2., elapsed(Instant::now()) + 2.);
+    let ran = (resumed - before) as f64;
+    assert!(
+        ran >= low && ran <= high + 4.,
+        "resumed at {resumed}, {before} + {ran} (due {low}..{high})"
+    );
+    // And the picture is that frame's, as a player opened there draws it.
+    let resumed_pixels = shown.pixels();
+    drop(shown);
+    let mut fresh = self::shown(&dir, |view| view);
+    fresh.player.open("Run", json!({}), resumed);
+    fresh.until(|frame| frame == Some(resumed));
+    assert!(
+        fresh.pixels() == resumed_pixels,
+        "frame {resumed} drawn differently"
+    );
+}
+
+#[test]
+fn a_looping_player_unseen_past_its_end_resumes_where_time_has_it() {
+    let dir = temp_dir("player-unseen-loop");
+    // One second a pass.
+    std::fs::write(dir.join("video.luau"), RUN.replace("DURATION", "30")).unwrap();
+    let mut shown = shown(&dir, |view| view);
+    shown.player.open("Run", json!({}), 0);
+    shown.player.looping(true);
+    shown.player.play(true);
+    let before = shown.until(|frame| frame.is_some_and(|f| f >= 3)).unwrap();
+    shown.player.watch(false);
+    let hidden = Instant::now();
+    shown.watch_for(Duration::from_millis(1500));
+    shown.player.watch(true);
+    let seen_at = Instant::now();
+    let held = shown.frame();
+    let resumed = shown.until(|frame| frame != held).unwrap();
+    // Half a pass on from where it was: not back at its start.
+    let due = (before as f64 + (seen_at - hidden).as_secs_f64() * 30.) % 30.;
+    let off = ((resumed as f64 - due + 45.) % 30.) - 15.;
+    assert!(off.abs() <= 4., "resumed at {resumed}, due about {due:.1}");
+}
+
+#[test]
+fn a_player_whose_box_is_clipped_away_draws_nothing() {
+    let dir = temp_dir("player-offscreen");
+    std::fs::write(dir.join("video.luau"), RUN.replace("DURATION", "900")).unwrap();
+    // Its box outside the clip of the stage's box: none of it shows.
+    let mut shown = shown(&dir, |view| view.absolute().left(400.));
+    shown.player.open("Run", json!({}), 40);
+    shown.player.play(true);
+    let meanwhile = shown.watch_for(Duration::from_millis(500));
+    assert!(
+        meanwhile.iter().all(Option::is_none),
+        "drew offscreen: {meanwhile:?}"
+    );
+}
+
+#[test]
+fn a_player_unseen_past_its_end_shows_its_last_frame_stopped() {
+    let dir = temp_dir("player-unseen-end");
+    // One second, not looping.
+    std::fs::write(dir.join("video.luau"), RUN.replace("DURATION", "30")).unwrap();
+    let mut shown = shown(&dir, |view| view);
+    shown.player.open("Run", json!({}), 0);
+    shown.player.looping(false);
+    shown.player.play(true);
+    shown.until(|frame| frame.is_some_and(|f| f >= 3));
+    shown.player.watch(false);
+    // Past its end while unseen: it stops there, drawing nothing.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while shown_playing(&shown) {
+        shown.stage.step().unwrap();
+        assert!(Instant::now() < deadline, "it never stopped");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let held = shown.frame();
+    let meanwhile = shown.watch_for(Duration::from_millis(300));
+    assert!(
+        meanwhile.iter().all(|f| *f == held),
+        "drew unseen: {meanwhile:?}"
+    );
+    // Seen again: its last frame, and still stopped.
+    shown.player.watch(true);
+    let last = shown.until(|frame| frame == Some(29));
+    assert_eq!(last, Some(29));
+    assert!(!shown_playing(&shown), "playing again");
+    let after = shown.watch_for(Duration::from_millis(200));
+    assert!(after.iter().all(|f| *f == Some(29)), "moved on: {after:?}");
+}
+fn shown_playing(shown: &Shown) -> bool {
+    shown.player.playing.with_untracked(|p| *p)
+}
+
+#[test]
+fn a_player_keeps_frames_only_paused_and_gives_them_back_at_rest() {
+    let dir = temp_dir("player-cache");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            // A script's player: its frames are bytes, which it keeps (a
+            // view on macOS shows pixel buffers, and keeps none).
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            let host = zgx_script::ScriptHost::inline(
+                setting.runtime,
+                "app",
+                r##"
+                ui.on_mount(function() ui.call("clip.listen", nil) end)
+                return ui.column { w = 100, h = 50,
+                    ui.image { src = "host:clip", w = 100, h = 50 } }
+                "##,
+            );
+            host.lint_strip(false);
+            player.expose(&host, "clip");
+            host.reload()?;
+            let view = host.view();
+            held = Some((player, host));
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let (player, _host) = held.unwrap();
+    // A frame of 100 by 50, RGBA.
+    let frame_bytes = 100 * 50 * 4;
+    player.keep_frames_for(Duration::from_millis(300));
+    let mut wait_for = |what: &dyn Fn() -> bool, why: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !what() {
+            stage.step().unwrap();
+            assert!(Instant::now() < deadline, "{why}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    // Paused, scrubbed to three frames: it keeps them.
+    // Each seek waits for its picture: seeks asked together are drawn as
+    // the last of them alone.
+    player.open("Bar", json!({}), 0);
+    wait_for(
+        &|| player.image.with_untracked(Option::is_some),
+        "no frame came",
+    );
+    for frame in [10, 20] {
+        player.seek(frame);
+        wait_for(
+            &|| player.frame.with_untracked(|f| *f) == frame,
+            "no frame came",
+        );
+    }
+    wait_for(
+        &|| player.cached_bytes() == 3 * frame_bytes,
+        "kept no frames scrubbing",
+    );
+    // Playing: given back, and nothing it plays is kept.
+    player.play(true);
+    wait_for(&|| player.cached_bytes() == 0, "kept frames playing");
+    wait_for(
+        &|| player.frame.with_untracked(|f| *f) >= 30,
+        "it didn't play",
+    );
+    assert_eq!(player.cached_bytes(), 0, "kept a played frame");
+    // Paused and scrubbed again, then left alone: given back.
+    player.play(false);
+    player.seek(5);
+    wait_for(&|| player.cached_bytes() == frame_bytes, "kept no frame");
+    let rest = Instant::now();
+    wait_for(&|| player.cached_bytes() == 0, "kept frames at rest");
+    assert!(
+        rest.elapsed() >= Duration::from_millis(250),
+        "gave back too soon"
+    );
+}
+
+/// Steps `stage` until what it draws shows `player` at `frame` and holds
+/// still, returning those pixels.
+fn drawn_at(stage: &mut Stage, player: &Player, frame: u64) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = Vec::new();
+    loop {
+        stage.step().unwrap();
+        let mut pixels = Vec::new();
+        stage.draw(&mut pixels).unwrap();
+        let green = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[1] > 200 && p[0] < 60);
+        if player.frame.with_untracked(|f| *f) == frame && green && pixels == last {
+            return pixels;
+        }
+        last = pixels;
+        assert!(Instant::now() < deadline, "frame {frame} never showed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_players_view_draws_the_same_pixels_as_its_frames_bytes_do() {
+    let dir = temp_dir("player-same-pixels");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let options = || StageOptions {
+        width: 100.,
+        height: 50.,
+        fps: 60.,
+        scale: 1.,
+        background: Color(255, 255, 255, 255),
+        ..Default::default()
+    };
+    let path = dir.to_path_buf();
+    // Its own view: on macOS, pixel buffers the window shows as they are.
+    let mut held = None;
+    let mut stage = Stage::new(options(), |setting| {
+        let player = Player::new(setting.runtime, &path, 1.)?;
+        player.open("Bar", json!({ "color": "#00ff00" }), 40);
+        let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+        held = Some(player);
+        Ok(view)
+    })
+    .unwrap();
+    let player = held.unwrap();
+    let as_surfaces = drawn_at(&mut stage, &player, 40);
+    drop((stage, player));
+    // A script's (`host:<name>`): on macOS its pixel buffers too, as
+    // `ScriptHost::surface`; elsewhere its frames' bytes, an image.
+    let mut held = None;
+    let mut stage = Stage::new(options(), |setting| {
+        let player = Player::new(setting.runtime, &path, 1.)?;
+        let host = zgx_script::ScriptHost::inline(
+            setting.runtime,
+            "app",
+            r##"
+            ui.on_mount(function()
+                ui.call("clip.listen", nil)
+                ui.invoke("clip.open", { id = "Bar", props = { color = "#00ff00" }, frame = 40 })
+            end)
+            return ui.column { w = 100, h = 50,
+                ui.image { src = "host:clip", w = 100, h = 50, fit = "contain" } }
+            "##,
+        );
+        host.lint_strip(false);
+        player.expose(&host, "clip");
+        host.reload()?;
+        let view = host.view();
+        held = Some((player, host));
+        Ok(view)
+    })
+    .unwrap();
+    let (player, _host) = held.unwrap();
+    let as_bytes = drawn_at(&mut stage, &player, 40);
+    assert!(as_surfaces == as_bytes, "the two ways draw it differently");
+}
+
+/// How many pixels wide `image`'s bar is: the frame it shows.
+fn bar_width(image: &zgx::image::ImageData) -> usize {
+    let row = &image.pixels()[..image.width() as usize * 4];
+    row.as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[1] > 200 && p[0] < 60)
+        .count()
+}
+
+#[test]
+fn a_players_image_is_the_frame_its_view_shows() {
+    let dir = temp_dir("player-image");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let path = dir.to_path_buf();
+    // Its view shows pixel buffers (macOS): no frame is read back to bytes,
+    // and `image` reads the one shown when asked.
+    let mut held = None;
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Bar", json!({ "color": "#00ff00" }), 40);
+            let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let player = held.unwrap();
+    let image = |player: &Player| player.image.with_untracked(Clone::clone).expect("an image");
+    let shown = drawn_at(&mut stage, &player, 40);
+    let at_40 = image(&player);
+    assert_eq!(bar_width(&at_40), 40, "image isn't frame 40");
+    // As drawn: the view's pixels where it shows the frame, at one pixel
+    // a point and the frame's own size.
+    assert_eq!((at_40.width(), at_40.height()), (100, 50));
+    assert!(
+        at_40.pixels() == &shown[..],
+        "image differs from the frame shown"
+    );
+    // The next frame's picture is its own; the one read stays as it was.
+    player.seek(25);
+    drawn_at(&mut stage, &player, 25);
+    assert_eq!(bar_width(&image(&player)), 25, "image isn't frame 25");
+    assert_eq!(bar_width(&at_40), 40, "a picture read changed");
+}
+
+#[test]
+fn images_held_unread_never_stall_a_players_view() {
+    let dir = temp_dir("player-held-images");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let path = dir.to_path_buf();
+    let mut held = None;
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Bar", json!({ "color": "#00ff00" }), 10);
+            let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let player = held.unwrap();
+    // Four frames' images kept and never read: on macOS each holds the pixel
+    // buffer it was shown in, all four a pool lends.
+    let mut kept = Vec::new();
+    for frame in [10, 20, 30, 40] {
+        player.seek(frame);
+        drawn_at(&mut stage, &player, frame);
+        kept.push(player.image.with_untracked(Clone::clone).expect("an image"));
+    }
+    // The view still goes on, frame by frame, as drawn.
+    for frame in [45, 50, 55] {
+        player.seek(frame);
+        let shown = drawn_at(&mut stage, &player, frame);
+        let green = shown[..400]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[1] > 200 && p[0] < 60)
+            .count();
+        assert_eq!(
+            green, frame as usize,
+            "the view stopped before frame {frame}"
+        );
+    }
+    // Each kept image is still the frame it was.
+    for (image, frame) in kept.iter().zip([10, 20, 30, 40]) {
+        assert_eq!(bar_width(image), frame, "a kept image changed");
+    }
+}
+
+/// A player's own view on macOS shows pixel buffers: scrubbed while paused,
+/// it keeps them (no bytes), shows a kept frame again without drawing it,
+/// and gives them back at rest.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_views_player_keeps_scrubbed_frames_as_pixel_buffers_until_rest() {
+    let dir = temp_dir("player-cache-surfaces");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Bar", json!({ "color": "#00ff00" }), 40);
+            let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let player = held.unwrap();
+    player.keep_frames_for(Duration::from_millis(300));
+    // A buffer of 100 by 50, counted as its pixels.
+    let frame_bytes = 100 * 50 * 4;
+    for frame in [40, 20, 10] {
+        player.seek(frame);
+        drawn_at(&mut stage, &player, frame);
+    }
+    assert_eq!(player.cached_bytes(), 3 * frame_bytes, "kept no buffers");
+    // Back to one kept: shown, the right picture, and nothing more kept.
+    player.seek(20);
+    let shown = drawn_at(&mut stage, &player, 20);
+    let image = player.image.with_untracked(Clone::clone).expect("an image");
+    assert_eq!(bar_width(&image), 20, "showed another frame");
+    assert!(
+        image.pixels() == &shown[..],
+        "the view shows another picture"
+    );
+    assert_eq!(player.cached_bytes(), 3 * frame_bytes);
+    // At rest: given back.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while player.cached_bytes() != 0 {
+        stage.step().unwrap();
+        assert!(Instant::now() < deadline, "kept its buffers at rest");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A view's player paused gives back the pixel buffers no one holds once it
+/// has rested a while, once a pause and never while it plays: CoreVideo
+/// holds the last ones about a second past the last frame, so giving back at
+/// the pause itself freed little, and a paused player held two (7 MB at 1280
+/// by 720) for as long as it was paused.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_paused_views_player_gives_back_its_buffers_once_at_rest() {
+    let dir = temp_dir("player-paused-release");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let mut held = None;
+    let path = dir.to_path_buf();
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Bar", json!({ "color": "#00ff00" }), 40);
+            let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let player = held.unwrap();
+    player.keep_frames_for(Duration::from_millis(300));
+    drawn_at(&mut stage, &player, 40);
+    // At rest after the frame it opened at: given back once.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while player.surface_releases() == 0 {
+        stage.step().unwrap();
+        assert!(Instant::now() < deadline, "never gave back at rest");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let rested = player.surface_releases();
+    // Playing: drawing on, none given back however long it plays.
+    player.play(true);
+    let until = Instant::now() + Duration::from_millis(900);
+    while Instant::now() < until {
+        stage.step().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let played = player.frame.with_untracked(|f| *f);
+    assert_ne!(played, 40, "it never played");
+    assert_eq!(player.surface_releases(), rested, "gave back while playing");
+    // Paused: once, a while on, and not again.
+    player.play(false);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while player.surface_releases() == rested {
+        stage.step().unwrap();
+        assert!(Instant::now() < deadline, "never gave back paused");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    stage.step().unwrap();
+    assert_eq!(
+        player.surface_releases(),
+        rested + 1,
+        "gave back more than once a pause"
+    );
+}
+
+/// Asks that show the frame it's at again (a reload, a view asking for
+/// pixel buffers, seen again) keep a frame asked for just before them: an
+/// open at 40 and a reload asked together show 40, not the frame it was at.
+#[test]
+fn a_frame_asked_for_survives_a_reload_asked_with_it() {
+    let dir = temp_dir("player-seek-kept");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let path = dir.to_path_buf();
+    for _ in 0..10 {
+        let mut held = None;
+        let mut stage = Stage::new(
+            StageOptions {
+                width: 100.,
+                height: 50.,
+                fps: 60.,
+                scale: 1.,
+                background: Color(255, 255, 255, 255),
+                ..Default::default()
+            },
+            |setting| {
+                let player = Player::new(setting.runtime, &path, 1.)?;
+                // Asked together: its thread takes both in one go.
+                player.open("Bar", json!({ "color": "#00ff00" }), 40);
+                player.reload();
+                let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+                held = Some(player);
+                Ok(view)
+            },
+        )
+        .unwrap();
+        let player = held.unwrap();
+        drawn_at(&mut stage, &player, 40);
+    }
+}
+
+/// A player whose device is lost (a driver reset, a GPU removed) draws on a
+/// new one and goes on, rather than stopping with an error.
+#[test]
+fn a_player_whose_device_is_lost_draws_on_a_new_one() {
+    let dir = temp_dir("player-lost-device");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let path = dir.to_path_buf();
+    let mut held = None;
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Bar", json!({ "color": "#00ff00" }), 40);
+            let view = div().w(100.).h(50.).child(player.view().w(100.).h(50.));
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let player = held.unwrap();
+    drawn_at(&mut stage, &player, 40);
+    player.debug_lose_device();
+    player.seek(41);
+    drawn_at(&mut stage, &player, 41);
+    let error = player.error.with_untracked(Clone::clone);
+    assert!(error.is_none(), "it stopped: {error:?}");
+}
+
+/// Played to its end (not looping), a player tells its last frame before it
+/// tells it stopped: what follows it sees the last frame as it stops, not
+/// one before it. Its frames come due far faster than they draw, so it
+/// reaches its end past frames it skipped, as a player behind time does.
+#[test]
+fn a_player_tells_its_last_frame_before_it_stops() {
+    const FAST: &str = r##"
+local video = require("@video")
+return video.compositions { video.composition {
+    id = "Bar", w = 100, h = 50, fps = 10000, duration = 300,
+    render = function()
+        local f = video.frame()
+        return ui.div { w_full = true, h_full = true, bg = "#000000",
+            ui.div { h = 50, w = function() return f:get() % 100 end, bg = "#00ff00" } }
+    end,
+} }
+"##;
+    let dir = temp_dir("player-last-frame");
+    std::fs::write(dir.join("video.luau"), FAST).unwrap();
+    let path = dir.to_path_buf();
+    let told: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+    let mut held = None;
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            player.open("Bar", json!({}), 0);
+            player.looping(false);
+            let (listened, told) = (player.clone(), told.clone());
+            let view = zgx::compose::component(move |cx| {
+                let told = told.clone();
+                cx.tasks().spawn(listened.listen(move |event| match event {
+                    zgx_video::Event::Frame { frame, .. } => {
+                        told.borrow_mut().push(format!("frame {frame}"))
+                    }
+                    zgx_video::Event::Stopped => told.borrow_mut().push("stopped".into()),
+                    _ => {}
+                }));
+                div().w(100.).h(50.)
+            });
+            held = Some(player);
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let player = held.unwrap();
+    player.play(true);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !told.borrow().iter().any(|event| event == "stopped") {
+        assert!(
+            Instant::now() < deadline,
+            "it never stopped: {:?}",
+            told.borrow()
+        );
+        stage.step().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let told = told.borrow();
+    let at = told.iter().position(|event| event == "stopped").unwrap();
+    assert_eq!(
+        told[..at].last().map(String::as_str),
+        Some("frame 299"),
+        "told before it stopped: {told:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+mod surfaces {
+    unsafe extern "C" {
+        fn CVPixelBufferGetIOSurface(buffer: *const std::ffi::c_void) -> *const std::ffi::c_void;
+        fn CFRelease(object: *const std::ffi::c_void);
+    }
+    #[link(name = "IOSurface", kind = "framework")]
+    unsafe extern "C" {
+        fn IOSurfaceGetID(surface: *const std::ffi::c_void) -> u32;
+        fn IOSurfaceLookup(id: u32) -> *const std::ffi::c_void;
+    }
+    /// The IOSurfaces of the native surfaces `scene` shows.
+    pub fn shown(scene: &zgx::scene::Scene) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut walk = vec![scene.root()];
+        while let Some(id) = walk.pop() {
+            if let zgx::scene::NodeKind::NativeSurface(frame) = scene.kind(id) {
+                // SAFETY: an IOSurface-backed buffer, alive as long as `frame`.
+                ids.push(unsafe {
+                    IOSurfaceGetID(CVPixelBufferGetIOSurface(
+                        std::ptr::from_ref(frame.pixel_buffer()).cast(),
+                    ))
+                });
+            }
+            walk.extend_from_slice(scene.children(id));
+        }
+        ids
+    }
+    /// Whether the IOSurface `id` still exists.
+    pub fn exists(id: u32) -> bool {
+        // SAFETY: Lookup returns a +1 reference or null.
+        unsafe {
+            let surface = IOSurfaceLookup(id);
+            if !surface.is_null() {
+                CFRelease(surface);
+            }
+            !surface.is_null()
+        }
+    }
+}
+
+/// A script's player draws its frames as they are, its decoder's or
+/// renderer's pixel buffers, with no bytes read back. Gone, it leaves no
+/// frame shown and no buffer held: the picture shown stays, as bytes, and the
+/// buffers go back. Another player under its name shows its own.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_scripts_player_shows_its_frames_as_they_are_and_leaves_none_behind() {
+    let dir = temp_dir("player-host-surface");
+    std::fs::write(dir.join("video.luau"), SCRIPT).unwrap();
+    let path = dir.to_path_buf();
+    const APP: &str = r##"
+        ui.on_mount(function()
+            ui.call("clip.listen", nil)
+            ui.invoke("clip.open", { id = "Bar", props = { color = "#00ff00" }, frame = 40 })
+        end)
+        return ui.column { w = 100, h = 50, ui.image { src = "host:clip", w = 100, h = 50 } }
+    "##;
+    let mut held = None;
+    let mut stage = Stage::new(
+        StageOptions {
+            width: 100.,
+            height: 50.,
+            fps: 60.,
+            scale: 1.,
+            background: Color(255, 255, 255, 255),
+            ..Default::default()
+        },
+        |setting| {
+            let player = Player::new(setting.runtime, &path, 1.)?;
+            let host = zgx_script::ScriptHost::inline(setting.runtime, "app", APP);
+            host.lint_strip(false);
+            player.expose(&host, "clip");
+            host.reload()?;
+            let view = host.view();
+            held = Some((player, host));
+            Ok(view)
+        },
+    )
+    .unwrap();
+    let (first, host) = held.unwrap();
+    let drawn = drawn_at(&mut stage, &first, 40);
+    let shown = surfaces::shown(&stage.ui().scene.borrow());
+    assert!(!shown.is_empty(), "the frame shows as a pixel buffer");
+    assert!(host.hosted_surface("clip").is_some());
+
+    // Its frame let go mid-stream: the picture shown stays, as bytes.
+    host.surface("clip", None);
+    let mut pixels = Vec::new();
+    stage.step().unwrap();
+    stage.draw(&mut pixels).unwrap();
+    assert!(
+        surfaces::shown(&stage.ui().scene.borrow()).is_empty(),
+        "a frame let go still shows"
+    );
+    assert!(
+        pixels == drawn,
+        "the picture shown changed as its frame went"
+    );
+
+    // Another under the same name, the script run again: its own frame
+    // shows, not the first's, and the first's buffers go back once the
+    // renderer's cache of them ages out (about a second).
+    drop(first);
+    let second = Player::new(&stage.ui().runtime, &path, 1.).unwrap();
+    second.expose(&host, "clip");
+    host.reload().unwrap();
+    drawn_at(&mut stage, &second, 40);
+    let now = surfaces::shown(&stage.ui().scene.borrow());
+    assert!(
+        !now.is_empty(),
+        "the new player's frame shows as a pixel buffer"
+    );
+    assert!(
+        now.iter().all(|id| !shown.contains(id)),
+        "the first player's frame came back"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while shown.iter().any(|id| surfaces::exists(*id)) {
+        assert!(
+            Instant::now() < deadline,
+            "the first player's buffers are still held"
+        );
+        stage.step().unwrap();
+        stage.draw(&mut pixels).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

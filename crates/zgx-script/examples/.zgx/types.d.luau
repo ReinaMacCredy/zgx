@@ -70,6 +70,23 @@ type function Item(t)
 	return types.never
 end
 
+-- What a function taking a string or the state holding one answers:
+-- `text` given a string, `state` given a state, `any` given `any`. (Not two
+-- overloads: luau-lsp checks a table literal against neither, so
+-- `ui.markdown(s, { key = "reply" })` would fail either way.)
+type function TextOrState(given, text, state)
+	if given:is("any") or given:is("unknown") then
+		return types.any
+	end
+	if given:is("string") or (given:is("singleton") and type(given:value()) == "string") then
+		return text
+	end
+	if given:is("table") and given:readproperty(types.singleton("get")) then
+		return state
+	end
+	error("takes a string or a State<string> holding one")
+end
+
 -- What a `ui.variants` definition's axes accept, the choosing table its
 -- recipe is called with: each axis its options' names (a boolean for an
 -- on-off axis, `[true]` / `[false]`), or `extra` (a state or a function
@@ -198,6 +215,15 @@ export type ColorToken =
 	| "$selection.text.inactive"
 	| "$find.match"
 	| "$find.current"
+	| "$caption.text"
+	| "$caption.text.hover"
+	| "$caption.text.inactive"
+	| "$caption.hover"
+	| "$caption.pressed"
+	| "$caption.close"
+	| "$caption.close.pressed"
+	| "$caption.close.text"
+	| "$caption.close.text.pressed"
 	| "$terminal.foreground"
 	| "$terminal.background"
 	| "$terminal.cursor"
@@ -352,6 +378,15 @@ export type TokenName =
 	| "find.match"
 	| "find.current"
 	| "mark.radius"
+	| "caption.text"
+	| "caption.text.hover"
+	| "caption.text.inactive"
+	| "caption.hover"
+	| "caption.pressed"
+	| "caption.close"
+	| "caption.close.pressed"
+	| "caption.close.text"
+	| "caption.close.text.pressed"
 	| "terminal.foreground"
 	| "terminal.background"
 	| "terminal.cursor"
@@ -403,6 +438,23 @@ export type Tokens = {
 		bg: string,
 		hover: string,
 		pressed: string,
+	},
+	caption: {
+		close: {
+			pressed: string,
+			text: {
+				pressed: string,
+				value: string,
+			},
+			value: string,
+		},
+		hover: string,
+		pressed: string,
+		text: {
+			hover: string,
+			inactive: string,
+			value: string,
+		},
 	},
 	control: {
 		height: string,
@@ -810,6 +862,22 @@ declare extern type Bitmap with
 end
 declare extern type Shader with
 end
+export type ShaderPass = {
+	name: string,
+	shader: string,
+	size: { number }?,
+	scale: number?,
+	format: ("rgba8" | "rgba16float")?,
+	feedback: boolean?,
+	steps: number?,
+	once: boolean?,
+}
+export type LayerShaderOptions = {
+	fps: number?,
+	passes: { ShaderPass }?,
+	images: { [string]: Bitmap }?,
+	geometry: string?,
+}
 declare extern type LayerShader with
 end
 declare extern type Brush with
@@ -930,12 +998,14 @@ export type Promise<T = unknown> = {
 -- nil while it is fine; `values.other` reads another field), and what
 -- submitting does (in a task: it may await, and raises what went wrong).
 -- `ui.router`'s spec: each route's name and path (`"/thread/:id"`), the
--- path it starts at ("/" by default), and the scheme of the deep links it
--- follows (`"mail"` for `mail://thread/42`).
+-- path it starts at ("/" by default), the scheme of the deep links it
+-- follows (`"mail"` for `mail://thread/42`), and how many places behind its
+-- history keeps (100 by default, the oldest let go; `math.huge` for all).
 export type RouterSpec = {
 	routes: { [string]: string },
 	initial: string?,
 	scheme: string?,
+	history: number?,
 }
 -- Where the router is: the route's name, its path and its params.
 export type Route = { name: string, path: string, params: { [string]: string } }
@@ -1170,6 +1240,15 @@ declare extern type Element with
 	function overlaid(self): boolean
 	-- Clear keyboard focus if it is on the element or inside it.
 	function blur(self): ()
+	-- Lock the pointer to the element, as the DOM's `requestPointerLock`
+	-- (a game's look about, a 3D view's orbit): hidden and held, every
+	-- press and wheel goes to it, and its `on_pointer_move` hears the
+	-- mouse's motion as `dx`, `dy`. Only in a press's, a release's or a
+	-- key's handler (or within a second of one); whether it holds it.
+	-- Escape always lets it go, as does the window losing focus.
+	function lock_pointer(self): boolean
+	-- Let the pointer go, if the element holds its lock.
+	function unlock_pointer(self): ()
 end
 
 -- `ref = r` on a node. Reading it in an effect or computed follows it: the
@@ -1235,6 +1314,55 @@ export type LineOptions = { cap: LineCap?, join: LineJoin?, dash: { number }?, d
 -- What a scroll view keeps clear (`scroll_padding`): points on every side,
 -- or by side.
 export type ScrollPadding = number | { top: number?, bottom: number?, left: number?, right: number? }
+-- A scrollbar drawn and timed as the app's own, over the platform's (each
+-- field set replaces the platform's), in points and milliseconds: an app's
+-- floating rail, thin, clear of a card's corners, gone with no track.
+export type Scrollbar = {
+	-- `false`: over zgx's own look on every platform (no arrow buttons, no
+	-- widening delay), the same bar wherever the app runs.
+	platform: boolean?,
+	-- The thumb across, and under the pointer or dragged.
+	thickness: number?,
+	active_thickness: number?,
+	-- The strip that takes the pointer, and the thumb from the view's edge
+	-- (otherwise centred in the strip).
+	strip: number?,
+	side: number?,
+	-- How far its track stops short of each end, the thumb whole within it;
+	-- how far the thumb's drawing is inset from its place; the shortest.
+	ends: number?,
+	inset: number?,
+	min: number?,
+	-- How long it stays once the view stops scrolling, how long it fades,
+	-- whether it fades in too, and on which curve.
+	linger: number?,
+	fade: number?,
+	fade_in: boolean?,
+	ease: ("linear" | "outQuad" | "outCubic")?,
+	-- How long its track is, from the view's start (a transcript's, stopping
+	-- above a composer over its foot); read as it changes.
+	track: (State<number> | () -> number)?,
+	-- Shown while this holds (what can't be seen to scroll until tried).
+	hint: (State<boolean> | () -> boolean)?,
+	-- Under the pointer or dragged, the theme's `scrollbar.thumb.active`;
+	-- whether its track is drawn.
+	active_color: boolean?,
+	track_fill: boolean?,
+	-- A press beside the thumb: a page, or the thumb's middle to the pointer,
+	-- dragged from there.
+	press: ("page" | "jump")?,
+	-- Let go (the pointer leaves, a hint ends): it lingers from then, or
+	-- from the last scroll.
+	linger_from: ("release" | "scroll")?,
+	-- Whether a press focuses it, for its keys.
+	focusable: boolean?,
+	-- An overlay (shown as it scrolls) even where scrollbars always show.
+	always_overlay: boolean?,
+	-- Whether assistive technology has it, a scrollbar whose value is the
+	-- offset (`false`: left out, as an app's rail may be; the view scrolls
+	-- for it as before).
+	accessible: boolean?,
+}
 export type MarkdownOptions = {
 	-- Names a text that grows (a streaming reply): parsed incrementally.
 	key: string?,
@@ -1264,7 +1392,7 @@ export type MarkdownBlock =
 	| { t: "ol", start: number, items: { { MarkdownBlock } } }
 	| { t: "quote", b: { MarkdownBlock } }
 	| { t: "hr" }
-	| { t: "table", head: { { MarkdownRun } }, rows: { { { MarkdownRun } } } }
+	| { t: "table", head: { { MarkdownRun } }, rows: { { { MarkdownRun } } }, align: { "start" | "center" | "end" | "" }? }
 	| { t: "img", src: string, alt: string }
 	-- A block `lazy` has not parsed yet: what it is by its first line
 	-- (`hint`), its lines and its bytes in the text (`from`, `to`, as
@@ -1358,6 +1486,9 @@ declare extern type Web with
 	function exit_full_screen(self): ()
 	function zoom(self, zoom: number): ()
 	function run(self, js: string): ()
+	-- The scrolls over the page that go on to the app under it (macOS), as
+	-- a nested frame hands on what it can't scroll; nil, none (the default).
+	function scroll_chain(self, chain: { up: boolean?, down: boolean?, left: boolean?, right: boolean? }?): ()
 	-- Each navigation, asked first: `false` refuses it. `kind`: "link",
 	-- "form", "back_forward", "reload", "form_resubmission" or "other".
 	function decide_navigation(
@@ -1621,6 +1752,9 @@ declare extern type WindowApi with
 	-- lights moves over as they go.
 	full_screen: State<boolean>
 	full_screen_transition: State<FullScreenTransition?>
+	-- Whether the window is maximized, read-only and followed. False in full
+	-- screen unless the system keeps it maximized under it.
+	maximized: State<boolean>
 	-- The window's size in points, read-only and followed: for decisions
 	-- layout can't make (a sidebar collapsing to icons below a width).
 	-- Sizes themselves are layout's: percentages, `grow`, `max_w`.
@@ -1651,6 +1785,9 @@ export type Child = Node | string | (() -> TextValue) | Message | { read [number
 export type Handler = () -> ...unknown
 -- `clicks` (on_press): the press's count, 2 for a double click's second, 3
 -- for a triple's, and on past it.
+-- `dx`, `dy` (on_pointer_move): how far it moved since the last move, in
+-- the window's points; while the pointer is locked (`locked`), the
+-- mouse's own motion, `x` and `y` staying where it locked.
 -- `shift`, `ctrl`, `alt`, `meta`: the keys held; `cmd`: the platform's
 -- command key (Command on macOS, Ctrl elsewhere), as `cmd` in keys.
 export type PointerEvent = {
@@ -1659,6 +1796,9 @@ export type PointerEvent = {
 	local_x: number,
 	local_y: number,
 	clicks: number?,
+	dx: number?,
+	dy: number?,
+	locked: boolean?,
 	shift: boolean,
 	ctrl: boolean,
 	alt: boolean,
@@ -1693,6 +1833,7 @@ export type WheelEvent = {
 	local_x: number,
 	local_y: number,
 	clicks: number?,
+	locked: boolean?,
 	shift: boolean,
 	ctrl: boolean,
 	alt: boolean,
@@ -1709,6 +1850,9 @@ export type AuxClickEvent = {
 	local_x: number,
 	local_y: number,
 	clicks: number?,
+	dx: number?,
+	dy: number?,
+	locked: boolean?,
 	shift: boolean,
 	ctrl: boolean,
 	alt: boolean,
@@ -1724,6 +1868,9 @@ export type PinchEvent = {
 	local_x: number,
 	local_y: number,
 	clicks: number?,
+	dx: number?,
+	dy: number?,
+	locked: boolean?,
 	shift: boolean,
 	ctrl: boolean,
 	alt: boolean,
@@ -1982,6 +2129,9 @@ export type Styles = {
 	underline_offset: Num?,
 	-- The language its text is in (HTML's `lang`): "ja", "zh-TW".
 	lang: string?,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: string?,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: number?,
 	y: number?,
@@ -2169,6 +2319,9 @@ export type StyleProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Reactive<string>?,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: string?,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Reactive<number>?,
 	y: Reactive<number>?,
@@ -2240,6 +2393,11 @@ export type NodeProps = {
 	variants: (Variants | ((choice: any) -> Variants))?,
 	ref: (Ref | { Ref })?,
 	focusable: boolean?,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: boolean?,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -2261,14 +2419,21 @@ export type NodeProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: ("polite" | "assertive" | "off")?,
-	-- Read after its name, as a hint (`aria-description`).
-	description: string?,
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
+	description: (string | ReadOnlyState<string> | (() -> string))?,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Reactive<string>?,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: (string | Readable<string?> | (() -> string?))?,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: boolean?,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: boolean?,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -2347,7 +2512,17 @@ export type NodeProps = {
 	-- the box passes through its `layer` function.
 	layer_shader: LayerShader?,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
-	layer_params: { read [number]: Color | { number } }?,
+	layer_params: ({ read [number]: Color | { number } } | (() -> { read [number]: Color | { number } }))?,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: number?,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: number?,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: boolean?,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: boolean?,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Reactive<boolean>?,
 	-- Events.
 	on_click: (ClickHandler | Handler | Action)?,
 	-- Primary pointer down and up.
@@ -2372,6 +2547,9 @@ export type NodeProps = {
 	on_file_hover: ((over: boolean) -> ...unknown)?,
 	on_hover: (((inside: boolean) -> ...unknown) | Action)?,
 	on_pointer_move: (((e: PointerEvent) -> ...unknown) | Action)?,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: ((locked: boolean) -> ...unknown)?,
 	-- Return true to consume the key.
 	on_key: (((e: KeyEvent) -> ...boolean?) | Action)?,
 	on_key_up: (((key: string, code: string?) -> ...unknown) | Action)?,
@@ -2389,6 +2567,10 @@ export type NodeProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: ((visible: boolean, element: Element) -> ...unknown)?,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: number?,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -2608,6 +2790,9 @@ export type Props = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -2639,6 +2824,11 @@ export type Props = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -2660,14 +2850,21 @@ export type Props = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -2747,6 +2944,16 @@ export type Props = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -2771,6 +2978,9 @@ export type Props = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -2788,6 +2998,10 @@ export type Props = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -2981,6 +3195,7 @@ export type Props_font_features = Reactive<string>?
 export type Props_underline = Reactive<boolean>?
 export type Props_underline_offset = Reactive<Num>?
 export type Props_lang = Reactive<string>?
+export type Props_geometry = string?
 export type Props_x = Reactive<number>?
 export type Props_y = Reactive<number>?
 export type Props_scale = Reactive<number>?
@@ -3001,6 +3216,7 @@ export type Props_class = string?
 export type Props_variants = (Variants | ((choice: any) -> Variants))?
 export type Props_ref = (Ref | { Ref })?
 export type Props_focusable = boolean?
+export type Props_focus_on_press = boolean?
 export type Props_capture_keys = boolean?
 export type Props_role = AriaRole?
 export type Props_heading = number?
@@ -3008,9 +3224,11 @@ export type Props_selected = (boolean | Readable<boolean> | (() -> boolean))?
 export type Props_checked = (boolean | Readable<boolean> | (() -> boolean))?
 export type Props_expanded = (boolean | Readable<boolean> | (() -> boolean))?
 export type Props_live = ("polite" | "assertive" | "off")?
-export type Props_description = string?
+export type Props_description = (string | ReadOnlyState<string> | (() -> string))?
+export type Props_value_text = Reactive<string>?
 export type Props_error = (string | Readable<string?> | (() -> string?))?
 export type Props_aria_hidden = boolean?
+export type Props_aria_modal = boolean?
 export type Props_focus_group = ("vertical" | "horizontal" | "both")?
 export type Props_pointer_events = (PointerEvents | Readable<PointerEvents> | (() -> PointerEvents))?
 export type Props_hit = ("target" | "shown")?
@@ -3041,7 +3259,12 @@ export type Props_mask = (Bitmap | MaskOptions)?
 export type Props_bg_shader = Shader?
 export type Props_shader_params = { read [number]: Color | { number } }?
 export type Props_layer_shader = LayerShader?
-export type Props_layer_params = { read [number]: Color | { number } }?
+export type Props_layer_params = ({ read [number]: Color | { number } } | (() -> { read [number]: Color | { number } }))?
+export type Props_layer_bleed = number?
+export type Props_layer_reach = number?
+export type Props_layer_clock = boolean?
+export type Props_shader_clock = boolean?
+export type Props_layer_on = Reactive<boolean>?
 export type Props_on_click = (ClickHandler | Handler | Action)?
 export type Props_on_press = (((e: PointerEvent) -> ...unknown) | Action)?
 export type Props_on_release = (((e: PointerEvent) -> ...unknown) | Action)?
@@ -3053,6 +3276,7 @@ export type Props_on_file_drop = ((files: { File }, e: PointerEvent) -> ...unkno
 export type Props_on_file_hover = ((over: boolean) -> ...unknown)?
 export type Props_on_hover = (((inside: boolean) -> ...unknown) | Action)?
 export type Props_on_pointer_move = (((e: PointerEvent) -> ...unknown) | Action)?
+export type Props_on_pointer_lock = ((locked: boolean) -> ...unknown)?
 export type Props_on_key = (((e: KeyEvent) -> ...boolean?) | Action)?
 export type Props_on_key_up = (((key: string, code: string?) -> ...unknown) | Action)?
 export type Props_on_focus = (Handler | Action)?
@@ -3063,6 +3287,7 @@ export type Props_zoomable = State<number>?
 export type Props_on_mount = ((element: Element) -> ...unknown)?
 export type Props_on_resize = ((size: Size, element: Element) -> ...unknown)?
 export type Props_on_visible = ((visible: boolean, element: Element) -> ...unknown)?
+export type Props_visible_margin = number?
 export type Props_on_drag = (() -> any)?
 export type Props_drag_preview = ((payload: any) -> Node)?
 export type Props_drag_preview_anchor = { number }?
@@ -3246,6 +3471,9 @@ export type ContainerProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -3277,6 +3505,11 @@ export type ContainerProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -3298,14 +3531,21 @@ export type ContainerProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -3385,6 +3625,16 @@ export type ContainerProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -3409,6 +3659,9 @@ export type ContainerProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -3426,6 +3679,10 @@ export type ContainerProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -3490,9 +3747,462 @@ export type ContainerProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
+}
+-- `ui.glass`'s look, over a container's props (merged, as a scroll's are: an
+-- intersection made a plain `h = 84` fail against the reactive forms).
+export type GlassProps = {
+	-- Size and position.
+	w: Props_w,
+	h: Props_h,
+	size: Props_size,
+	min_w: Props_min_w,
+	max_w: Props_max_w,
+	min_h: Props_min_h,
+	max_h: Props_max_h,
+	w_full: Props_w_full,
+	h_full: Props_h_full,
+	aspect: Props_aspect,
+	absolute: Props_absolute,
+	relative: Props_relative,
+	top: Props_top,
+	left: Props_left,
+	inset_start: Props_inset_start,
+	inset_end: Props_inset_end,
+	right: Props_right,
+	bottom: Props_bottom,
+	-- Spacing.
+	p: Props_p,
+	px: Props_px,
+	py: Props_py,
+	pt: Props_pt,
+	pr: Props_pr,
+	pb: Props_pb,
+	pl: Props_pl,
+	ps: Props_ps,
+	pe: Props_pe,
+	m: Props_m,
+	mx: Props_mx,
+	my: Props_my,
+	mt: Props_mt,
+	mr: Props_mr,
+	mb: Props_mb,
+	ml: Props_ml,
+	ms: Props_ms,
+	me: Props_me,
+	gap: Props_gap,
+	gap_x: Props_gap_x,
+	gap_y: Props_gap_y,
+	-- Flex and grid.
+	direction: Props_direction,
+	dir: Props_dir,
+	grow: Props_grow,
+	shrink: Props_shrink,
+	basis: Props_basis,
+	flex_wrap: Props_flex_wrap,
+	wrap_reverse: Props_wrap_reverse,
+	items: Props_items,
+	justify: Props_justify,
+	self: Props_self,
+	content: Props_content,
+	grid: Props_grid,
+	display: Props_display,
+	cols: Props_cols,
+	rows: Props_rows,
+	areas: Props_areas,
+	flow: Props_flow,
+	area: Props_area,
+	grid_column: Props_grid_column,
+	grid_row: Props_grid_row,
+	col_start: Props_col_start,
+	row_start: Props_row_start,
+	col_span: Props_col_span,
+	row_span: Props_row_span,
+	col_span_full: Props_col_span_full,
+	row_span_full: Props_row_span_full,
+	overflow: Props_overflow,
+	overflow_x: Props_overflow_x,
+	overflow_y: Props_overflow_y,
+	z: Props_z,
+	-- Inside a scroll view, hold this far below its top as it scrolls past,
+	-- inside the parent (CSS's `position: sticky` with `top`).
+	sticky_top: Props_sticky_top,
+	hidden: Props_hidden,
+	invisible: Props_invisible,
+	-- Paint.
+	bg: Props_bg,
+	gradient: Props_gradient,
+	radial: Props_radial,
+	mask_gradient: Props_mask_gradient,
+	mask_radial: Props_mask_radial,
+	text_gradient: Props_text_gradient,
+	text_radial: Props_text_radial,
+	color: Props_color,
+	bg_image: Props_bg_image,
+	bg_fit: Props_bg_fit,
+	rounded: Props_rounded,
+	rounded_tl: Props_rounded_tl,
+	rounded_tr: Props_rounded_tr,
+	rounded_br: Props_rounded_br,
+	rounded_bl: Props_rounded_bl,
+	border: Props_border,
+	border_sides: Props_border_sides,
+	border_color: Props_border_color,
+	border_over: Props_border_over,
+	-- A function may return nil: a solid border.
+	border_dash: Props_border_dash,
+	border_style: Props_border_style,
+	outline: Props_outline,
+	outline_color: Props_outline_color,
+	outline_offset: Props_outline_offset,
+	outline_style: Props_outline_style,
+	outline_dash: Props_outline_dash,
+	shadow: Props_shadow,
+	text_shadow: Props_text_shadow,
+	drop_shadow: Props_drop_shadow,
+	inset_shadow: Props_inset_shadow,
+	opacity: Props_opacity,
+	brightness: Props_brightness,
+	contrast: Props_contrast,
+	saturate: Props_saturate,
+	hue_rotate: Props_hue_rotate,
+	sepia: Props_sepia,
+	invert: Props_invert,
+	blend: Props_blend,
+	blur: Props_blur,
+	backdrop_blur: Props_backdrop_blur,
+	fade: Props_fade,
+	fade_x: Props_fade_x,
+	fade_sides: Props_fade_sides,
+	fade_overflow: Props_fade_overflow,
+	snap: Props_snap,
+	zoom: Props_zoom,
+	zoom_fixed: Props_zoom_fixed,
+	clip_inset: Props_clip_inset,
+	clip_feather: Props_clip_feather,
+	layer: Props_layer,
+	object_position: Props_object_position,
+	fit: Props_fit,
+	image_rendering: Props_image_rendering,
+	slice: Props_slice,
+	decode: Props_decode,
+	dither: Props_dither,
+	characters: Props_characters,
+	cursor: Props_cursor,
+	-- Text.
+	text_size: Props_text_size,
+	weight: Props_weight,
+	bold: Props_bold,
+	italic: Props_italic,
+	align: Props_align,
+	font: Props_font,
+	wrap: Props_wrap,
+	truncate: Props_truncate,
+	lines: Props_lines,
+	line_height: Props_line_height,
+	letter_spacing: Props_letter_spacing,
+	-- Tabular figures: every digit the same width.
+	tabular: Props_tabular,
+	-- OpenType features (CSS's `font-feature-settings`): "ss01 cv02=3 liga=0",
+	-- a tag on, or `tag=value` (0 off). Replaces `tabular`: give "tnum" here too.
+	font_features: Props_font_features,
+	-- Underlined text (inherited, as CSS's `text-decoration`), and how far
+	-- below the baseline the line sits.
+	underline: Props_underline,
+	underline_offset: Props_underline_offset,
+	-- The language its text is in (HTML's `lang`, a BCP 47 tag: "ja",
+	-- "zh-TW"), inherited: Han characters take its fonts (a Chinese quote's
+	-- in a Japanese app), over the app's locale and a line's kana, and
+	-- assistive technology reads it in that language.
+	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
+	-- Transforms: after layout, about `origin` (fractions of the node).
+	x: Props_x,
+	y: Props_y,
+	scale: Props_scale,
+	scale_x: Props_scale_x,
+	scale_y: Props_scale_y,
+	rotate: Props_rotate,
+	skew: Props_skew,
+	skew_x: Props_skew_x,
+	skew_y: Props_skew_y,
+	rotate_x: Props_rotate_x,
+	rotate_y: Props_rotate_y,
+	perspective: Props_perspective,
+	origin: Props_origin,
+	-- The subtree's theme: a theme's name (`"zgx-light"`), or tokens to
+	-- override (`{ accent = "#e5484d" }`, with `theme = name` to start from).
+	theme: Props_theme,
+	-- Values the components and rows built in this subtree read with
+	-- `ui.use_context(name)`, as React's context gives them: a state, a
+	-- table, a function. Nearer ones win.
+	provide: Props_provide,
+	-- Identity, for selectors, refs and animations.
+	id: Props_id,
+	-- Space-separated class names.
+	class: Props_class,
+	-- Styles chosen from a `ui.variants` definition: `button { tone =
+	-- "ghost" }`, or the recipe itself for its defaults. The element's own
+	-- properties win over them.
+	variants: Props_variants,
+	ref: Props_ref,
+	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
+	-- While focus is in it, every key goes to what is focused: no shortcut
+	-- or menu item takes one (a field recording a shortcut). As focus
+	-- leaves, shortcuts work again.
+	capture_keys: Props_capture_keys,
+	-- What assistive technology takes it for (ARIA's `role`), instead of
+	-- what it is: a clickable row as an "option", a row of buttons as a
+	-- "toolbar". It keeps what it does.
+	role: Props_role,
+	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
+	-- list headings and move between them.
+	heading: Props_heading,
+	-- Whether this option, tab or item is the chosen one (`aria-selected`).
+	selected: Props_selected,
+	-- Whether a switch, checkbox or radio of the app's own is on
+	-- (`aria-checked`), and whether what a control opens shows
+	-- (`aria-expanded`): a custom disclosure's.
+	checked: Props_checked,
+	expanded: Props_expanded,
+	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
+	-- note, a message arriving.
+	live: Props_live,
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
+	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
+	-- What is wrong with its value (`aria-invalid`), followed: nil while it
+	-- is fine. Assistive technology hears it with the field.
+	error: Props_error,
+	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
+	-- decoration, or what is said elsewhere.
+	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
+	-- One Tab stop for the focusable things inside; the arrows along this
+	-- axis (and Home, End) move among them, as ARIA's composite widgets
+	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
+	-- horizontal, without asking.
+	focus_group: Props_focus_group,
+	-- A press on it (or on what inside takes no input) moves the window; a
+	-- double click zooms it. Buttons and inputs inside keep their clicks.
+	-- CSS pointer-events: "none" (or false) lets the pointer through to what
+	-- is under the node (presses, hover, the wheel, drops, a native view);
+	-- descendants with handlers still take it. A state or function follows.
+	pointer_events: Props_pointer_events,
+	-- "target": while `x`, `y`, `scale`, `rotate` or `opacity` animate
+	-- (`ui.tween`, `ui.spring`, `anime`) or a layout animation moves it, it and what
+	-- it holds take clicks and hover where they're going, not where they
+	-- show. "shown" (the default) hits where it shows.
+	hit: Props_hit,
+	window_drag: Props_window_drag,
+	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares. `false` keeps every plugin off the
+	-- element (a password field, a destructive confirm), as `private` does.
+	hook: Props_hook,
+	private: Props_private,
+	-- The pointer selects the text in it and everything it holds, as on a
+	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
+	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
+	selectable: Props_selectable,
+	-- A selectable node's highlight and selected-text colours (CSS
+	-- `::selection`), over the theme's `$selection` and `$selection.text`
+	-- tokens; a state or function follows.
+	selection_color: Props_selection_color,
+	selected_text_color: Props_selected_text_color,
+	selection_radius: Props_selection_radius,
+	-- Shown over it while the pointer rests on it (after 300 ms; at once
+	-- within a second of another): text in the theme's look, or a node of
+	-- the app's own. Above it, centred, unless `tooltip_placement` says.
+	tooltip: Props_tooltip,
+	tooltip_placement: Props_tooltip_placement,
+	-- A hover card the pointer can move into and click in: it stays while
+	-- the pointer is over the node or the card.
+	tooltip_interactive: Props_tooltip_interactive,
+	-- Milliseconds the pointer rests before it shows (300; once one
+	-- shows, the next shows at once). Keyboard focus shows it too.
+	tooltip_delay: Props_tooltip_delay,
+	-- A condition (true disables), or the styles it shows while disabled.
+	disabled: Props_disabled,
+	hover: Props_hover,
+	active: Props_active,
+	focus: Props_focus,
+	-- Its descendants' `queries` read its size, as CSS's `container-type`.
+	-- Its content doesn't size its width: give it one, a percentage or
+	-- `grow`, or let its parent stretch it.
+	container: Props_container,
+	-- Styles while the container above is within bounds, as CSS
+	-- `@container` rules, in order (the last that holds wins): `{ {
+	-- min_width = 900, style = { hidden = false } } }`. They follow its size
+	-- as layout changes it, in that frame, without running the script.
+	queries: Props_queries,
+	-- Size animation ("height", "width", "size"; `true` is "height") or
+	-- position animation ("position"). A `layout_id` node mounting as
+	-- another with the same id unmounts (or while it is mounted) moves and
+	-- scales from that one's box.
+	layout: Props_layout,
+	layout_id: Props_layout_id,
+	layout_ease: Props_layout_ease,
+	-- Milliseconds.
+	layout_duration: Props_layout_duration,
+	layout_enter: Props_layout_enter,
+	layout_clip: Props_layout_clip,
+	-- The content shows through the bitmap's alpha: `mask = bitmap`, or
+	-- `{ bitmap, w = …, h = …, x = …, y = …, sweep = … }`.
+	mask: Props_mask,
+	bg_shader: Props_bg_shader,
+	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
+	shader_params: Props_shader_params,
+	-- The subtree, cached as a layer, composites through it: each pixel of
+	-- the box passes through its `layer` function.
+	layer_shader: Props_layer_shader,
+	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
+	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
+	-- Events.
+	on_click: Props_on_click,
+	-- Primary pointer down and up.
+	on_press: Props_on_press,
+	on_release: Props_on_release,
+	-- The middle (or another extra) button pressed and released on it: a
+	-- browser tab closes on it, a link opens in the background.
+	on_aux_click: Props_on_aux_click,
+	-- The primary button clicked twice on one spot, as the DOM's `dblclick`.
+	on_double_click: Props_on_double_click,
+	-- Back or forward on the platform's gesture over it (a trackpad's swipe
+	-- between pages, where nothing under the fingers scrolls that way).
+	on_navigate: Props_on_navigate,
+	-- A two-finger swipe over it, step by step: tracked here, not by the
+	-- platform (with it, three fingers still reach `on_navigate`).
+	on_swipe: Props_on_swipe,
+	-- Files dropped on it from outside the window (Finder, Explorer): the
+	-- innermost node with one takes them.
+	on_file_drop: Props_on_file_drop,
+	-- Files dragged from outside the window come over it (true), then
+	-- leave, are dropped or the drag ends (false).
+	on_file_hover: Props_on_file_hover,
+	on_hover: Props_on_hover,
+	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
+	-- Return true to consume the key.
+	on_key: Props_on_key,
+	on_key_up: Props_on_key_up,
+	on_focus: Props_on_focus,
+	on_blur: Props_on_blur,
+	-- Return true to take the gesture from the scroll views around it.
+	on_wheel: Props_on_wheel,
+	on_pinch: Props_on_pinch,
+	-- Its zoom, bound to this state: Control-wheel or a pinch over it zooms it (0.25 to 5).
+	zoomable: Props_zoomable,
+	on_mount: Props_on_mount,
+	-- When layout gives it a new size, and at its first layout.
+	on_resize: Props_on_resize,
+	-- When any of it comes into view or all of it leaves (inside every
+	-- clip and scroll viewport above it), and at its first layout: for
+	-- building what only matters on screen.
+	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
+	-- Drag and drop within the window. Payloads are what `on_drag`
+	-- returns: the script's own plain values, so they are `any` here.
+	-- A source: `on_drag` returns the payload once the pointer moves 4
+	-- points; `drag_preview` builds what follows the pointer.
+	on_drag: Props_on_drag,
+	drag_preview: Props_drag_preview,
+	-- Where the preview goes: its point `drag_preview_anchor` (fractions
+	-- of its size, `{ 0.5, 0 }` its top middle) `drag_preview_offset`
+	-- points from the pointer. `{ 0.5, 0 }` and `{ 0, 16 }` hang it below
+	-- the pointer, leaving what the drag is over in view; without either,
+	-- it keeps the grab point under the pointer.
+	drag_preview_anchor: Props_drag_preview_anchor,
+	drag_preview_offset: Props_drag_preview_offset,
+	on_drag_end: Props_on_drag_end,
+	-- What the drag carries to other apps as it leaves the window (macOS):
+	-- Finder takes files, Mail text, a browser links.
+	drag_export: Props_drag_export,
+	-- Released outside every window of the app (macOS): a tab torn off its
+	-- window. `grab_x`/`grab_y` are where the source was held.
+	on_drag_outside: Props_on_drag_outside,
+	-- The drag moves its window instead, with no preview (macOS): a
+	-- window's only tab. Dropped on another window's destination it drops
+	-- there; elsewhere the window stays where it was let go.
+	drag_moves_window: Props_drag_moves_window,
+	-- A destination: `drop_when` filters payloads (default: all).
+	drop_when: Props_drop_when,
+	on_drag_over: Props_on_drag_over,
+	on_drag_leave: Props_on_drag_leave,
+	on_drop: Props_on_drop,
+	-- Spring-loading: an accepted drag has rested on it for the system's
+	-- delay (0.5 s by default), or Space was pressed. Open what it stands
+	-- for (show a tab); return `false` to decline. Once per stay.
+	on_drag_spring: Props_on_drag_spring,
+	-- A secondary click (control-click on macOS) shows the returned
+	-- `menu_item`s, `submenu`s and separators as a menu at the pointer;
+	-- returning nil (or nothing) shows none.
+	context_menu: Props_context_menu,
+	-- The context menu panel's look: bg, rounded, p, gap, backdrop_blur,
+	-- border, shadow, w, …
+	context_menu_style: Props_context_menu_style,
+	-- Open the context menu under the node, from its left edge (a tab's),
+	-- rather than at the pointer.
+	context_menu_below: Props_context_menu_below,
+	[number]: Child,
+	-- A button's look where its own styles don't say: "primary" (the
+	-- accent), "ghost" (no background until hovered), "danger", "default".
+	-- Other containers don't take it.
+	variant: ("primary" | "ghost" | "danger" | "default")?,
+	-- The name assistive technology reads for it, instead of its text: a
+	-- switch, a button showing only an icon. A state or function is
+	-- followed: a list row's name made from what it shows now.
+	label: Label?,
+	-- A custom slider's (`role = "slider"` or "spinbutton", on a column,
+	-- row, div or overlay): its value (a number, a state or a function,
+	-- followed) between `min` and `max`, what it moves by (`step`, a
+	-- hundredth of the range without one), and what its value reads as
+	-- ("High", not "3"; followed). Screen readers increment and decrement
+	-- it, or set it, through `on_change(value)`; `keyboard = true` lets
+	-- the arrows, Page Up and Down, Home and End move it too, and makes it
+	-- focusable.
+	value: (number | State<number> | () -> number)?,
+	min: number?,
+	max: number?,
+	step: number?,
+	on_change: ((value: number) -> ...unknown)?,
+	keyboard: boolean?,
+	-- The more see-through of the system's glasses.
+	clear: Reactive<boolean>?,
+	-- A colour it takes on.
+	tint: Reactive<Color>?,
+	-- Its corners' radius in points.
+	radius: Reactive<number>?,
+	-- Each corner's own, over `radius`: `{ tl, tr, br, bl }` or four numbers
+	-- (the drawn glass; macOS's system glass takes `radius`).
+	corners: Reactive<Corners>?,
 }
 export type ScrollProps = {
 	-- Size and position.
@@ -3660,6 +4370,9 @@ export type ScrollProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -3691,6 +4404,11 @@ export type ScrollProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -3712,14 +4430,21 @@ export type ScrollProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -3799,6 +4524,16 @@ export type ScrollProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -3823,6 +4558,9 @@ export type ScrollProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -3840,6 +4578,10 @@ export type ScrollProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -3904,19 +4646,28 @@ export type ScrollProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	-- The scroll position in points, both ways.
 	offset: State<number>?,
 	-- Stays at the end while the content grows, until scrolled away.
-	-- An interactive scrollbar over the trailing edge (none by default).
-	scrollbar: boolean?,
+	-- An interactive scrollbar over the trailing edge (none by default):
+	-- the platform's (`true`), or drawn and timed as `Scrollbar` says.
+	scrollbar: (boolean | Scrollbar)?,
 	follow: boolean?,
 	-- "contain": a wheel or trackpad gesture over it stays with it at its
 	-- edges (CSS's overscroll-behavior), the scroll views around it never
 	-- moving; "auto" (the default) hands what it can't scroll on to them.
 	overscroll: ("auto" | "contain")?,
+	-- `ui.scroll_x`: a mouse wheel, which has no sideways axis, moves it: with
+	-- Shift always (never the page), and without once the pointer has been
+	-- moved onto it, going on to the views around it at its edge after a
+	-- pause or once the pointer moves. A trackpad's
+	-- swipe mostly down leaves it still.
+	wheel_across: boolean?,
+	-- Comes to rest only on whole pages, each its own length along the way it
+	-- scrolls, as UIKit's paging scroll views.
+	paging: boolean?,
 	-- What a focused control or a find keeps clear of scrolling into view
 	-- (CSS's scroll-padding): a composer or a bar floating over its edges.
 	-- Points: one number for every side, or { top, bottom, left, right };
@@ -4090,6 +4841,9 @@ export type TextProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -4121,6 +4875,11 @@ export type TextProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -4142,14 +4901,21 @@ export type TextProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -4229,6 +4995,16 @@ export type TextProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -4253,6 +5029,9 @@ export type TextProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -4270,6 +5049,10 @@ export type TextProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -4488,6 +5271,9 @@ export type MarkdownViewProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -4519,6 +5305,11 @@ export type MarkdownViewProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -4540,14 +5331,21 @@ export type MarkdownViewProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -4627,6 +5425,16 @@ export type MarkdownViewProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -4651,6 +5459,9 @@ export type MarkdownViewProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -4668,6 +5479,10 @@ export type MarkdownViewProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -4749,13 +5564,24 @@ export type SpanProps = {
 	underline_style: ("solid" | "double" | "dotted" | "dashed" | "wavy")?,
 	underline_color: Color?,
 	underline_thickness: number?,
+	-- Its text fading in: from clear at `start` (`ui.now()`'s milliseconds)
+	-- to its colour `ms` later, its alpha `1 - (1 - t)^power` (power 2 if
+	-- not given). Drawn in Rust a frame at a time: no script per frame.
+	fade_in: {
+		start: number,
+		ms: number,
+		power: number?,
+	}?,
 	-- A link (`on_click`) under the pointer: underlined, recoloured. With
 	-- it, the link isn't underlined at rest unless `underline` says so.
 	hover: { underline: boolean?, color: Color? }?,
 	-- An icon before the text, in the line (a file chip's file type):
 	-- `src` (a file, `https://…`) or `code` (SVG markup), `size` square
 	-- (12), `gap` from the text (4), centred on the line; `tint` a colour,
-	-- or `"currentColor"` for the span's. A span of no text with an icon
+	-- or `"currentColor"` for the span's. `bg` sets it on a well of its own
+	-- (a colour or token), `pad` larger than it on every side (0), its
+	-- corner `radius` (0), drawn over the span's background and under the
+	-- icon; the line keeps the well's room. A span of no text with an icon
 	-- is the icon alone: nothing of it is copied or read out.
 	icon: {
 		src: string?,
@@ -4763,6 +5589,9 @@ export type SpanProps = {
 		size: number?,
 		gap: number?,
 		tint: Color?,
+		bg: Color?,
+		radius: number?,
+		pad: number?,
 	}?,
 	-- A click (and a middle click, which passes as a ⌘-click) on the run,
 	-- a link: told the keys held. Returning `true` handled it: its `href`
@@ -4780,8 +5609,10 @@ export type SpanProps = {
 	-- Its text as it is, not a template (see TextProps).
 	literal: boolean?,
 	-- Room around it: across (before and after it, taking space in the
-	-- line), or `{ across, down }`; with `bg`, the background hugs the text
-	-- plus this (an inline code chip) instead of filling the line.
+	-- line), or `{ across, down }`, or `{ before, after, down }` (a chip
+	-- whose icon sits near its edge, its name with more room after it);
+	-- with `bg`, the background hugs the text plus this (an inline code
+	-- chip) instead of filling the line.
 	padding: (number | { number })?,
 	-- The background's corner radius.
 	radius: number?,
@@ -4957,6 +5788,9 @@ export type RichProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -4988,6 +5822,11 @@ export type RichProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -5009,14 +5848,21 @@ export type RichProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -5096,6 +5942,16 @@ export type RichProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -5120,6 +5976,9 @@ export type RichProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -5137,6 +5996,10 @@ export type RichProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -5349,6 +6212,9 @@ export type ImageProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -5380,6 +6246,11 @@ export type ImageProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -5401,14 +6272,21 @@ export type ImageProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -5488,6 +6366,16 @@ export type ImageProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -5512,6 +6400,9 @@ export type ImageProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -5529,6 +6420,10 @@ export type ImageProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -5758,6 +6653,9 @@ export type SvgProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -5789,6 +6687,11 @@ export type SvgProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -5810,14 +6713,21 @@ export type SvgProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -5897,6 +6807,16 @@ export type SvgProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -5921,6 +6841,9 @@ export type SvgProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -5938,6 +6861,10 @@ export type SvgProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -6068,6 +6995,10 @@ export type ModelProps = {
 	-- The animation it plays, round and round: a clip's name, or its place
 	-- in the file (from 1).
 	animation: (string | number)?,
+	-- Seconds into `animation` to pose it at, in place of playing it: a
+	-- video's frame, a slider's or a scrubbed timeline's says where it is.
+	-- The same time gives the same pose. Requires `animation`.
+	time: Reactive<number>?,
 	-- As a group's: it hears its meshes'.
 	on_click: ((hit: Hit3D) -> ())?,
 	on_hover: ((over: boolean) -> ())?,
@@ -6274,6 +7205,9 @@ export type Scene3DProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -6305,6 +7239,11 @@ export type Scene3DProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -6326,14 +7265,21 @@ export type Scene3DProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -6413,6 +7359,16 @@ export type Scene3DProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -6437,6 +7393,9 @@ export type Scene3DProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -6454,6 +7413,10 @@ export type Scene3DProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -6689,6 +7652,9 @@ export type CanvasProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -6720,6 +7686,11 @@ export type CanvasProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -6741,14 +7712,21 @@ export type CanvasProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -6828,6 +7806,16 @@ export type CanvasProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -6852,6 +7840,9 @@ export type CanvasProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -6869,6 +7860,10 @@ export type CanvasProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -7113,6 +8108,9 @@ export type CheckboxProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -7144,6 +8142,11 @@ export type CheckboxProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -7165,14 +8168,21 @@ export type CheckboxProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -7252,6 +8262,16 @@ export type CheckboxProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -7276,6 +8296,9 @@ export type CheckboxProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -7293,6 +8316,10 @@ export type CheckboxProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -7515,6 +8542,9 @@ export type InputProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -7546,6 +8576,11 @@ export type InputProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -7567,14 +8602,21 @@ export type InputProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -7654,6 +8696,16 @@ export type InputProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -7678,6 +8730,9 @@ export type InputProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -7695,6 +8750,10 @@ export type InputProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -8023,6 +9082,9 @@ export type ProgressProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -8054,6 +9116,11 @@ export type ProgressProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -8075,14 +9142,21 @@ export type ProgressProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -8162,6 +9236,16 @@ export type ProgressProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -8186,6 +9270,9 @@ export type ProgressProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -8203,6 +9290,10 @@ export type ProgressProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -8416,6 +9507,9 @@ export type SliderProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -8447,6 +9541,11 @@ export type SliderProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -8468,7 +9567,8 @@ export type SliderProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
@@ -8476,6 +9576,9 @@ export type SliderProps = {
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -8555,6 +9658,16 @@ export type SliderProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -8579,6 +9692,9 @@ export type SliderProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -8596,6 +9712,10 @@ export type SliderProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -8827,6 +9947,9 @@ export type SegmentedProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -8858,6 +9981,11 @@ export type SegmentedProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -8879,14 +10007,21 @@ export type SegmentedProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -8966,6 +10101,16 @@ export type SegmentedProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -8990,6 +10135,9 @@ export type SegmentedProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -9007,6 +10155,10 @@ export type SegmentedProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -9231,6 +10383,9 @@ export type StepperProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -9262,6 +10417,11 @@ export type StepperProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -9283,14 +10443,21 @@ export type StepperProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -9370,6 +10537,16 @@ export type StepperProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -9394,6 +10571,9 @@ export type StepperProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -9411,6 +10591,10 @@ export type StepperProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -9636,6 +10820,9 @@ export type DisclosureProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -9667,6 +10854,11 @@ export type DisclosureProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -9688,14 +10880,21 @@ export type DisclosureProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -9775,6 +10974,16 @@ export type DisclosureProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -9799,6 +11008,9 @@ export type DisclosureProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -9816,6 +11028,10 @@ export type DisclosureProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -9880,7 +11096,6 @@ export type DisclosureProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	open: State<boolean>,
@@ -10053,6 +11268,9 @@ export type AccordionProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -10084,6 +11302,11 @@ export type AccordionProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -10105,14 +11328,21 @@ export type AccordionProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -10192,6 +11422,16 @@ export type AccordionProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -10216,6 +11456,9 @@ export type AccordionProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -10233,6 +11476,10 @@ export type AccordionProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -10445,6 +11692,9 @@ export type SectionProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -10474,6 +11724,11 @@ export type SectionProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -10495,14 +11750,21 @@ export type SectionProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -10582,6 +11844,16 @@ export type SectionProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -10606,6 +11878,9 @@ export type SectionProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -10623,6 +11898,10 @@ export type SectionProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -10687,7 +11966,6 @@ export type SectionProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	id: any,
@@ -10859,6 +12137,9 @@ export type SeparatorProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -10890,6 +12171,11 @@ export type SeparatorProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -10911,14 +12197,21 @@ export type SeparatorProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -10998,6 +12291,16 @@ export type SeparatorProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -11022,6 +12325,9 @@ export type SeparatorProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -11039,6 +12345,10 @@ export type SeparatorProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -11257,6 +12567,9 @@ export type TabsProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -11288,6 +12601,11 @@ export type TabsProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -11309,14 +12627,21 @@ export type TabsProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -11396,6 +12721,16 @@ export type TabsProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -11420,6 +12755,9 @@ export type TabsProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -11437,6 +12775,10 @@ export type TabsProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -11677,6 +13019,9 @@ export type TreeProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -11708,6 +13053,11 @@ export type TreeProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -11729,14 +13079,21 @@ export type TreeProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -11816,6 +13173,16 @@ export type TreeProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -11840,6 +13207,9 @@ export type TreeProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -11857,6 +13227,10 @@ export type TreeProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -12093,6 +13467,9 @@ export type DataGridProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -12124,6 +13501,11 @@ export type DataGridProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -12145,14 +13527,21 @@ export type DataGridProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -12232,6 +13621,16 @@ export type DataGridProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -12256,6 +13655,9 @@ export type DataGridProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -12273,6 +13675,10 @@ export type DataGridProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -12505,6 +13911,9 @@ export type CalendarProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -12536,6 +13945,11 @@ export type CalendarProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -12557,14 +13971,21 @@ export type CalendarProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -12644,6 +14065,16 @@ export type CalendarProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -12668,6 +14099,9 @@ export type CalendarProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -12685,6 +14119,10 @@ export type CalendarProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -12910,6 +14348,9 @@ export type DatePickerProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -12941,6 +14382,11 @@ export type DatePickerProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -12962,14 +14408,21 @@ export type DatePickerProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -13049,6 +14502,16 @@ export type DatePickerProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -13073,6 +14536,9 @@ export type DatePickerProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -13090,6 +14556,10 @@ export type DatePickerProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -13313,6 +14783,9 @@ export type TimeFieldProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -13344,6 +14817,11 @@ export type TimeFieldProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -13365,14 +14843,21 @@ export type TimeFieldProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -13452,6 +14937,16 @@ export type TimeFieldProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -13476,6 +14971,9 @@ export type TimeFieldProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -13493,6 +14991,10 @@ export type TimeFieldProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -13715,6 +15217,9 @@ export type ComboboxProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -13746,6 +15251,11 @@ export type ComboboxProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -13767,14 +15277,21 @@ export type ComboboxProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -13854,6 +15371,16 @@ export type ComboboxProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -13878,6 +15405,9 @@ export type ComboboxProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -13895,6 +15425,10 @@ export type ComboboxProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -14125,6 +15659,9 @@ export type CommandPaletteProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -14156,6 +15693,11 @@ export type CommandPaletteProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -14177,14 +15719,21 @@ export type CommandPaletteProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -14264,6 +15813,16 @@ export type CommandPaletteProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -14288,6 +15847,9 @@ export type CommandPaletteProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -14305,6 +15867,10 @@ export type CommandPaletteProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -14523,6 +16089,9 @@ export type SelectProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -14554,6 +16123,11 @@ export type SelectProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -14575,14 +16149,21 @@ export type SelectProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -14662,6 +16243,16 @@ export type SelectProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -14686,6 +16277,9 @@ export type SelectProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -14703,6 +16297,10 @@ export type SelectProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -14928,6 +16526,9 @@ export type SplitProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -14959,6 +16560,11 @@ export type SplitProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -14980,14 +16586,21 @@ export type SplitProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -15067,6 +16680,16 @@ export type SplitProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -15091,6 +16714,9 @@ export type SplitProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -15108,6 +16734,10 @@ export type SplitProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -15170,7 +16800,6 @@ export type SplitProps = {
 	-- focusable.
 	value: (number | State<number> | () -> number)?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	-- The first pane's size in points, both ways: the divider writes it as
@@ -15186,6 +16815,45 @@ export type SplitProps = {
 	max: number?,
 	-- The other pane's smallest size: the divider stops short of it.
 	min_rest: number?,
+}
+-- A text in a row, for `ListEstimate`.
+export type ListEstimateText = {
+	-- The field holding it.
+	field: string,
+	-- Its font's size (14), and a line's height (1.4 times that).
+	size: number?,
+	line: number?,
+	-- A narrow character's average width in ems (0.5); wide ones count an em.
+	char: number?,
+	-- An average word's length in characters (5): wrapping leaves about half of
+	-- one unused on each line.
+	word: number?,
+	-- Its column: `share` of (the list less `inset`, at most `most`, less `minus`).
+	inset: number?,
+	most: number?,
+	minus: number?,
+	share: number?,
+	-- Clamped to this many lines, and what shows beyond them then.
+	most_lines: number?,
+	beyond: number?,
+	-- It's Markdown: what each kind of source line adds to its wrapped lines.
+	markdown: { paragraph: number?, heading: number?, item: number?, code: number?, table: number? }?,
+}
+-- How a row's data makes its height (`ui.list`'s `estimate`), or a part of it.
+export type ListEstimate = {
+	-- Points it always adds.
+	height: number?,
+	-- Its text, or several.
+	text: ListEstimateText | { ListEstimateText }?,
+	-- A part for each item of a list field.
+	each: string?,
+	item: ListEstimate?,
+	-- A part by a field's value.
+	by: string?,
+	cases: { [string]: ListEstimate }?,
+	default: ListEstimate?,
+	-- A part for each field that holds anything.
+	has: { [string]: ListEstimate }?,
 }
 -- A virtualized list: only visible rows are built.
 export type ListProps = {
@@ -15351,6 +17019,9 @@ export type ListProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -15382,6 +17053,11 @@ export type ListProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -15403,14 +17079,21 @@ export type ListProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -15490,6 +17173,16 @@ export type ListProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -15514,6 +17207,9 @@ export type ListProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -15531,6 +17227,10 @@ export type ListProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -15579,8 +17279,9 @@ export type ListProps = {
 	label: Label?,
 	-- The row count (with `heights`, their length).
 	count: Reactive<number>?,
-	-- An interactive scrollbar over the trailing edge (none by default).
-	scrollbar: boolean?,
+	-- An interactive scrollbar over the trailing edge (none by default):
+	-- the platform's (`true`), or drawn and timed as `Scrollbar` says.
+	scrollbar: (boolean | Scrollbar)?,
 	-- Its rows are one Tab stop, and the arrows, Page Up and Down, Home and
 	-- End move focus through every row (mounting it), as a list box's do.
 	keyboard: boolean?,
@@ -15614,6 +17315,10 @@ export type ListProps = {
 	-- stay put as estimates are measured. With `key`, heights go with
 	-- their items.
 	measured: boolean?,
+	-- With `measured`, `data` and `key`: how a row's data makes its height, so
+	-- rows out of view stand at about what they will be and the scrollbar
+	-- tells the truth. Declared once; no script runs per row.
+	estimate: ListEstimate?,
 	-- Row `index`'s plain text: what copying a selection over rows the list
 	-- has not mounted takes. Without it, a row's text is what its row's
 	-- description shows (its texts, a row's side by side with tabs).
@@ -15656,6 +17361,10 @@ export type ListProps = {
 	-- where they are (a measured list's, by key).
 	on_start: (() -> ())?,
 	start_distance: number?,
+	-- Viewports of rows built ahead of each edge of its view in time frames
+	-- leave over, and kept as it scrolls away: 1 unless set; 0, it builds
+	-- what shows and its `overscan` alone.
+	ahead: number?,
 	-- Kept saying whether it rests at its end (within a few points): a
 	-- "jump to the latest" button shows while it does not.
 	at_end: State<boolean>?,
@@ -15834,6 +17543,9 @@ export type LayerProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -15865,6 +17577,11 @@ export type LayerProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -15886,14 +17603,21 @@ export type LayerProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -15973,6 +17697,16 @@ export type LayerProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -15997,6 +17731,9 @@ export type LayerProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -16014,6 +17751,10 @@ export type LayerProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -16074,7 +17815,6 @@ export type LayerProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	open: State<boolean>?,
@@ -16247,6 +17987,9 @@ export type ModalProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -16278,6 +18021,11 @@ export type ModalProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -16299,14 +18047,21 @@ export type ModalProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -16386,6 +18141,16 @@ export type ModalProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -16410,6 +18175,9 @@ export type ModalProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -16427,6 +18195,10 @@ export type ModalProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -16487,7 +18259,6 @@ export type ModalProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	-- A state, written back as it closes; or, controlled, a function saying
@@ -16678,6 +18449,9 @@ export type PopoverProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -16709,6 +18483,11 @@ export type PopoverProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -16730,14 +18509,21 @@ export type PopoverProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -16817,6 +18603,16 @@ export type PopoverProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -16841,6 +18637,9 @@ export type PopoverProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -16858,6 +18657,10 @@ export type PopoverProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -16918,7 +18721,6 @@ export type PopoverProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	-- A state, written back as it closes; or, controlled, a function saying
@@ -17121,6 +18923,9 @@ export type MenuItemProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -17152,6 +18957,11 @@ export type MenuItemProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -17169,14 +18979,21 @@ export type MenuItemProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -17256,6 +19073,16 @@ export type MenuItemProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -17280,6 +19107,9 @@ export type MenuItemProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -17297,6 +19127,10 @@ export type MenuItemProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -17518,6 +19352,9 @@ export type SubmenuProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -17549,6 +19386,11 @@ export type SubmenuProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -17570,14 +19412,21 @@ export type SubmenuProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -17657,6 +19506,16 @@ export type SubmenuProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -17681,6 +19540,9 @@ export type SubmenuProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -17698,6 +19560,10 @@ export type SubmenuProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -17758,7 +19624,6 @@ export type SubmenuProps = {
 	min: number?,
 	max: number?,
 	step: number?,
-	value_text: Reactive<string>?,
 	on_change: ((value: number) -> ...unknown)?,
 	keyboard: boolean?,
 	-- A state, written back as it closes; or, controlled, a function saying
@@ -17937,6 +19802,9 @@ export type WebViewProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -17968,6 +19836,11 @@ export type WebViewProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -17989,14 +19862,21 @@ export type WebViewProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -18076,6 +19956,16 @@ export type WebViewProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -18097,6 +19987,9 @@ export type WebViewProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -18114,6 +20007,10 @@ export type WebViewProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -18361,6 +20258,9 @@ export type TerminalProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -18392,6 +20292,11 @@ export type TerminalProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -18413,14 +20318,21 @@ export type TerminalProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -18500,6 +20412,16 @@ export type TerminalProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -18524,6 +20446,9 @@ export type TerminalProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -18541,6 +20466,10 @@ export type TerminalProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -18754,6 +20683,9 @@ export type GpuViewProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -18785,6 +20717,11 @@ export type GpuViewProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -18806,14 +20743,21 @@ export type GpuViewProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -18893,6 +20837,16 @@ export type GpuViewProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -18917,6 +20871,9 @@ export type GpuViewProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -18934,6 +20891,10 @@ export type GpuViewProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -19148,6 +21109,9 @@ export type SlotProps = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -19179,6 +21143,11 @@ export type SlotProps = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -19200,14 +21169,21 @@ export type SlotProps = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -19287,6 +21263,16 @@ export type SlotProps = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -19311,6 +21297,9 @@ export type SlotProps = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -19328,6 +21317,10 @@ export type SlotProps = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -19381,7 +21374,7 @@ export type SlotProps = {
 -- offer.
 -- The hooks this app declares (`hook = "…"`).
 export type HookName = "toolbar.add"
-export type HookTarget = "#add" | "#all-clear" | "#api" | "#app" | "#appearance" | "#area_" | "#attach" | "#back" | "#ball" | "#banner" | "#board" | "#body" | "#budget" | "#buffer_menu" | "#busy" | "#button" | "#c1" | "#cancel" | "#cargo" | "#catalog" | "#city" | "#clear" | "#close-settings" | "#components" | "#compose" | "#composer" | "#confirm-remove" | "#copies" | "#copy_env" | "#ctx" | "#customer" | "#dark" | "#day" | "#delete" | "#docs" | "#documents" | "#done" | "#draft" | "#drawing" | "#drop-hint" | "#dropdown_catcher" | "#due" | "#duplicate" | "#editor" | "#ellipse" | "#emoji" | "#empty" | "#export_menu" | "#failure" | "#field-fill" | "#field-name" | "#file" | "#files" | "#filters" | "#find" | "#find-bar" | "#find-case" | "#find-close" | "#find-count" | "#find-next" | "#find-previous" | "#fit_frame" | "#focus" | "#folders" | "#forward" | "#frame_card" | "#frame_title" | "#frame_trace" | "#fruit" | "#g" | "#glyphs" | "#groceries" | "#guide" | "#highlight_" | "#id" | "#inbox" | "#inspector" | "#keep" | "#knob" | "#latest" | "#live" | "#load-error" | "#loading" | "#logs_menu" | "#m1" | "#m2" | "#main" | "#menu_catcher" | "#menu_dim" | "#menu_layer" | "#messages" | "#model" | "#more_menu" | "#n" | "#new" | "#new-tab" | "#next" | "#next_frame" | "#notes" | "#notifications" | "#o" | "#open" | "#open-dialog" | "#open-palette" | "#open-settings" | "#orbs" | "#orders" | "#other" | "#overlay_" | "#overlays_button" | "#overlays_hide_all" | "#overlays_menu" | "#palette" | "#panes" | "#pay" | "#plot" | "#prev_frame" | "#previous" | "#profiler" | "#range" | "#readme" | "#receive" | "#reconnect" | "#record" | "#record_start" | "#record_toggle" | "#rect" | "#redo" | "#refresh" | "#reload" | "#remove-error" | "#replace" | "#replace-all" | "#replace-one" | "#reply" | "#result_" | "#retry" | "#return" | "#revert" | "#role" | "#rows" | "#rtl" | "#runner" | "#runtime_menu" | "#s" | "#save" | "#save-error" | "#scroller" | "#search" | "#search_input" | "#search_menu" | "#select" | "#send" | "#settings" | "#ship" | "#sidebar" | "#sketch" | "#sliders" | "#snapping" | "#span_" | "#span_tooltip" | "#spans" | "#src" | "#stamp" | "#start" | "#state-" | "#status" | "#status-bar" | "#status-caret" | "#status-language" | "#status-message" | "#status-wrap" | "#status_bar" | "#status_buffer" | "#status_logs" | "#stop" | "#subject" | "#tab_placeholder" | "#target_button" | "#tasks" | "#team" | "#theme" | "#thinking" | "#thread-body" | "#thread-subject" | "#timeline" | "#title" | "#title_bar" | "#toast" | "#toast-error" | "#toasts" | "#toggle-dark" | "#toggle-rtl" | "#toolbar" | "#tooltip_" | "#total" | "#track" | "#transcript" | "#typing" | "#undo" | "#view-menu" | "#volume" | "#welcome" | "#zoom" | "#zoom-in" | "#zoom-out" | "hook:toolbar.add" | ".bar" | ".dot" | ".row" | ".scoped" | ".sq" | ".word"
+export type HookTarget = "#add" | "#all-clear" | "#api" | "#app" | "#appearance" | "#area_" | "#attach" | "#back" | "#ball" | "#banner" | "#board" | "#body" | "#budget" | "#buffer_menu" | "#busy" | "#button" | "#c1" | "#cancel" | "#cargo" | "#catalog" | "#city" | "#clear" | "#close-settings" | "#components" | "#compose" | "#composer" | "#confirm-remove" | "#copies" | "#copy_env" | "#ctx" | "#customer" | "#dark" | "#day" | "#delete" | "#docs" | "#documents" | "#done" | "#draft" | "#drawing" | "#drop-hint" | "#dropdown_catcher" | "#due" | "#duplicate" | "#editor" | "#ellipse" | "#emoji" | "#empty" | "#export_menu" | "#failure" | "#field-fill" | "#field-name" | "#file" | "#files" | "#filters" | "#find" | "#find-bar" | "#find-case" | "#find-close" | "#find-count" | "#find-next" | "#find-previous" | "#fit_frame" | "#focus" | "#folders" | "#forward" | "#frame_card" | "#frame_title" | "#frame_trace" | "#fruit" | "#g" | "#glyphs" | "#groceries" | "#guide" | "#highlight_" | "#id" | "#inbox" | "#inspector" | "#keep" | "#knob" | "#latest" | "#live" | "#load-error" | "#loading" | "#logs_menu" | "#m1" | "#m2" | "#main" | "#menu_catcher" | "#menu_dim" | "#menu_layer" | "#messages" | "#model" | "#more_menu" | "#n" | "#new" | "#new-tab" | "#next" | "#next_frame" | "#notes" | "#notifications" | "#o" | "#open" | "#open-dialog" | "#open-palette" | "#open-settings" | "#orbs" | "#orders" | "#other" | "#overlay_" | "#overlays_button" | "#overlays_hide_all" | "#overlays_menu" | "#palette" | "#panes" | "#pay" | "#plot" | "#prev_frame" | "#previous" | "#profiler" | "#range" | "#readme" | "#receive" | "#reconnect" | "#record" | "#record_start" | "#record_toggle" | "#rect" | "#redo" | "#refresh" | "#reload" | "#remove-error" | "#replace" | "#replace-all" | "#replace-one" | "#reply" | "#result_" | "#retry" | "#return" | "#revert" | "#role" | "#rows" | "#rtl" | "#runner" | "#runtime_menu" | "#s" | "#save" | "#save-error" | "#scroller" | "#search" | "#search_input" | "#search_menu" | "#select" | "#send" | "#settings" | "#ship" | "#sidebar" | "#sketch" | "#sliders" | "#snapping" | "#span_" | "#span_tooltip" | "#spans" | "#src" | "#stamp" | "#start" | "#state-" | "#status" | "#status-bar" | "#status-caret" | "#status-language" | "#status-message" | "#status-wrap" | "#status_bar" | "#status_buffer" | "#status_logs" | "#stop" | "#subject" | "#tab_placeholder" | "#target_button" | "#task" | "#tasks" | "#team" | "#theme" | "#thinking" | "#thread-body" | "#thread-subject" | "#timeline" | "#title" | "#title_bar" | "#toast" | "#toast-error" | "#toasts" | "#toggle-dark" | "#toggle-rtl" | "#toolbar" | "#tooltip_" | "#total" | "#track" | "#transcript" | "#typing" | "#undo" | "#view-menu" | "#volume" | "#welcome" | "#zoom" | "#zoom-in" | "#zoom-out" | "hook:toolbar.add" | ".bar" | ".dot" | ".row" | ".scoped" | ".sq" | ".word"
 -- A target inside others (`"#sidebar >> .session-row"`): any text, since a
 -- chain's parts combine freely; `zgx lint` checks each `#id` and `hook:`.
 export type HookChain = string
@@ -19592,6 +21585,9 @@ export type EachOptions = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -19623,6 +21619,11 @@ export type EachOptions = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -19644,14 +21645,21 @@ export type EachOptions = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -19731,6 +21739,16 @@ export type EachOptions = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -19755,6 +21773,9 @@ export type EachOptions = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -19772,6 +21793,10 @@ export type EachOptions = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -20000,6 +22025,9 @@ export type PresenceOptions = {
 	-- in a Japanese app), over the app's locale and a line's kana, and
 	-- assistive technology reads it in that language.
 	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
 	-- Transforms: after layout, about `origin` (fractions of the node).
 	x: Props_x,
 	y: Props_y,
@@ -20031,6 +22059,11 @@ export type PresenceOptions = {
 	variants: Props_variants,
 	ref: Props_ref,
 	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
 	-- While focus is in it, every key goes to what is focused: no shortcut
 	-- or menu item takes one (a field recording a shortcut). As focus
 	-- leaves, shortcuts work again.
@@ -20052,14 +22085,21 @@ export type PresenceOptions = {
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
-	-- Read after its name, as a hint (`aria-description`).
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
 	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
 	-- What is wrong with its value (`aria-invalid`), followed: nil while it
 	-- is fine. Assistive technology hears it with the field.
 	error: Props_error,
 	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
 	-- decoration, or what is said elsewhere.
 	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
 	-- One Tab stop for the focusable things inside; the arrows along this
 	-- axis (and Home, End) move among them, as ARIA's composite widgets
 	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
@@ -20139,6 +22179,16 @@ export type PresenceOptions = {
 	layer_shader: Props_layer_shader,
 	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
 	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
 	-- Primary pointer down and up.
@@ -20163,6 +22213,9 @@ export type PresenceOptions = {
 	on_file_hover: Props_on_file_hover,
 	on_hover: Props_on_hover,
 	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
 	-- Return true to consume the key.
 	on_key: Props_on_key,
 	on_key_up: Props_on_key_up,
@@ -20180,6 +22233,10 @@ export type PresenceOptions = {
 	-- clip and scroll viewport above it), and at its first layout: for
 	-- building what only matters on screen.
 	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
 	-- Drag and drop within the window. Payloads are what `on_drag`
 	-- returns: the script's own plain values, so they are `any` here.
 	-- A source: `on_drag` returns the payload once the pointer moves 4
@@ -20238,6 +22295,23 @@ export type CaseKey = string | number | boolean
 export type TweenEnd = number | string | { number }
 export type TweenOptions = { duration: number?, ease: Easing?, from: TweenEnd?, to: TweenEnd?, [number]: never }
 export type SpringOptions = { stiffness: number?, damping: number?, from: TweenEnd?, to: TweenEnd?, [number]: never }
+export type SpringToOptions = {
+	response: number?,
+	bounce: number?,
+	stiffness: number?,
+	damping: number?,
+	-- Points a second to start from, for what a gesture hands over.
+	velocity: number?,
+	-- Where the spring itself begins, if not at the state: the state stays where it
+	-- is until the spring has passed it.
+	from: number?,
+	-- Ms before it moves.
+	delay: number?,
+	-- Ms, by when it lands whatever the spring says.
+	most: number?,
+	-- When it arrives.
+	done: (() -> ())?,
+}
 export type LoopOptions = {
 	duration: number?,
 	ease: Easing?,
@@ -20419,7 +22493,7 @@ declare ui: {
 	-- from its uses, which misfires). A row whose item changes is built
 	-- again; a `build` taking a third parameter gets the row's item as
 	-- state instead, kept current, and its row updates in place.
-	each: (list: State<{ any }> | { any }, build: (item: any, index: number, row: State<any>) -> Node, opts: EachOptions?) -> Node,
+	each: (list: State<{ any }> | ReadOnlyState<{ any }> | { any }, build: (item: any, index: number, row: State<any>) -> Node, opts: EachOptions?) -> Node,
 	-- What `build` makes of the value, entering and exiting as it changes;
 	-- nil shows nothing. The value is `any`, as `each`'s item is.
 	presence: (value: string | Readable<unknown> | (() -> unknown), build: (value: any) -> Node, opts: PresenceOptions?) -> Node,
@@ -20478,7 +22552,7 @@ declare ui: {
 	-- table, img; runs `{ x, b?, i?, c?, s?, a?, f? }`). With `key` (a
 	-- reply's id), text growing under it parses only its new end, and its
 	-- earlier blocks are the same tables as before.
-	markdown: (text: string, opts: MarkdownOptions?) -> { MarkdownBlock },
+	markdown: <T>(text: T, opts: MarkdownOptions?) -> TextOrState<T, { MarkdownBlock }, ReadOnlyState<{ MarkdownBlock }>>,
 	-- Markdown drawn: paragraphs, headings, lists, quotes, tables, and code
 	-- blocks with a Copy button, in the theme's colours and sizes,
 	-- selectable. As its text changes it parses only what changed and
@@ -20562,8 +22636,10 @@ declare ui: {
 	paged: <T, C>(load: (cursor: C?) -> { items: { T }, next: C? }) -> Paged<T>,
 	-- `state` once it has stayed unchanged for `ms` (a search box's query):
 	-- read-only (as `ui.computed`'s: a write is an error), its timer begun
-	-- again on each change, gone with its owner.
-	debounced: <T>(state: State<T>, ms: number) -> State<T>,
+	-- again on each change, gone with its owner. `every`: what reads it is
+	-- told at each rest, even when the value is the one it already held (a
+	-- view's offset come back to where it last rested).
+	debounced: <T>(state: State<T>, ms: number, opts: { every: boolean? }?) -> State<T>,
 	-- A connection kept open to `url` (a WebSocket) through the host's
 	-- connector, as `useWebSocket`: messages to `on_message`, `send` queued
 	-- while it is not open and sent in order once it is, opened again after
@@ -20649,6 +22725,9 @@ declare ui: {
 	tween: (state: State<any>, opts: TweenOptions?) -> Binding,
 	spring: (state: State<any>, opts: SpringOptions?) -> Binding,
 	loop: (opts: LoopOptions?) -> Binding,
+	-- Run a state to `target` on a spring now, in Rust. The function it returns
+	-- stops it and says how fast it was going.
+	spring_to: (state: State<number>, target: number, opts: SpringToOptions?) -> () -> number,
 	-- White pixels with the alpha `alpha(x, y)` gives (0 to 1), for masks.
 	bitmap: (w: number, h: number, alpha: (x: number, y: number) -> number) -> Bitmap,
 	-- A WGSL fill: `fn fill(input: FillInput) -> vec4<f32>`, with input.p,
@@ -20656,9 +22735,12 @@ declare ui: {
 	shader: (source: string, opts: { fps: number? }?) -> Shader,
 	-- A WGSL layer shader: `fn layer(input: LayerInput) -> vec4<f32>`, with
 	-- input.color (the layer's pixel, straight alpha), input.p, input.size,
-	-- input.time, input.scale and input.params; `zgx_sample(p)` reads the
-	-- layer at another point of the box.
-	layer_shader: (source: string, opts: { fps: number? }?) -> LayerShader,
+	-- input.time, input.scale, input.params and input.radii (the box's corners);
+	-- `zgx_sample(p)` reads the layer at another point, and `zgx_backdrop(p)`
+	-- what lies behind the node there.
+	layer_shader: (source: string, opts: LayerShaderOptions?) -> LayerShader,
+	-- A box of glass: macOS 26's own where it can be, drawn elsewhere.
+	glass: (opts: GlassProps) -> Node,
 	-- Sorts `list` in place, stably, by a field of each item (`"price"`) or
 	-- a function of it (called once an item); returns it. Use it over
 	-- `table.sort` with a comparator for long lists: that calls Luau some

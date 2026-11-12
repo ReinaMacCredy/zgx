@@ -41,6 +41,22 @@ pub(crate) fn spawn<T: Send + Sync + 'static>(
     slot
 }
 
+/// `spawn`, or with `here` (a renderer that waits for its shaders anyway:
+/// offscreen, or told to, `GpuRenderer::waits_for_shaders`) `make` run on
+/// this thread, its slot filled when this returns. Such a renderer would
+/// only block for the compile thread; meanwhile both threads allocated, and
+/// how their allocations interleaved moved what its frames counted (the
+/// gate's fx cells, run to run, by up to 0.46%).
+pub(crate) fn start<T: Send + Sync + 'static>(
+    here: bool,
+    make: impl FnOnce() -> T + Send + 'static,
+) -> Slot<T> {
+    if here {
+        return Arc::new(OnceLock::from(make()));
+    }
+    spawn(make)
+}
+
 /// A compile started or done, in a renderer's cache of pipelines by shader.
 pub(crate) enum Compiled<T> {
     Pending(Slot<Option<T>>),
@@ -93,6 +109,16 @@ pub fn warm_fill_shader(shader: &Arc<zgx::decoration::FillShader>) {
     declared.retain(|shader| shader.strong_count() > 0);
     declared.push(Arc::downgrade(shader));
     DECLARED_COUNT.fetch_add(1, Ordering::Release);
+}
+
+/// Whether `shader` is one declared (`warm_fill_shader`) and still held.
+#[cfg(test)]
+pub(crate) fn is_declared(shader: &Arc<zgx::decoration::FillShader>) -> bool {
+    let declared = DECLARED.lock().unwrap_or_else(|p| p.into_inner());
+    declared.iter().any(|held| {
+        held.upgrade()
+            .is_some_and(|held| Arc::ptr_eq(&held, shader))
+    })
 }
 
 /// How many fill shaders scripts have declared (`declared_since`).

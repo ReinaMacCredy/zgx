@@ -10,6 +10,9 @@ use std::{
 type EffectId = u64;
 trait Dependency {
     fn unsubscribe(&self, id: EffectId);
+    /// What it takes beside its value (a memory report's): itself, in its
+    /// `Rc`, and its subscribers.
+    fn bytes(&self) -> usize;
 }
 /// One allocation: the closure lives in the `Rc` itself.
 type Callback = Rc<RefCell<dyn FnMut()>>;
@@ -125,7 +128,11 @@ impl Effects {
     /// is left, and what is made next takes the lowest. (A slot's id never
     /// comes back, so that one gone and made again names no stale effect.)
     fn rest(&mut self) {
-        while self.slots.last().is_some_and(|(_, record)| record.is_none()) {
+        while self
+            .slots
+            .last()
+            .is_some_and(|(_, record)| record.is_none())
+        {
             self.slots.pop();
         }
         let left = self.slots.len() as u32;
@@ -165,6 +172,8 @@ struct Inner {
     /// field, not an extension: `extension` scans in order, and an entry
     /// ahead of `Themes` would tax every theme read.
     idle: RefCell<Vec<std::rc::Weak<dyn Fn()>>>,
+    /// A host's idle trim was asked for (`idle::request`).
+    idle_requested: Cell<bool>,
     /// What effects made while they ran (`Runtime::own`), by effect: few
     /// ever do, so a side map rather than a field each.
     owned: RefCell<Owned>,
@@ -725,6 +734,12 @@ impl Runtime {
         let _restore = Restore(&self.inner, self.inner.batch_depth.replace(0));
         self.flush();
     }
+    /// Whether a flush now would find nothing to run: no observer queued, and
+    /// no write waiting to queue one. `settle` then does nothing.
+    #[doc(hidden)]
+    pub fn nothing_due(&self) -> bool {
+        self.inner.queued.borrow().is_empty() && self.inner.pending.borrow().is_empty()
+    }
     /// Run queued observers. Reentrant writes join the current flush.
     pub fn flush(&self) {
         if self.inner.batch_depth.get() != 0 || self.inner.flushing.replace(true) {
@@ -796,6 +811,72 @@ impl Runtime {
         }
         self.inner.stopped.set(self.inner.stopped.get() + stopped);
     }
+    /// The runtime's lines of a memory report: its effects (each closure's
+    /// captures and what it reads), the signals they read (without their
+    /// values, which their holders count), and the values effects own.
+    /// Worked out only as a report asks; none if a run holds the tables.
+    #[cold]
+    pub fn memory(&self, report: &mut crate::memory::Report) {
+        use crate::memory::{map_bytes, vec_bytes};
+        let (Ok(effects), Ok(owned)) = (
+            self.inner.effects.try_borrow(),
+            self.inner.owned.try_borrow(),
+        ) else {
+            return;
+        };
+        let mut bytes = vec_bytes(&effects.slots) + vec_bytes(&effects.free);
+        let mut callbacks = rustc_hash::FxHashSet::default();
+        let mut signals = rustc_hash::FxHashSet::default();
+        let mut signal_bytes = 0;
+        for record in effects
+            .slots
+            .iter()
+            .filter_map(|(_, record)| record.as_ref())
+        {
+            // A callback shared by effects counts once.
+            if callbacks.insert(Rc::as_ptr(&record.callback) as *const () as usize) {
+                bytes += 2 * size_of::<usize>() + size_of_val(&*record.callback);
+            }
+            if record.dependencies.spilled() {
+                bytes += record.dependencies.capacity() * size_of::<Subscription>();
+            }
+            for dependency in &record.dependencies {
+                if signals.insert(dependency.key as usize)
+                    && let Some(source) = dependency.source.upgrade()
+                {
+                    signal_bytes += source.bytes();
+                }
+            }
+        }
+        bytes += self
+            .inner
+            .queued
+            .try_borrow()
+            .map_or(0, |queued| vec_bytes(&queued));
+        if let Ok(order) = self.inner.order.try_borrow() {
+            bytes += vec_bytes(&order.bits) + vec_bytes(&order.slots);
+        }
+        report.add("reactive", "effects", Some(effects.len()), Some(bytes));
+        report.add(
+            "reactive",
+            "signals read",
+            Some(signals.len()),
+            Some(signal_bytes),
+        );
+        let values = owned.values().map(Vec::len).sum();
+        let owned_bytes = map_bytes(&owned)
+            + owned
+                .values()
+                .map(|values| {
+                    vec_bytes(values)
+                        + values
+                            .iter()
+                            .map(|value| size_of_val(&**value))
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        report.add("reactive", "owned values", Some(values), Some(owned_bytes));
+    }
     /// How many effects are alive (not stopped).
     pub fn effect_count(&self) -> usize {
         self.inner.effects.borrow().len() - self.inner.stopped.get()
@@ -803,6 +884,10 @@ impl Runtime {
     /// What `idle::on_idle` registered.
     pub(crate) fn idle_trims(&self) -> &RefCell<Vec<std::rc::Weak<dyn Fn()>>> {
         &self.inner.idle
+    }
+    /// Whether a host's idle trim is asked for (`idle::request`).
+    pub(crate) fn idle_requested(&self) -> &Cell<bool> {
+        &self.inner.idle_requested
     }
     /// The runtime's one value of type `T`, made by `init` the first time
     /// it is asked for, so that independent parts of an application (its
@@ -948,6 +1033,14 @@ struct SignalInner<T> {
 impl<T> Dependency for SignalInner<T> {
     fn unsubscribe(&self, id: EffectId) {
         self.subscribers.borrow_mut().remove(&id);
+    }
+    fn bytes(&self) -> usize {
+        2 * size_of::<usize>()
+            + size_of::<Self>()
+            + self
+                .subscribers
+                .try_borrow()
+                .map_or(0, |subscribers| crate::memory::set_bytes(&subscribers))
     }
 }
 /// Effects held by [`Runtime::hold_effects`] until it drops.
@@ -1152,10 +1245,14 @@ impl<T: 'static> Signal<T> {
 }
 
 /// Lexically scoped, typed service storage for a future compiler's `provide` nodes.
+///
+/// A copy shares this scope's values until either provides one (they're
+/// copied then), so a copy costs two counts, and a scope that provides
+/// nothing holds no map.
 #[derive(Clone, Default)]
 pub struct ServiceScope {
     parent: Option<Rc<ServiceScope>>,
-    values: HashMap<TypeId, Rc<dyn Any>>,
+    values: Option<Rc<HashMap<TypeId, Rc<dyn Any>>>>,
 }
 impl ServiceScope {
     /// An empty scope with no parent.
@@ -1167,19 +1264,21 @@ impl ServiceScope {
     pub fn child(&self) -> Self {
         Self {
             parent: Some(Rc::new(self.clone())),
-            values: HashMap::new(),
+            values: None,
         }
     }
     /// Store `value` as this scope's `T`, replacing any; returns it shared.
     pub fn provide<T: 'static>(&mut self, value: T) -> Rc<T> {
         let value = Rc::new(value);
-        self.values.insert(TypeId::of::<T>(), value.clone());
+        Rc::make_mut(self.values.get_or_insert_with(Default::default))
+            .insert(TypeId::of::<T>(), value.clone());
         value
     }
     /// The nearest `T`: this scope's, else its parent's, and so on up.
     pub fn get<T: 'static>(&self) -> Option<Rc<T>> {
         self.values
-            .get(&TypeId::of::<T>())
+            .as_ref()
+            .and_then(|values| values.get(&TypeId::of::<T>()))
             .cloned()
             .and_then(|value| value.downcast().ok())
             .or_else(|| self.parent.as_ref().and_then(|parent| parent.get()))
@@ -1189,8 +1288,66 @@ impl ServiceScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A copy of a scope shares its values until one provides, and then
+    /// neither sees what the other provided after the copy, either way; a
+    /// child sees its parent's as they were, under what it provides itself.
+    #[test]
+    fn a_copied_scope_never_sees_what_the_other_provides_after() {
+        let mut scope = ServiceScope::new();
+        assert!(scope.get::<u32>().is_none());
+        scope.provide(1_u32);
+        let mut copy = scope.clone();
+        assert!(Rc::ptr_eq(
+            scope.values.as_ref().unwrap(),
+            copy.values.as_ref().unwrap()
+        ));
+        assert_eq!(copy.get::<u32>().as_deref(), Some(&1));
+        // The copy provides: the original doesn't see it.
+        copy.provide(2_u32);
+        copy.provide("copy");
+        assert_eq!(copy.get::<u32>().as_deref(), Some(&2));
+        assert_eq!(scope.get::<u32>().as_deref(), Some(&1));
+        assert!(scope.get::<&str>().is_none());
+        // The original provides: the copy doesn't see it.
+        scope.provide(3_u64);
+        scope.provide(4_u32);
+        assert!(copy.get::<u64>().is_none());
+        assert_eq!(copy.get::<u32>().as_deref(), Some(&2));
+        assert_eq!(scope.get::<u32>().as_deref(), Some(&4));
+        // A child sees its parent's, under its own.
+        let mut child = scope.child();
+        assert_eq!(child.get::<u64>().as_deref(), Some(&3));
+        child.provide(5_u64);
+        assert_eq!(child.get::<u64>().as_deref(), Some(&5));
+        assert_eq!(scope.get::<u64>().as_deref(), Some(&3));
+        assert!(
+            ServiceScope::new().values.is_none(),
+            "an empty scope holds no map"
+        );
+    }
     /// Queued ids come out newest first, as a sort leaves them, whether
     /// they are close together (a bitmap orders them) or far apart.
+    /// `settle` skips its clocks on this: true only when it would run nothing.
+    #[test]
+    fn nothing_is_due_only_when_a_flush_would_run_nothing() {
+        let runtime = Runtime::new();
+        let value = runtime.signal(0);
+        let seen = Rc::new(Cell::new(0));
+        let (read, wrote) = (value.clone(), seen.clone());
+        let _effect = runtime.effect(move || wrote.set(read.get()));
+        runtime.flush();
+        assert!(runtime.nothing_due());
+        runtime.batch(|| {
+            value.set(1);
+            assert!(!runtime.nothing_due(), "a write waits in the batch");
+            assert_eq!(seen.get(), 0);
+            runtime.settle();
+            assert_eq!(seen.get(), 1, "settling runs it");
+            assert!(runtime.nothing_due());
+        });
+        assert!(runtime.nothing_due());
+    }
+
     #[test]
     fn queued_effects_are_ordered_newest_first() {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;

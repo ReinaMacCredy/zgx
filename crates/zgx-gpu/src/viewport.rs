@@ -51,7 +51,9 @@ pub struct ViewportFrame<'a> {
     pub size: (u32, u32),
     /// Device pixels a point.
     pub scale: f32,
-    /// When it is drawn.
+    /// When it is drawn, on the interface's time (`zgx::clock::now`: a
+    /// virtual clock's while one runs, so a video's frames repeat), one
+    /// instant for every view and box of a window's frame.
     pub time: std::time::Instant,
 }
 
@@ -76,7 +78,7 @@ impl<'a> ViewportFrame<'a> {
             format,
             size,
             scale,
-            time: std::time::Instant::now(),
+            time: zgx::clock::now(),
         }
     }
 }
@@ -363,6 +365,12 @@ pub(crate) struct Views {
     /// comes back for it (`GpuRenderer::planes_owed`).
     #[cfg(target_os = "macos")]
     pub(crate) owed: bool,
+    /// This frame's time (`zgx::clock::now`), read by its first view's
+    /// render, with the frame it's for (`GpuRenderer::image_frame`): every
+    /// view and every box of one in a frame is drawn at the same instant,
+    /// so what steps once a frame time steps once. A window with no view
+    /// never reads it.
+    time: std::cell::Cell<Option<(u64, std::time::Instant)>>,
 }
 /// A box on a plane: its node, the frame it last drew, its box, and the
 /// drawables' textures as wgpu's, by Metal texture (the pool's few).
@@ -412,6 +420,9 @@ impl Views {
     }
 }
 
+/// What GPU views' textures may hold together, whatever pictures hold.
+const VIEW_TEXTURES: usize = 64 * 1024 * 1024;
+
 impl GpuRenderer {
     /// Draw `image`, a frame of a GPU view, into the view's texture (made, or
     /// remade at a new size) and cache it under the frame's id in place of
@@ -446,12 +457,45 @@ impl GpuRenderer {
             Some(kept) => kept,
             None => {
                 let bytes = size.0 as usize * size.1 as usize * 4;
-                if bytes + self.images.values().map(|entry| entry.1).sum::<usize>()
-                    > 64 * 1024 * 1024
-                {
-                    return Err(GpuError(
-                        "visible image and GPU view textures exceed their budget".into(),
-                    ));
+                let budget = VIEW_TEXTURES;
+                let mut held = self.images.values().map(|entry| entry.1).sum::<usize>();
+                if bytes + held > budget {
+                    // Images not showing give their textures back, least
+                    // recently drawn first: drawn again, they upload again.
+                    // (A video's clip leaves a frame's picture behind each
+                    // frame; a 3D view after it found the budget spent.) Not
+                    // those not marked drawn: a frame paints what it kept
+                    // without marking it (`images_showing`).
+                    let showing = self.images_showing();
+                    let mut idle: Vec<(u64, u64)> = (self.image_drawn.iter())
+                        .filter(|(id, _)| !showing.contains(*id))
+                        .map(|(id, drawn)| (*drawn, *id))
+                        .collect();
+                    idle.sort_unstable();
+                    for (_, id) in idle {
+                        if bytes + held <= budget {
+                            break;
+                        }
+                        self.image_drawn.remove(&id);
+                        if let Some(entry) = self.images.remove(&id) {
+                            held -= entry.1;
+                        }
+                    }
+                }
+                // Views answer to a budget of their own, not to pictures': a
+                // view is a target its box bounds and goes when it goes, and
+                // pictures showing may rightly hold all of theirs (a film's
+                // wallpaper, large on a magnified board), and aren't to go
+                // softer or blank for a view.
+                let views = self.views.as_ref().expect("made above");
+                let (shown, count) = (views.shown.values())
+                    .filter_map(|last| self.images.get(&last.image))
+                    .fold((0, 0), |(bytes, count), entry| (bytes + entry.1, count + 1));
+                if bytes + shown > VIEW_TEXTURES {
+                    return Err(GpuError(format!(
+                        "GPU view textures exceed their budget: a view of {bytes} bytes, \
+                         {shown} held by {count} other views"
+                    )));
                 }
                 let texture = self.view_texture(key, size);
                 let target = texture.create_view(&Default::default());
@@ -490,7 +534,23 @@ impl GpuRenderer {
     /// Have view `key.0`'s painter draw a frame of `size` into `target`, its
     /// work submitted before the frame showing it. Nothing if the view is
     /// gone.
-    fn paint(
+    /// This frame's time for its views: read from the interface's clock by
+    /// the first to draw, the same for the rest.
+    fn view_time(&self) -> std::time::Instant {
+        let frame = self.image_frame;
+        let Some(views) = self.views.as_ref() else {
+            return zgx::clock::now();
+        };
+        match views.time.get() {
+            Some((at, time)) if at == frame => time,
+            _ => {
+                let time = zgx::clock::now();
+                views.time.set(Some((frame, time)));
+                time
+            }
+        }
+    }
+    pub(crate) fn paint(
         &self,
         key: (u64, u64),
         size: (u32, u32),
@@ -526,7 +586,9 @@ impl GpuRenderer {
             format,
             size,
             scale: self.scale,
-            time: std::time::Instant::now(),
+            // The interface's time (a video's virtual clock's while one
+            // runs), read once a frame: the same for every view and box.
+            time: self.view_time(),
         });
         // Ahead of the frame sampling it (or its drawable's present), which
         // is recorded after this and submitted later on the same queue.
@@ -847,6 +909,8 @@ impl GpuRenderer {
             return Ok(false);
         };
         views.owed = false;
+        // A frame of its own: its views' time read again.
+        views.time.set(None);
         let due: Vec<_> = views
             .planes
             .values()

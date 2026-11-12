@@ -6,7 +6,9 @@
 //! - `p` (`s`: runs), `h` (`l`: level, `s`), `code` (`lang`, `text`, and
 //!   what [`Options::code`] adds), `ul` / `ol` (`start`, `items`: a list of
 //!   block lists), `quote` (`b`), `hr`, `table` (`head`: cells, `rows`:
-//!   rows of cells; a cell is runs), `img` (`src`, `alt`).
+//!   rows of cells; a cell is runs; `align`, only where the source aligns a
+//!   column: each column's side, `"start"`, `"center"`, `"end"`, or `""`
+//!   where it says none), `img` (`src`, `alt`).
 //!
 //! A list item's own text (a tight list's, never a paragraph) is a `p`
 //! with `tight`, which has no space under it.
@@ -27,7 +29,8 @@ pub(crate) mod view;
 pub use mend::PENDING_LINK_URL;
 
 use crate::Value;
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
+use mlua::IntoLua;
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 use std::rc::Rc;
 
 /// How text is read.
@@ -49,7 +52,8 @@ pub type CodeFields = Rc<dyn Fn(&str, &str) -> Vec<(&'static str, Value)>>;
 
 /// Markdown parsed into blocks.
 pub fn parse(text: &str, options: &Options) -> Vec<Value> {
-    parse_at(text, 0, options)
+    parse_at(text, 0, options, &Defs::default())
+        .tops
         .into_iter()
         .flat_map(|top| top.blocks)
         .collect()
@@ -57,7 +61,8 @@ pub fn parse(text: &str, options: &Options) -> Vec<Value> {
 
 /// Streaming markdown: [`set_text`](Self::set_text) with the text so far
 /// parses only what an append can have changed (the last two top-level
-/// blocks; a link reference definition anywhere means the whole text), and
+/// blocks, and the whole text once if a definition arrives for a reference
+/// ahead of them), and
 /// [`blocks`](Self::blocks) shares the blocks before that with the last
 /// answer. While a marker hangs at the end (`**bold`, a link's address half
 /// there), the blocks show it closed, so the text does not restyle and
@@ -70,8 +75,12 @@ pub struct Incremental {
     /// The last top-level block's blocks as shown, mended; `None` when
     /// nothing hangs.
     display_tail: Option<Vec<Value>>,
-    /// Link reference definitions act at a distance: whole parses only.
+    /// A second definition of a settled label, to another address: the first
+    /// wins over the whole text, which a tail alone can't hold to, so whole
+    /// parses from there.
     full_only: bool,
+    /// The definitions found, and the references to them.
+    defs: Defs,
     /// Bytes parsed by the last update: an append's work is its tail's.
     last_parse_bytes: usize,
     /// The last top-level block's mending so far, and where that block
@@ -85,6 +94,15 @@ pub struct Incremental {
     /// here down; 0 for none. (In the struct's padding: a parser that never
     /// parses lazily is the size it was.)
     pending_below: u32,
+    /// How many top-level elements, from the first, hold the very blocks
+    /// last answered: what changes them lowers it.
+    settled: usize,
+    /// The last answer of [`blocks_appended`](Self::blocks_appended), which
+    /// the next is grown from.
+    appended: Option<std::rc::Rc<crate::value::Appended>>,
+    /// How many blocks the top-level elements before each hold (`counts[i]`
+    /// for `tops[..i]`), as far as the settled ones: theirs stand.
+    counts: Vec<usize>,
 }
 
 /// A top-level element: where it starts, and the blocks it made (one, or
@@ -199,6 +217,7 @@ impl Incremental {
         self.source = text.to_string();
         self.full_only = false;
         self.tops = scan_tops(text);
+        self.settled = 0;
         for at in 0..self.tops.len() {
             // What it is, if it makes a block (raw HTML doesn't).
             if let Some(Value::Str(hint)) = self.tops[at].blocks.first().cloned() {
@@ -284,35 +303,48 @@ impl Incremental {
             return true;
         }
         let (from, to) = self.top_range(at);
-        let mut parsed = parse_at(&self.source[from..to], from, &self.options);
+        let mut parsed = parse_at(&self.source[from..to], from, &self.options, &self.defs).tops;
         if parsed.len() != 1 || parsed[0].blocks.len() > 1 {
             return false;
         }
         self.tops[at].blocks = std::mem::take(&mut parsed[0].blocks);
+        self.settled = self.settled.min(at);
         true
     }
     fn reset(&mut self, text: &str) {
         self.pending_below = 0;
         self.mender = None;
         self.source = text.to_string();
-        self.full_only = has_link_defs(text);
-        self.tops = parse_at(text, 0, &self.options);
-        self.last_parse_bytes = text.len();
+        self.full_only = false;
+        self.defs = Defs::default();
+        self.parse_whole();
+    }
+    /// The whole text parsed. Blocks that come out the same keep their
+    /// values, so what reads them passes over them at a pointer's glance.
+    fn parse_whole(&mut self) {
+        let parsed = parse_at(&self.source, 0, &self.options, &Defs::default());
+        let mut tops = parsed.tops;
+        // (Each on its own: a reference near the top changes only its block.)
+        let mut same = 0;
+        for (at, (new, old)) in tops.iter_mut().zip(&self.tops).enumerate() {
+            if new.start == old.start && new.blocks == old.blocks {
+                new.blocks = old.blocks.clone();
+                if same == at {
+                    same = at + 1;
+                }
+            }
+        }
+        self.tops = tops;
+        self.settled = self.settled.min(same);
+        self.defs = Defs::default();
+        self.defs.note(0, parsed.found, parsed.named);
+        self.last_parse_bytes = self.source.len();
         self.remend();
     }
     fn append(&mut self, delta: &str) {
-        // The delta may finish a line begun earlier: look for definitions
-        // from that line's start.
-        let scan_from = self.source.rfind('\n').map_or(0, |i| i + 1);
         self.source.push_str(delta);
-        if !self.full_only && has_link_defs(&self.source[scan_from..]) {
-            self.full_only = true;
-        }
         if self.full_only {
-            self.tops = parse_at(&self.source, 0, &self.options);
-            self.last_parse_bytes = self.source.len();
-            self.remend();
-            return;
+            return self.parse_whole();
         }
         // From the start of the second-to-last top-level block, at its
         // line's start (indentation keeps its meaning): a trailing paragraph
@@ -321,10 +353,25 @@ impl Incremental {
         // so two blocks back is always enough.
         let boundary = match self.tops.len() {
             0 | 1 => 0,
-            n => self.tops[n - 2].start,
+            n => self.tail_start(n - 2),
         };
-        let boundary = self.source[..boundary].rfind('\n').map_or(0, |i| i + 1);
-        let mut tail = parse_at(&self.source[boundary..], boundary, &self.options);
+        let parsed = parse_at(
+            &self.source[boundary..],
+            boundary,
+            &self.options,
+            &self.defs,
+        );
+        // A definition that came, went or changed reaches back only to a
+        // reference ahead of this tail, if there is one.
+        match self.defs.note(boundary, parsed.found, parsed.named) {
+            Reach::Tail => {}
+            Reach::Whole => return self.parse_whole(),
+            Reach::Always => {
+                self.full_only = true;
+                return self.parse_whole();
+            }
+        }
+        let mut tail = parsed.tops;
         self.last_parse_bytes = self.source.len() - boundary;
         let at = self.tops.partition_point(|t| t.start < boundary);
         // A block parsed again the same keeps its value.
@@ -335,11 +382,40 @@ impl Incremental {
         }
         self.tops.truncate(at);
         self.tops.extend(tail);
+        self.settled = self.settled.min(at);
         // Pending ones are above the tail parsed again.
         if self.pending_below > 0 {
             self.pending_below = self.pending_below.min(at as u32);
         }
         self.remend();
+    }
+    /// Where a tail from top-level element `at` starts, at its line's start.
+    /// A reply with definitions starts it after a blank line, a whole element
+    /// at a time: definitions belong to no element, and a line right after
+    /// one reads otherwise than alone (indented, it isn't code).
+    fn tail_start(&self, mut at: usize) -> usize {
+        let line = |at: usize| {
+            self.source[..self.tops[at].start]
+                .rfind('\n')
+                .map_or(0, |i| i + 1)
+        };
+        if self.defs.known.is_empty() {
+            return line(at);
+        }
+        while at > 0 {
+            let ahead = &self.source[..line(at)];
+            let last_line = ahead.trim_end_matches(['\r', '\n']);
+            let blank = ahead.len() - last_line.len() >= 2
+                || last_line
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|l| l.trim().is_empty());
+            if blank {
+                return line(at);
+            }
+            at -= 1;
+        }
+        0
     }
     /// Mend hanging inline markers in the last top-level block, the only
     /// place they can hang (a blank line settles a block).
@@ -364,7 +440,7 @@ impl Incremental {
             return;
         };
         self.last_parse_bytes += mended.len();
-        let tail = parse_at(&mended, start, &self.options);
+        let tail = parse_at(&mended, start, &self.options, &self.defs).tops;
         self.display_tail = Some(tail.into_iter().flat_map(|t| t.blocks).collect());
     }
     /// The blocks to show: those before the last top-level block are the
@@ -385,71 +461,230 @@ impl Incremental {
         }
         out
     }
+    /// [`blocks`](Self::blocks) as one shared list, made in place: a long
+    /// reply's answer is one allocation, not a vector and its copy.
+    pub fn blocks_shared(&mut self) -> std::rc::Rc<[Value]> {
+        let stable = self.tops.len().saturating_sub(1);
+        let (head, tail) = self.head_and_tail();
+        let len = head.iter().map(|t| t.blocks.len()).sum::<usize>() + tail.len();
+        let mut list = std::rc::Rc::<[Value]>::new_uninit_slice(len);
+        let slots = std::rc::Rc::get_mut(&mut list).expect("made here, held nowhere else");
+        let blocks = head.iter().flat_map(|top| &top.blocks).chain(tail);
+        for (slot, block) in slots.iter_mut().zip(blocks) {
+            slot.write(block.clone());
+        }
+        (self.settled, self.appended) = (stable, None);
+        self.counts.clear();
+        // SAFETY: `len` is what `head` and `tail` hold, so every slot was
+        // written above.
+        unsafe { list.assume_init() }
+    }
+    /// [`blocks`](Self::blocks) as a list grown from the last answer: the
+    /// chunks of it wholly within the elements nothing changed since are
+    /// its own, so an answer costs what changed (`value::Appended`).
+    pub fn blocks_appended(&mut self) -> std::rc::Rc<crate::value::Appended> {
+        let stable = self.tops.len().saturating_sub(1);
+        // The counts of the settled elements stand: the others' are counted.
+        self.counts.truncate(self.settled.min(stable) + 1);
+        if self.counts.is_empty() {
+            self.counts.push(0);
+        }
+        for at in self.counts.len() - 1..stable {
+            let count = self.counts[at] + self.tops[at].blocks.len();
+            self.counts.push(count);
+        }
+        let (head, tail) = self.head_and_tail();
+        let counts = &self.counts[..=stable];
+        let shared = counts[self.settled.min(stable)];
+        let len = counts[stable] + tail.len();
+        let list = crate::value::Appended::grown(self.appended.as_ref(), shared, len, |start| {
+            // The element block `start` is in (or the last's, past them).
+            let at = counts.partition_point(|&count| count <= start) - 1;
+            let rest = head[at..].iter().flat_map(|top| &top.blocks).chain(tail);
+            Box::new(rest.skip(start - counts[at]))
+        });
+        self.settled = stable;
+        self.appended = Some(list.clone());
+        list
+    }
+    /// The elements before the last, and the last's blocks as shown.
+    fn head_and_tail(&self) -> (&[Top], &[Value]) {
+        let stable = self.tops.len().saturating_sub(1);
+        let (head, last) = self.tops.split_at(stable);
+        let tail: &[Value] = match &self.display_tail {
+            Some(tail) => tail,
+            None => last.first().map_or(&[], |top| &top.blocks),
+        };
+        (head, tail)
+    }
+}
+
+/// What a `ui.markdown` call asks: how its text is read, its key, and how
+/// a keyed text landing whole is parsed.
+struct Call {
+    options: Options,
+    key: Option<String>,
+    lazy: Option<usize>,
+    first: Option<usize>,
+}
+impl Call {
+    fn read(opts: &Option<mlua::Table>) -> mlua::Result<Self> {
+        let flag = |name: &str| -> mlua::Result<bool> {
+            Ok(match opts {
+                Some(t) => t.get::<Option<bool>>(name)?.unwrap_or(false),
+                None => false,
+            })
+        };
+        let options = Options {
+            breaks: flag("breaks")?,
+            paths: flag("paths")?,
+            code: None,
+        };
+        let key: Option<String> = match opts {
+            Some(t) => t.get("key")?,
+            None => None,
+        };
+        // `lazy = true` (4 KB) or a byte count: a keyed text that long
+        // landing whole is parsed over frames, the end first
+        // (`set_text_lazy`).
+        let lazy = match opts {
+            Some(t) => match t.get::<mlua::Value>("lazy")? {
+                mlua::Value::Boolean(true) => Some(LAZY_FROM),
+                mlua::Value::Integer(n) => Some(n.max(0) as usize),
+                mlua::Value::Number(n) if n.is_finite() => Some(n.max(0.) as usize),
+                mlua::Value::Nil | mlua::Value::Boolean(false) => None,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "ui.markdown `lazy` is true or a byte count",
+                    ));
+                }
+            },
+            None => None,
+        };
+        let first: Option<usize> = match opts {
+            Some(t) => t.get::<Option<usize>>("first")?,
+            None => None,
+        };
+        Ok(Self {
+            options,
+            key,
+            lazy,
+            first,
+        })
+    }
+}
+
+/// The text a call parses: a script's string, or what a state holds.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Str(&'a str),
+    Held(&'a Value),
 }
 
 /// `ui.markdown(text, { key?, breaks?, paths? })`: the blocks. With `key`
 /// (a message's id), text that grows under the same key parses
 /// incrementally, sharing its earlier blocks with the last answer; without,
 /// the same text answers with the same blocks.
+///
+/// Given the state holding the text instead (`ui.markdown(reply, { key })`),
+/// a read-only state of the blocks, kept current in Rust as the text
+/// changes: no script table is made for an answer (a `ui.each` over it takes
+/// each chunk's blocks as they are, the new ones alone), and the text is
+/// never a script's string (a keyed stream parses a long one, `state:append`'s,
+/// from what was appended alone).
 pub(crate) fn script(
     lua: &mlua::Lua,
-    (text, opts): (mlua::LuaString, Option<mlua::Table>),
-) -> mlua::Result<Value> {
+    (text, opts): (mlua::Value, Option<mlua::Table>),
+) -> mlua::Result<mlua::Value> {
+    let call = Call::read(&opts)?;
+    if let Some(state) = crate::value::state_handle(&text) {
+        let env = crate::node::env(lua)?;
+        let weak = lua.weak();
+        let blocks = crate::node::derived_state(&env, move || {
+            let Some(lua) = weak.try_upgrade() else {
+                return Ok(Value::Nil);
+            };
+            let held = state.read();
+            answer(&lua, Source::Held(&held), &call, false)
+        });
+        drop(env);
+        return blocks.into_lua(lua);
+    }
+    let mlua::Value::String(text) = &text else {
+        return Err(mlua::Error::runtime(
+            "ui.markdown takes a string, or a state holding one",
+        ));
+    };
     let text = text.to_str()?;
-    let flag = |name: &str| -> mlua::Result<bool> {
-        Ok(match &opts {
-            Some(t) => t.get::<Option<bool>>(name)?.unwrap_or(false),
-            None => false,
-        })
-    };
-    let options = Options {
-        breaks: flag("breaks")?,
-        paths: flag("paths")?,
-        code: None,
-    };
-    let key: Option<String> = match &opts {
-        Some(t) => t.get("key")?,
-        None => None,
-    };
-    // `lazy = true` (4 KB) or a byte count: a keyed text that long landing
-    // whole is parsed over frames, the end first (`set_text_lazy`).
-    let lazy = match &opts {
-        Some(t) => match t.get::<mlua::Value>("lazy")? {
-            mlua::Value::Boolean(true) => Some(LAZY_FROM),
-            mlua::Value::Integer(n) => Some(n.max(0) as usize),
-            mlua::Value::Number(n) if n.is_finite() => Some(n.max(0.) as usize),
-            mlua::Value::Nil | mlua::Value::Boolean(false) => None,
-            _ => {
-                return Err(mlua::Error::runtime(
-                    "ui.markdown `lazy` is true or a byte count",
-                ));
-            }
-        },
-        None => None,
-    };
-    let first: Option<usize> = match &opts {
-        Some(t) => t.get::<Option<usize>>("first")?,
-        None => None,
+    answer(lua, Source::Str(&text), &call, true)?.into_lua(lua)
+}
+
+/// The blocks `call` makes of `text`; with `table`, its script table derived
+/// from the last answer's (a script is given the blocks as a table, not a
+/// state).
+fn answer(lua: &mlua::Lua, text: Source, call: &Call, table: bool) -> mlua::Result<Value> {
+    if let Source::Held(held) = text
+        && !matches!(held, Value::Nil | Value::Str(_) | Value::Text(_))
+    {
+        return Err(mlua::Error::runtime(
+            "ui.markdown's state holds a string: the markdown",
+        ));
+    }
+    // The whole text, where a path needs it (a long text made one string
+    // only then).
+    let whole = || -> std::borrow::Cow<'_, str> {
+        match text {
+            Source::Str(text) => std::borrow::Cow::Borrowed(text),
+            Source::Held(Value::Str(text)) => std::borrow::Cow::Borrowed(&**text),
+            Source::Held(Value::Text(text)) => text.to_cow(),
+            Source::Held(_) => std::borrow::Cow::Borrowed(""),
+        }
     };
     // (The VM registers its cache when it starts: `install`.)
     let Some(parsed) = lua.app_data_ref::<Parsed>() else {
-        return Ok(Value::List(parse(&text, &options).into()));
+        return Ok(Value::List(parse(&whole(), &call.options).into()));
     };
-    let flags = (options.breaks, options.paths);
-    Ok(match key {
+    let flags = (call.options.breaks, call.options.paths);
+    Ok(match &call.key {
         Some(key) => {
             let mut streams = parsed.streams.borrow_mut();
-            let fresh = !matches!(streams.get(&key), Some((f, _)) if *f == flags);
+            let fresh = !matches!(streams.get(key), Some((f, ..)) if *f == flags);
             if fresh {
-                streams.insert(key.clone(), (flags, Incremental::new(options)));
+                streams.insert(
+                    key.clone(),
+                    (flags, Incremental::new(call.options.clone()), None, None),
+                );
             }
-            let (_, stream) = streams.get_mut(&key).expect("inserted above");
-            match lazy {
-                Some(threshold) => stream.set_text_lazy(&text, threshold),
-                None => stream.set_text(&text),
+            let (_, stream, last, kept) = streams.get_mut(key).expect("inserted above");
+            match (call.lazy, text) {
+                (Some(threshold), _) => stream.set_text_lazy(&whole(), threshold),
+                (None, Source::Held(held)) => stream.set_value(held),
+                (None, Source::Str(text)) => stream.set_text(text),
             }
             let pending = stream.has_pending();
-            let blocks = Value::List(stream.blocks().into());
+            let blocks = match table {
+                true => Value::List(stream.blocks_shared()),
+                false => crate::value::Appended::into_value(stream.blocks_appended()),
+            };
+            if table {
+                // Its table from the last answer's, which holds the same
+                // blocks but the end: only what's new is converted and
+                // weighed, not the whole list each time a chunk lands
+                // (`value::derive`).
+                if let Some(old) = last.replace(blocks.clone()) {
+                    // The last answer's table, if the sweep left none kept:
+                    // a script read it since.
+                    if kept.is_none() {
+                        *kept = crate::value::table_of(lua, &old)?;
+                    }
+                    crate::value::derive(lua, &old, &blocks)?;
+                    *kept = crate::value::table_of(lua, &blocks)?;
+                }
+            } else {
+                // A state's: no table, nor one to derive the next from (its
+                // list is grown from the last itself).
+                (*last, *kept) = (None, None);
+            }
             touch(
                 &mut parsed.stream_order.borrow_mut(),
                 key.clone(),
@@ -457,17 +692,18 @@ pub(crate) fn script(
             );
             drop(streams);
             if pending {
-                follow_lazy(lua, key, first.and_then(|i| i.checked_sub(1)))?;
+                follow_lazy(lua, key.clone(), call.first.and_then(|i| i.checked_sub(1)))?;
             }
             blocks
         }
         None => {
             let mut texts = parsed.texts.borrow_mut();
+            let text = whole();
             let at = (text.to_string(), flags);
             if let Some(blocks) = texts.get(&at) {
                 return Ok(blocks.clone());
             }
-            let blocks = Value::List(parse(&text, &options).into());
+            let blocks = Value::List(parse(&text, &call.options).into());
             if texts.len() >= KEPT {
                 texts.clear();
             }
@@ -541,7 +777,7 @@ fn follow_lazy(lua: &mlua::Lua, key: String, first: Option<usize>) -> mlua::Resu
         };
         let first = wanted.take();
         let (more, asked) = match parsed.streams.borrow_mut().get_mut(&stream_key) {
-            Some((_, stream)) => {
+            Some((_, stream, ..)) => {
                 let more = stream.parse_pending(LAZY_BUDGET, first);
                 (more, first.is_some_and(|i| !stream.block_pending(i)))
             }
@@ -584,12 +820,13 @@ pub(crate) fn install(lua: &mlua::Lua) {
     lua.set_app_data(Parsed::default());
 }
 
-/// A VM at rest: streams not asked for lately go. (The texts parsed stay: a
-/// chat opened again would parse them in its first frame.)
+/// A VM at rest: its parsed texts and the streams not asked for lately go. What
+/// is on show keeps its blocks; only something built again parses again.
 pub(crate) fn rest(lua: &mlua::Lua) {
     let Some(parsed) = lua.app_data_ref::<Parsed>() else {
         return;
     };
+    *parsed.texts.borrow_mut() = Texts::new();
     let mut streams = parsed.streams.borrow_mut();
     let mut order = parsed.stream_order.borrow_mut();
     let now = std::time::Instant::now();
@@ -605,7 +842,9 @@ pub(crate) fn rest(lua: &mlua::Lua) {
     order.shrink_to_fit();
 }
 
-/// A stream left this long has ended, or parses again if it goes on.
+/// A stream left this long has ended, or parses again if it goes on. (A
+/// minute: a reply pausing on a tool call keeps its parser, and its next
+/// chunk doesn't parse the whole reply again.)
 const STREAM_QUIET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How many texts and streams a script's `ui.markdown` keeps.
@@ -614,7 +853,12 @@ const KEPT: usize = 256;
 /// `breaks` and `paths`, as a script asked for them.
 type Flags = (bool, bool);
 type Texts = std::collections::HashMap<(String, Flags), Value>;
-type Streams = std::collections::HashMap<String, (Flags, Incremental)>;
+/// Each keyed stream: its flags, its parse, and its last answer (whose
+/// table the next one's is derived from), with that table once a script
+/// has it, kept so the host's idle sweep doesn't let it go (only scripts'
+/// holding counts there): a stream pausing between chunks goes idle.
+type Streams =
+    std::collections::HashMap<String, (Flags, Incremental, Option<Value>, Option<mlua::Table>)>;
 
 /// A VM's parsed markdown.
 #[derive(Default)]
@@ -651,7 +895,7 @@ fn touch(
 /// block's stand-in, found with the parser's events alone (what makes the
 /// blocks is most of a parse); raw HTML, which makes none, not pending.
 fn scan_tops(text: &str) -> Vec<Top> {
-    parse_or_scan(text, 0, &Options::default(), true)
+    parse_or_scan(text, 0, &Options::default(), true, &Defs::default()).tops
 }
 
 /// The stand-in for a top-level element not parsed yet.
@@ -675,24 +919,145 @@ fn parser_flags() -> pulldown_cmark::Options {
     flags
 }
 
-/// Link reference definition lines (`[label]: destination`, up to three
-/// spaces in), conservatively.
+/// Link reference definition lines (`[label]: destination`), conservatively:
+/// after any quotes' and lists' markers (a definition in one defines for the
+/// whole text), up to three spaces in; or the end of a label begun on a line
+/// before.
 fn has_link_defs(text: &str) -> bool {
     text.lines().any(|line| {
-        let trimmed = line.trim_start();
-        line.len() - trimmed.len() <= 3 && trimmed.starts_with('[') && trimmed.contains("]:")
+        let Some(colon) = line.find("]:") else {
+            return false;
+        };
+        let inside = after_container_markers(line);
+        let trimmed = inside.trim_start();
+        (inside.len() - trimmed.len() <= 3 && trimmed.starts_with('['))
+            || !line[..colon].contains('[')
     })
+}
+/// `line` after the markers of the quotes and lists it opens with.
+fn after_container_markers(mut line: &str) -> &str {
+    loop {
+        let trimmed = line.trim_start();
+        let rest = if let Some(rest) = trimmed.strip_prefix('>') {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix(['-', '+', '*']) {
+            rest
+        } else {
+            let digits = trimmed.len()
+                - trimmed
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .len();
+            match trimmed[digits..].strip_prefix(['.', ')']) {
+                Some(rest) if digits > 0 => rest,
+                _ => return line,
+            }
+        };
+        // A marker is followed by a space or the line's end; a quote's by
+        // anything.
+        if !trimmed.starts_with('>') && !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+            return line;
+        }
+        line = rest;
+    }
+}
+
+/// A link label, as definitions and references match: its case folded, its
+/// blanks one space.
+type Label = unicase::UniCase<String>;
+fn label(text: &str) -> Label {
+    unicase::UniCase::new(text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// A stream's link definitions, and the references that name them. A
+/// definition acts over the whole text, ahead of it too, but a tail parsed
+/// can be told those ahead of it (`parse_or_scan`'s broken link callback),
+/// and the blocks ahead of it need parsing again only if they name one that
+/// came or changed.
+#[derive(Default)]
+struct Defs {
+    /// By label: where it goes, and where in the text it stands.
+    known: std::collections::HashMap<Label, (String, usize)>,
+    /// Each label named by a reference, and where in the text first.
+    named: std::collections::HashMap<Label, usize>,
+}
+/// How far a tail's definitions reach (`Defs::note`).
+enum Reach {
+    Tail,
+    /// To a reference ahead of the tail: parsed whole, once.
+    Whole,
+    /// A settled label defined again otherwise: whole from here on.
+    Always,
+}
+impl Defs {
+    /// What a parse from `from` to the text's end found.
+    fn note(
+        &mut self,
+        from: usize,
+        found: Vec<(Label, String, usize)>,
+        named: Vec<(Label, usize)>,
+    ) -> Reach {
+        for (name, at) in named {
+            self.named
+                .entry(name)
+                .and_modify(|first| *first = at.min(*first))
+                .or_insert(at);
+        }
+        if found.is_empty() && self.known.is_empty() {
+            return Reach::Tail;
+        }
+        let mut changed: Vec<Label> = Vec::new();
+        // Those it had from there on that it didn't find now are gone.
+        let gone: Vec<Label> = self
+            .known
+            .iter()
+            .filter(|(name, (_, at))| *at >= from && !found.iter().any(|(n, ..)| n == *name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in gone {
+            self.known.remove(&name);
+            changed.push(name);
+        }
+        for (name, dest, at) in found {
+            match self.known.get(&name) {
+                Some((was, ahead)) if *ahead < from => {
+                    if *was != dest {
+                        return Reach::Always;
+                    }
+                }
+                Some((was, ..)) if *was == dest => {
+                    self.known.insert(name, (dest, at));
+                }
+                _ => {
+                    self.known.insert(name.clone(), (dest, at));
+                    changed.push(name);
+                }
+            }
+        }
+        let reaches = changed
+            .iter()
+            .any(|name| self.named.get(name).is_some_and(|first| *first < from));
+        if reaches { Reach::Whole } else { Reach::Tail }
+    }
+}
+
+/// What a parse made and found.
+struct Made {
+    tops: Vec<Top>,
+    /// The definitions in it: label, address, where.
+    found: Vec<(Label, String, usize)>,
+    /// The references in it: label, where.
+    named: Vec<(Label, usize)>,
 }
 
 /// `text` (which starts at `offset` in the whole) parsed into its top-level
-/// elements.
-fn parse_at(text: &str, offset: usize, options: &Options) -> Vec<Top> {
-    parse_or_scan(text, offset, options, false)
+/// elements, a reference to a definition ahead of it in `defs` following it.
+fn parse_at(text: &str, offset: usize, options: &Options, defs: &Defs) -> Made {
+    parse_or_scan(text, offset, options, false, defs)
 }
 /// `parse_at`, or with `scan` its top-level elements alone (`scan_tops`):
 /// one loop over the parser's events, so the parser's iterator has the one
 /// caller it is inlined into.
-fn parse_or_scan(text: &str, offset: usize, options: &Options, scan: bool) -> Vec<Top> {
+fn parse_or_scan(text: &str, offset: usize, options: &Options, scan: bool, defs: &Defs) -> Made {
     let flags = parser_flags();
     let mut builder = Builder {
         frames: vec![Frame::Blocks(Vec::new())],
@@ -707,15 +1072,60 @@ fn parse_or_scan(text: &str, offset: usize, options: &Options, scan: bool) -> Ve
         took: false,
         options,
         deeper: 0,
+        align: None,
+        html: false,
+        named: Vec::new(),
+        top: offset,
     };
     let mut tops = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;
-    for (event, range) in Parser::new_ext(text, flags).into_offset_iter() {
+    // Each strikethrough open, whether it's struck (`~~`) or plain (`~`).
+    let mut tildes: Vec<bool> = Vec::new();
+    let named = std::cell::RefCell::new(Vec::new());
+    let callback = |broken: pulldown_cmark::BrokenLink<'_>| {
+        let name = label(&broken.reference);
+        let dest = defs
+            .known
+            .get(&name)
+            .filter(|(_, at)| *at < offset)
+            .map(|(dest, ..)| dest.clone());
+        named.borrow_mut().push((name, offset + broken.span.start));
+        dest.map(|dest| (dest.into(), "".into()))
+    };
+    let parser = Parser::new_with_broken_link_callback(text, flags, Some(callback));
+    let found = parser
+        .reference_definitions()
+        .iter()
+        .map(|(name, def)| (label(name), def.dest.to_string(), offset + def.span.start))
+        .collect();
+    for (event, range) in parser.into_offset_iter() {
+        // Only `~~` strikes, as `mend` holds it. This is a deliberate choice,
+        // not GFM's: the spec strikes a single `~` too (example 491;
+        // cmark-gfm only turns that off behind an option). In text that
+        // names paths, one tilde is usually a home directory (`~/.config`),
+        // and two in a line would strike everything between them.
+        let event = match event {
+            Event::Start(Tag::Strikethrough) => {
+                let struck = text[range.clone()].starts_with("~~");
+                tildes.push(struck);
+                if struck {
+                    event
+                } else {
+                    Event::Text("~".into())
+                }
+            }
+            Event::End(TagEnd::Strikethrough) => match tildes.pop() {
+                Some(false) => Event::Text("~".into()),
+                _ => event,
+            },
+            event => event,
+        };
         let opens = matches!(event, Event::Start(_));
         let closes = matches!(event, Event::End(_));
         if depth == 0 {
             start = range.start;
+            builder.top = offset + start;
             if scan {
                 let hint = match &event {
                     Event::Start(Tag::Paragraph) => Some("p"),
@@ -754,7 +1164,9 @@ fn parse_or_scan(text: &str, offset: usize, options: &Options, scan: bool) -> Ve
             });
         }
     }
-    tops
+    let mut named = named.into_inner();
+    named.append(&mut builder.named);
+    Made { tops, found, named }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -928,10 +1340,30 @@ fn link_of(href: &str, paths: bool) -> Link {
 }
 
 fn map(fields: Vec<(&str, Value)>) -> Value {
-    let mut fields: Vec<(Rc<str>, Value)> =
-        fields.into_iter().map(|(k, v)| (Rc::from(k), v)).collect();
+    let mut fields: Vec<(Rc<str>, Value)> = fields.into_iter().map(|(k, v)| (key(k), v)).collect();
     fields.sort_by(|a, b| a.0.cmp(&b.0));
     Value::Map(fields.into())
+}
+
+thread_local! {
+    /// The field names blocks and runs are made with (`map`), each made
+    /// once: a document's every block and run named its fields anew, an
+    /// allocation each. At most `KEYS` (a code block's own fields add some).
+    static NAMES: std::cell::RefCell<Vec<Rc<str>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+const KEYS: usize = 64;
+/// `name` as the field name blocks share (`NAMES`).
+fn key(name: &str) -> Rc<str> {
+    NAMES.with_borrow_mut(|names| {
+        if let Some(kept) = names.iter().find(|kept| &***kept == name) {
+            return kept.clone();
+        }
+        let made: Rc<str> = Rc::from(name);
+        if names.len() < KEYS {
+            names.push(made.clone());
+        }
+        made
+    })
 }
 
 fn runs_value(runs: &[Run]) -> Value {
@@ -964,6 +1396,25 @@ fn runs_value(runs: &[Run]) -> Value {
                 map(f)
             })
             .collect(),
+    )
+}
+
+/// A table's columns' sides, as a `table` block's `align` says them.
+fn table_align(align: &[Alignment]) -> Value {
+    Value::List(
+        align
+            .iter()
+            .map(|side| {
+                match side {
+                    Alignment::None => "",
+                    Alignment::Left => "start",
+                    Alignment::Center => "center",
+                    Alignment::Right => "end",
+                }
+                .into()
+            })
+            .collect::<Vec<Value>>()
+            .into(),
     )
 }
 
@@ -1007,6 +1458,15 @@ struct Builder<'a> {
     /// Quotes, lists and items open beyond `NESTING`: read into the deepest
     /// container kept, as its blocks.
     deeper: usize,
+    /// The open table's columns' sides, when its source aligns any (a table
+    /// holds no table).
+    align: Option<Box<[Alignment]>>,
+    /// Inside raw HTML.
+    html: bool,
+    /// The references its text's definitions resolved: label, where.
+    named: Vec<(Label, usize)>,
+    /// Where the top-level element being read starts in the whole text.
+    top: usize,
 }
 
 /// How deeply quotes and lists nest at most (in frames: a list level is
@@ -1016,6 +1476,38 @@ struct Builder<'a> {
 const NESTING: usize = 64;
 
 impl Builder<'_> {
+    /// A table opens, its columns aligned as `align` says. (Out of line,
+    /// as `close_table`: `event` stays as small as it was.)
+    #[inline(never)]
+    fn open_table(&mut self, align: Vec<Alignment>) {
+        self.align = align
+            .iter()
+            .any(|side| *side != Alignment::None)
+            .then(|| align.into_boxed_slice());
+        self.frames.push(Frame::Table {
+            head: Vec::new(),
+            rows: Vec::new(),
+            row: Vec::new(),
+            in_head: false,
+        });
+    }
+    /// The open table closes into its block: `align` only when its source
+    /// aligns a column.
+    #[inline(never)]
+    fn close_table(&mut self) {
+        let align = self.align.take();
+        if let Some(Frame::Table { head, rows, .. }) = self.frames.pop() {
+            let mut fields = vec![
+                ("t", "table".into()),
+                ("head", Value::List(head.into())),
+                ("rows", Value::List(rows.into())),
+            ];
+            if let Some(align) = align {
+                fields.push(("align", table_align(&align)));
+            }
+            self.block(map(fields));
+        }
+    }
     fn style(&self) -> Style {
         self.styles.last().copied().unwrap_or_default()
     }
@@ -1153,8 +1645,19 @@ impl Builder<'_> {
         matches!(event, Event::SoftBreak | Event::HardBreak)
     }
 
+    /// A reference this text's own definition resolves: no callback says so.
+    fn note_reference(&mut self, link_type: pulldown_cmark::LinkType, id: &str) {
+        use pulldown_cmark::LinkType::{Collapsed, Reference, Shortcut};
+        if matches!(link_type, Reference | Collapsed | Shortcut) {
+            self.named.push((label(id), self.top));
+        }
+    }
     fn take_runs(&mut self) -> Value {
         let mut runs = std::mem::take(&mut self.runs);
+        // Its mark goes with them: read against the next block's words (a
+        // tight list item starts no paragraph to set it), it would call them
+        // blank.
+        self.line = (0, 0);
         // Trailing line breaks inside a block are not shown.
         if let Some(last) = runs.last_mut() {
             while last.text.ends_with('\n') {
@@ -1246,12 +1749,7 @@ impl Builder<'_> {
                     items: Vec::new(),
                 }),
                 Tag::Item => self.frames.push(Frame::Blocks(Vec::new())),
-                Tag::Table(_) => self.frames.push(Frame::Table {
-                    head: Vec::new(),
-                    rows: Vec::new(),
-                    row: Vec::new(),
-                    in_head: false,
-                }),
+                Tag::Table(align) => self.open_table(align),
                 Tag::TableHead => {
                     if let Some(Frame::Table { in_head, .. }) = self.frames.last_mut() {
                         *in_head = true;
@@ -1272,13 +1770,28 @@ impl Builder<'_> {
                     s.strike = true;
                     self.styles.push(s);
                 }
-                Tag::Link { dest_url, .. } => {
+                Tag::Link {
+                    link_type,
+                    dest_url,
+                    id,
+                    ..
+                } => {
+                    self.note_reference(link_type, &id);
                     let link = link_of(&dest_url, self.options.paths);
                     self.links.push(link)
                 }
-                Tag::Image { dest_url, .. } => {
+                Tag::Image {
+                    link_type,
+                    dest_url,
+                    id,
+                    ..
+                } => {
+                    self.note_reference(link_type, &id);
                     self.image = Some((dest_url.to_string(), String::new()))
                 }
+                // Raw HTML isn't shown: the parser gives its indentation as
+                // text, which would join the next block's words.
+                Tag::HtmlBlock => self.html = true,
                 Tag::Paragraph => {
                     self.took = false;
                     self.line = (0, 0);
@@ -1370,18 +1883,11 @@ impl Builder<'_> {
                         rows.push(Value::List(std::mem::take(row).into()));
                     }
                 }
-                TagEnd::Table => {
-                    if let Some(Frame::Table { head, rows, .. }) = self.frames.pop() {
-                        self.block(map(vec![
-                            ("t", "table".into()),
-                            ("head", Value::List(head.into())),
-                            ("rows", Value::List(rows.into())),
-                        ]));
-                    }
-                }
+                TagEnd::Table => self.close_table(),
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     self.styles.pop();
                 }
+                TagEnd::HtmlBlock => self.html = false,
                 TagEnd::Link => {
                     self.links.pop();
                 }
@@ -1398,6 +1904,7 @@ impl Builder<'_> {
                 }
                 _ => {}
             },
+            Event::Text(_) if self.html => {}
             Event::Text(text) => match &mut self.code {
                 Some((_, code)) => code.push_str(&text),
                 None => self.push_text(&text, false),
@@ -1436,6 +1943,68 @@ mod tests {
     }
     fn plain() -> Options {
         Options::default()
+    }
+    #[test]
+    fn at_rest_parsed_text_goes_and_the_same_text_parses_the_same() {
+        let lua = mlua::Lua::new();
+        install(&lua);
+        let text = "# Title\n\nSome *words* and a [link](https://example.com).";
+        // (The blocks themselves: `script` makes a new table of them each time.)
+        let call = Call::read(&None).expect("no options");
+        let ask = || answer(&lua, Source::Str(text), &call, false).expect("its blocks");
+        let first = ask();
+        let held = |lua: &mlua::Lua| {
+            lua.app_data_ref::<Parsed>()
+                .expect("installed")
+                .texts
+                .borrow()
+                .len()
+        };
+        assert_eq!(held(&lua), 1);
+        rest(&lua);
+        assert_eq!(
+            held(&lua),
+            0,
+            "nothing kept for a text no one is asking for"
+        );
+        assert_eq!(ask(), first);
+    }
+    #[test]
+    fn at_rest_a_stream_stays_until_it_has_been_quiet() {
+        let lua = mlua::Lua::new();
+        install(&lua);
+        let keyed = lua.create_table().unwrap();
+        keyed.set("key", "message-1").unwrap();
+        script(
+            &lua,
+            (
+                mlua::Value::String(lua.create_string("Some words").unwrap()),
+                Some(keyed),
+            ),
+        )
+        .expect("its blocks");
+        let streams = |lua: &mlua::Lua| {
+            lua.app_data_ref::<Parsed>()
+                .expect("installed")
+                .streams
+                .borrow()
+                .len()
+        };
+        rest(&lua);
+        assert_eq!(streams(&lua), 1, "it may go on: asked for a moment ago");
+        {
+            let parsed = lua.app_data_ref::<Parsed>().expect("installed");
+            let mut order = parsed.stream_order.borrow_mut();
+            let long_ago =
+                std::time::Instant::now() - STREAM_QUIET - std::time::Duration::from_secs(1);
+            order.iter_mut().for_each(|(_, used)| *used = long_ago);
+        }
+        rest(&lua);
+        assert_eq!(
+            streams(&lua),
+            0,
+            "quiet this long, it has ended, or parses again if it goes on"
+        );
     }
     fn paths() -> Options {
         Options {
@@ -1512,6 +2081,50 @@ mod tests {
     }
 
     #[test]
+    fn a_table_says_how_its_columns_align_only_when_its_source_does() {
+        let sides = |source: &str| {
+            let blocks = parse(source, &plain());
+            blocks[0].field("align").map(|align| {
+                let Value::List(sides) = align else { panic!() };
+                sides
+                    .iter()
+                    .map(|side| match side {
+                        Value::Str(side) => side.to_string(),
+                        _ => panic!(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            sides("| a | b | c | d |\n|:--|:-:|--:|---|\n| 1 | 2 | 3 | 4 |"),
+            Some(vec![
+                "start".into(),
+                "center".into(),
+                "end".into(),
+                String::new()
+            ])
+        );
+        assert_eq!(sides("| a | b |\n|---|---|\n| 1 | 2 |"), None);
+        // The next table says its own: none after one that aligned.
+        let blocks = parse("| a |\n|--:|\n| 1 |\n\n| b |\n|---|\n| 2 |", &plain());
+        assert_eq!(kinds(&blocks), ["table", "table"]);
+        assert!(blocks[0].field("align").is_some());
+        assert!(blocks[1].field("align").is_none());
+        // In a list item.
+        let blocks = parse("- | a |\n  |:-:|\n  | 1 |", &plain());
+        let Some(Value::List(items)) = blocks[0].field("items") else {
+            panic!()
+        };
+        let Value::List(first) = &items[0] else {
+            panic!()
+        };
+        let Some(Value::List(align)) = first[0].field("align") else {
+            panic!()
+        };
+        assert!(matches!(&align[0], Value::Str(side) if &**side == "center"));
+    }
+
+    #[test]
     fn nesting_thousands_deep_shows_as_the_deepest_level_kept() {
         /// How deeply blocks nest, and the text in them.
         fn walk(value: &Value, depth: usize, text: &mut String) -> usize {
@@ -1572,6 +2185,34 @@ mod tests {
     }
 
     #[test]
+    fn one_tilde_is_text_and_two_strike() {
+        // A path's tilde, twice in a line, as a prompt has it.
+        let text = "Work in ~/Documents/tmp, not the app's settings (~/.config), and ~~not this~~.";
+        let blocks = parse(text, &plain());
+        let runs = blocks[0].field("s").unwrap().list();
+        let shown: String = runs
+            .iter()
+            .map(|r| match r.field("x") {
+                Some(Value::Str(x)) => x.to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            "Work in ~/Documents/tmp, not the app's settings (~/.config), and not this."
+        );
+        let struck: Vec<String> = runs
+            .iter()
+            .filter(|r| r.field("s").is_some())
+            .map(|r| match r.field("x") {
+                Some(Value::Str(x)) => x.to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(struck, ["not this"], "only the `~~` run strikes");
+    }
+
+    #[test]
     fn breaks_keep_line_breaks() {
         let blocks = parse(
             "one\ntwo",
@@ -1584,6 +2225,19 @@ mod tests {
         assert_eq!(
             runs[0].field("x").map(|v| v.to_json()),
             Some("\"one\\ntwo\"".into())
+        );
+    }
+
+    #[test]
+    fn an_indented_html_blocks_indent_stays_out_of_what_follows() {
+        let plain = plain();
+        assert_eq!(
+            parse(" <div\n\nwords", &plain),
+            parse("<div\n\nwords", &plain)
+        );
+        assert_eq!(
+            parse(" <div\n\n- item", &plain),
+            parse("<div\n\n- item", &plain)
         );
     }
 
@@ -1930,5 +2584,77 @@ mod tests {
         stream.set_text_lazy(&text, 4096);
         assert_eq!(pending_count(&stream), 0);
         assert_eq!(stream.blocks(), parse(&text, &plain()));
+    }
+
+    /// The blocks an answer says it shares with the last are that answer's
+    /// own values, the same allocations, however the text changed: appended
+    /// to (a paragraph growing, blocks after it), parsed whole again (a link
+    /// definition), landing whole and parsed over time; and an append shares
+    /// all but the end.
+    #[test]
+    fn an_answer_shares_with_the_last_the_blocks_it_says() {
+        let mut stream = Incremental::new(plain());
+        let mut last: Option<std::rc::Rc<crate::value::Appended>> = None;
+        let mut check = |stream: &mut Incremental| {
+            let list = stream.blocks_appended();
+            assert!(list.iter().eq(stream.blocks().iter()));
+            assert_eq!(list.flat()[..], stream.blocks()[..]);
+            let mut shared = 0;
+            if let Some(last) = &last {
+                shared = list.grown_from(last).expect("grown from the last answer");
+                assert!(shared <= last.len().min(list.len()));
+                for (now, then) in list.iter().zip(last.iter()).take(shared) {
+                    assert_ne!(crate::value::identity(now), 0);
+                    assert_eq!(crate::value::identity(now), crate::value::identity(then));
+                }
+                for from in [0, shared, list.len()] {
+                    assert!(list.iter_from(from).eq(list.flat()[from..].iter()));
+                }
+            }
+            last = Some(list);
+            shared
+        };
+        let mut text = String::new();
+        for i in 0..30 {
+            text.push_str(&format!("Para {i} with **bold"));
+            stream.set_text(&text);
+            check(&mut stream);
+            text.push_str(" text**.\n\n");
+            stream.set_text(&text);
+            let shared = check(&mut stream);
+            assert!(shared + 2 >= i, "append {i} shares {shared}");
+        }
+        // The element before the last changed, as many after: a paragraph
+        // `2` becomes an item, joining the list before it.
+        text.push_str("1. a\n\n2");
+        stream.set_text(&text);
+        check(&mut stream);
+        text.push_str(". b\n\nc");
+        stream.set_text(&text);
+        check(&mut stream);
+        text.push_str("\n\n");
+        // A definition no reference ahead of it names stays with its tail.
+        text.push_str("[ref]: https://example.com\n\n");
+        stream.set_text(&text);
+        assert!(check(&mut stream) > 0);
+        text.push_str("After [ref].\n\n");
+        stream.set_text(&text);
+        check(&mut stream);
+        // One that a reference ahead names parses whole, and shares what came
+        // out the same, up to that reference.
+        text.push_str("[late] named.\n\nwords\n\nmore\n\n");
+        stream.set_text(&text);
+        check(&mut stream);
+        text.push_str("[late]: https://example.com/late\n\n");
+        stream.set_text(&text);
+        assert!(check(&mut stream) > 0);
+        let whole: String = (0..60).map(|i| format!("Block {i}.\n\n")).collect();
+        stream.set_text_lazy(&whole, 64);
+        check(&mut stream);
+        while stream.parse_pending(64, None) {
+            check(&mut stream);
+        }
+        check(&mut stream);
+        assert_eq!(stream.blocks(), parse(&whole, &plain()));
     }
 }

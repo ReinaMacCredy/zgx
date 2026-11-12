@@ -2,7 +2,7 @@
 //! frame go, least recently drawn first, and upload again when drawn. A long
 //! page of photos scrolled through drew until its 54th, then every frame
 //! failed.
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use zgx::{image::ImageData, scene::*};
 use zgx_gpu::GpuRenderer;
 
@@ -45,8 +45,25 @@ fn scroll(scene: &mut Scene, column: NodeId, to: f32) -> Vec<Rect> {
     scene.flush().damage
 }
 
+/// Held by each test: `zgx::image::release_decoded` gives back every kept
+/// file's pixels in the process, so a test releasing them would take another's
+/// from under it (a decoded copy it reads, or one its frames wait on). One that
+/// releases runs alone; the rest together.
+static KEPT_COPIES: RwLock<()> = RwLock::new(());
+fn decoded_kept() -> RwLockReadGuard<'static, ()> {
+    KEPT_COPIES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+fn releases_decoded() -> RwLockWriteGuard<'static, ()> {
+    KEPT_COPIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn a_long_page_of_photos_scrolls_down_and_back() {
+    let _decoded = decoded_kept();
     let (mut scene, column) = page(600., 100);
     let mut gpu = GpuRenderer::new(800, 600).unwrap();
     let damage = scene.flush().damage;
@@ -70,10 +87,11 @@ fn a_long_page_of_photos_scrolls_down_and_back() {
 }
 
 /// More than the budget drawn in one frame: nothing drawn there can go, so
-/// the last are drawn at a lower resolution, once said, and none is left
-/// out. (Stacked, half transparent: each one shows.)
+/// the last are drawn at a lower resolution, and none is left out, nor an
+/// issue raised. (Stacked, half transparent: each one shows.)
 #[test]
 fn more_photos_than_the_budget_in_one_frame_draw_what_fits() {
+    let _decoded = decoded_kept();
     let mut scene = Scene::new(800., 600.);
     let stack = scene.append(
         scene.root(),
@@ -90,13 +108,12 @@ fn more_photos_than_the_budget_in_one_frame_draw_what_fits() {
     let mut gpu = GpuRenderer::new(800, 600).unwrap();
     let damage = scene.flush().damage;
     gpu.render(&scene, &damage).unwrap();
-    let issues = gpu.take_issues();
-    assert_eq!(issues.len(), 1, "{issues:?}");
-    assert!(issues[0].contains("lower resolution"), "{issues:?}");
+    assert_eq!(gpu.take_issues(), Vec::<String>::new());
     let stats = gpu.debug_cache_stats();
     assert_eq!(stats.image_textures, 60, "every one drawn");
+    // (With what the last, each cut to 64 pixels, may go over it.)
     assert!(
-        stats.image_bytes <= 64 * 1024 * 1024,
+        stats.image_bytes <= 64 * 1024 * 1024 + 60 * 64 * 48 * 4,
         "{}",
         stats.image_bytes
     );
@@ -108,6 +125,7 @@ fn more_photos_than_the_budget_in_one_frame_draw_what_fits() {
 /// decoded copy ready to go.
 #[test]
 fn a_kept_file_draws_once_decoded_at_the_size_it_shows() {
+    let _decoded = decoded_kept();
     let mut png = Vec::new();
     image::RgbaImage::from_pixel(400, 300, image::Rgba([230, 20, 20, 255]))
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
@@ -154,12 +172,139 @@ fn a_kept_file_draws_once_decoded_at_the_size_it_shows() {
     assert!(gpu.readback().unwrap()[(30 * 200 + 30) * 4] > 200);
 }
 
+/// A picture's row scrolled out of a list and back: its node is new, its image
+/// the same, its decoded pixels given up long since. Its texture waited, so it
+/// draws in the frame it returns, not blank until it decodes again; once the
+/// window has gone idle it has gone, and memory with it.
+#[test]
+fn a_kept_file_returning_to_the_scene_draws_at_once() {
+    let _decoded = releases_decoded();
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(400, 300, image::Rgba([230, 20, 20, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let picture = zgx_gpu::assets::decode_image_kept(Arc::from(png)).unwrap();
+    let style = || Style {
+        width: Some(100.),
+        height: Some(75.),
+        ..Default::default()
+    };
+    let whole = [Rect::new(0., 0., 200., 200.)];
+    let mut scene = Scene::new(200., 200.);
+    let mut gpu = GpuRenderer::new(200, 200).unwrap();
+    let node = scene.append(scene.root(), NodeKind::Image(picture.clone()), style());
+    scene.flush();
+    gpu.render(&scene, &whole).unwrap();
+    for _ in 0..500 {
+        std::thread::sleep(std::time::Duration::from_millis(4));
+        if gpu.images_decoded() {
+            gpu.render(&scene, &whole).unwrap();
+        }
+        if gpu.debug_cache_stats().image_textures == 1 {
+            break;
+        }
+    }
+    assert_eq!(gpu.debug_cache_stats().image_textures, 1, "decoded");
+    assert!(gpu.take_images_uploaded());
+    // Its pixels given up, as the host does after uploads.
+    zgx::image::release_decoded();
+
+    let red = |gpu: &GpuRenderer| gpu.readback().unwrap()[(30 * 200 + 30) * 4];
+    scene.remove(node);
+    scene.flush();
+    gpu.render(&scene, &whole).unwrap();
+    assert!(red(&gpu) < 100, "gone with its row");
+    let node = scene.append(scene.root(), NodeKind::Image(picture.clone()), style());
+    scene.flush();
+    gpu.render(&scene, &whole).unwrap();
+    assert!(!gpu.images_decoded(), "nothing to wait for");
+    assert!(red(&gpu) > 200, "drawn in the frame it returns");
+
+    // Gone again, and the window idle: its texture goes too.
+    scene.remove(node);
+    scene.flush();
+    gpu.render(&scene, &whole).unwrap();
+    assert_eq!(gpu.debug_cache_stats().image_textures, 1, "kept");
+    gpu.trim();
+    assert_eq!(gpu.debug_cache_stats().image_textures, 0, "given back");
+}
+
+/// What textures of pictures no node shows may hold is bounded, the least
+/// recently drawn going first. (Held by the app, as a cache holds them: one
+/// nothing holds goes with its node, below.)
+#[test]
+fn textures_of_images_gone_are_bounded() {
+    let _decoded = decoded_kept();
+    let whole = [Rect::new(0., 0., 800., 600.)];
+    let mut scene = Scene::new(800., 600.);
+    let mut gpu = GpuRenderer::new(800, 600).unwrap();
+    // 40 photos of 1.2 MB, each in the scene a frame: 48 MB seen, 32 MB kept.
+    let mut held = Vec::new();
+    for i in 0..40 {
+        let photo = photo(i);
+        held.push(photo.clone());
+        let node = scene.append(scene.root(), photo, photo_style());
+        scene.flush();
+        gpu.render(&scene, &whole).unwrap();
+        scene.remove(node);
+        scene.flush();
+        gpu.render(&scene, &whole).unwrap();
+    }
+    let stats = gpu.debug_cache_stats();
+    assert!(
+        stats.image_bytes <= 32 * 1024 * 1024,
+        "{}",
+        stats.image_bytes
+    );
+    assert!(
+        stats.image_bytes >= 24 * 1024 * 1024,
+        "{}",
+        stats.image_bytes
+    );
+    gpu.trim();
+    assert_eq!(gpu.debug_cache_stats().image_bytes, 0);
+    drop(held);
+}
+
+/// A picture replaced by another, frame after frame, as a video's frames
+/// are: one nothing holds any more can't be shown again, so its texture goes
+/// with it, not kept for its node's return. A player kept nine of them
+/// (32 MB of 1280 by 720 frames) as it played and for as long as it paused.
+#[test]
+fn a_picture_nothing_holds_gives_its_texture_back_once_replaced() {
+    let _decoded = decoded_kept();
+    let whole = [Rect::new(0., 0., 800., 600.)];
+    let mut scene = Scene::new(800., 600.);
+    let mut gpu = GpuRenderer::new(800, 600).unwrap();
+    let node = scene.append(scene.root(), photo(0), photo_style());
+    for i in 1..40 {
+        scene.set_kind(node, photo(i));
+        scene.flush();
+        gpu.render(&scene, &whole).unwrap();
+    }
+    let stats = gpu.debug_cache_stats();
+    assert_eq!(stats.image_textures, 1, "{} bytes held", stats.image_bytes);
+    // One still held (an app's cache), shown again, draws without uploading.
+    let kept = photo(40);
+    scene.set_kind(node, kept.clone());
+    scene.flush();
+    gpu.render(&scene, &whole).unwrap();
+    scene.set_kind(node, photo(41));
+    scene.flush();
+    gpu.render(&scene, &whole).unwrap();
+    assert_eq!(gpu.debug_cache_stats().image_textures, 2, "a held one kept");
+    scene.set_kind(node, kept);
+    scene.flush();
+    assert_eq!(gpu.render(&scene, &whole).unwrap().image_uploads, 0);
+}
+
 /// A 2 by 2 checker, black and white, drawn at 100 by 100: smooth, its
 /// middle blends them; pixelated (`Scene::set_image_rendering`), each point
 /// is the nearest of the four, black or white, as an image and as a
 /// background image alike.
 #[test]
 fn pixelated_images_take_the_nearest_pixel() {
+    let _decoded = decoded_kept();
     use zgx::decoration::{Background, Decoration};
     use zgx::image::ImageRendering;
     let checker = Arc::new(
@@ -229,6 +374,7 @@ fn pixelated_images_take_the_nearest_pixel() {
 /// inherited, as CSS's `image-rendering` is.
 #[test]
 fn a_kept_file_drawn_pixelated_takes_the_nearest_pixel() {
+    let _decoded = decoded_kept();
     use zgx::image::ImageRendering;
     let mut png = Vec::new();
     image::RgbaImage::from_fn(4, 4, |x, y| match (x + y) % 2 {
@@ -281,6 +427,7 @@ fn a_kept_file_drawn_pixelated_takes_the_nearest_pixel() {
 /// of its own either way, the pixelated ones with a sampler of their own.
 #[test]
 fn pixelated_images_draw_in_as_many_draws() {
+    let _decoded = decoded_kept();
     use zgx::image::ImageRendering;
     let images: Vec<_> = (0..20u8)
         .map(|i| Arc::new(ImageData::new(4, 4, [i * 12, 90, 200 - i * 9, 255].repeat(16)).unwrap()))

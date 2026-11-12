@@ -1,7 +1,7 @@
 //! Immutable decoded straight-alpha RGBA8 images shared between scene nodes.
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn next_identity() -> Result<u64, &'static str> {
@@ -37,6 +37,8 @@ impl ImageEffect {
 #[derive(Debug)]
 struct Pixels {
     decoded: Arc<[u8]>,
+    /// `decoded` is premultiplied already (`ImageData::new_premultiplied`).
+    premultiplied: bool,
     /// Dropped by `drop_kept`, which can't unwind: dropped inline, its glue
     /// (out of line) gave every drop of a node's kind a cleanup path, +0.1%
     /// on scenes that show no image.
@@ -45,10 +47,30 @@ struct Pixels {
     /// frame of: here, behind the pixels' `Arc` (`drop_animation`), not a
     /// field of `ImageData`, whose drop glue every style's drop inlines.
     animation: std::mem::ManuallyDrop<Option<Arc<crate::animation::Animation>>>,
+    /// Pixels made when first read (`ImageData::on_demand`), dropped as
+    /// `kept` is (`drop_made`).
+    made: std::mem::ManuallyDrop<Option<Box<Made>>>,
+}
+/// What makes an image's pixels on demand (`ImageData::on_demand`).
+type Make = Box<dyn FnOnce() -> Arc<[u8]> + Send>;
+/// Pixels made when first read, and kept from then.
+struct Made {
+    make: std::sync::Mutex<Option<Make>>,
+    pixels: std::sync::OnceLock<Arc<[u8]>>,
+}
+impl std::fmt::Debug for Made {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Made")
+            .field("made", &self.pixels.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 impl Drop for Pixels {
     fn drop(&mut self) {
         drop_kept(&mut self.kept);
+        if self.made.is_some() {
+            drop_made(&mut self.made);
+        }
         if self.animation.is_some() {
             // Through a pointer the optimizer can't see into: an animation
             // holds frames, which hold pixels, so a direct call closed a
@@ -65,6 +87,11 @@ impl Drop for Pixels {
 extern "C" fn drop_kept(kept: &mut std::mem::ManuallyDrop<Option<Kept>>) {
     // SAFETY: once, from `Pixels::drop`; nothing reads it after.
     unsafe { std::mem::ManuallyDrop::drop(kept) }
+}
+/// Pixels made on demand, dropped as `Pixels::drop` says of `kept`.
+extern "C" fn drop_made(made: &mut std::mem::ManuallyDrop<Option<Box<Made>>>) {
+    // SAFETY: once, from `Pixels::drop`; nothing reads it after.
+    unsafe { std::mem::ManuallyDrop::drop(made) }
 }
 /// An animated still's animation, dropped as `Pixels::drop` says.
 extern "C" fn drop_animation(
@@ -86,6 +113,24 @@ pub enum Decoding {
     Sync,
     /// Off the main thread, whatever its size.
     Async,
+}
+thread_local! {
+    static WHOLE_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Whether frames drawn on this thread may go without a picture's pixels:
+/// with `true`, a kept file drawn here that would decode off the thread
+/// (`Decoding::Auto`, larger than `SYNC_PIXELS`) decodes as it is drawn, in
+/// that frame, as `Decoding::Sync` does. For a renderer whose frames are
+/// written out (a video), where a frame drawn without them is wrong, not
+/// late. `Decoding::Async` images still decode off the thread.
+/// It returns what it was, for whoever set it to put it back.
+pub fn set_whole_frames_on_this_thread(whole: bool) -> bool {
+    WHOLE_FRAMES.replace(whole)
+}
+/// Whether frames drawn on this thread decode every picture they draw
+/// (`set_whole_frames_on_this_thread`).
+pub fn whole_frames_on_this_thread() -> bool {
+    WHOLE_FRAMES.get()
 }
 /// An image drawn in nine pieces (a nine-patch; CSS's `border-image` with
 /// `fill`, `Scene::set_image_slice`): `slice` cuts its pixels into corners,
@@ -142,6 +187,9 @@ struct Kept {
     held: std::sync::Mutex<Option<Held>>,
     /// The size a decode under way makes, if one is.
     pending: std::sync::Mutex<Option<(u32, u32)>>,
+    /// When `held` was last asked for (`USES`), for which goes first past the
+    /// budget (`set_decoded_budget`).
+    used: AtomicU64,
     /// When it decodes (`Decoding`, as a `u8`).
     decoding: std::sync::atomic::AtomicU8,
     /// Its file didn't decode: not tried again (each try would draw again).
@@ -155,6 +203,16 @@ impl std::fmt::Debug for Kept {
         f.debug_struct("Kept")
             .field("encoded", &self.encoded.len())
             .finish_non_exhaustive()
+    }
+}
+/// Whether an image is still held anywhere ([`ImageData::holders`]): kept
+/// beside its texture by a renderer, which holds no image itself.
+#[derive(Clone, Debug)]
+pub struct Holders(std::sync::Weak<Pixels>);
+impl Holders {
+    /// Whether anything holds it: a node, an app, a cache.
+    pub fn any(&self) -> bool {
+        self.0.strong_count() > 0
     }
 }
 /// Pixels decoded at a size, premultiplied (`ImageData::pixels_at`).
@@ -203,13 +261,96 @@ impl ImageData {
             height,
             pixels: Arc::new(Pixels {
                 decoded: pixels,
+                premultiplied: false,
                 kept: std::mem::ManuallyDrop::new(None),
                 animation: std::mem::ManuallyDrop::new(None),
+                made: std::mem::ManuallyDrop::new(None),
             }),
             transform: crate::affine::Affine::IDENTITY,
             effect: ImageEffect::Plain,
             gpu: None,
         })
+    }
+    /// [`ImageData::new`] from RGBA8 `pixels` already premultiplied by their
+    /// alpha (a frame read back from a renderer): drawn as they are, not
+    /// premultiplied again. [`ImageData::pixels`] gives them as they are.
+    pub fn new_premultiplied(
+        width: u32,
+        height: u32,
+        pixels: impl Into<Arc<[u8]>>,
+    ) -> Result<Self, &'static str> {
+        let mut image = Self::new(width, height, pixels)?;
+        Arc::get_mut(&mut image.pixels)
+            .expect("made just now")
+            .premultiplied = true;
+        Ok(image)
+    }
+    /// Whether its pixels are premultiplied already
+    /// ([`ImageData::new_premultiplied`]); else straight.
+    pub fn is_premultiplied(&self) -> bool {
+        self.pixels.premultiplied
+    }
+    /// A `width` by `height` image whose RGBA8 pixels `make` gives when they
+    /// are first read, and that are kept from then: for a picture held
+    /// somewhere else (a pixel buffer on screen) that few ask for as bytes.
+    /// Bytes of the wrong length read as transparent black.
+    pub fn on_demand(
+        width: u32,
+        height: u32,
+        make: impl FnOnce() -> Arc<[u8]> + Send + 'static,
+    ) -> Result<Self, &'static str> {
+        (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or("image size overflow")?;
+        if width == 0 || height == 0 {
+            return Err("image requires nonzero dimensions");
+        }
+        Ok(Self {
+            id: next_identity()?,
+            width,
+            height,
+            pixels: Arc::new(Pixels {
+                decoded: Arc::from(&[][..]),
+                premultiplied: false,
+                kept: std::mem::ManuallyDrop::new(None),
+                animation: std::mem::ManuallyDrop::new(None),
+                made: std::mem::ManuallyDrop::new(Some(Box::new(Made {
+                    make: std::sync::Mutex::new(Some(Box::new(make))),
+                    pixels: std::sync::OnceLock::new(),
+                }))),
+            }),
+            transform: crate::affine::Affine::IDENTITY,
+            effect: ImageEffect::Plain,
+            gpu: None,
+        })
+    }
+    /// [`ImageData::on_demand`] of RGBA8 pixels already premultiplied by
+    /// their alpha (a renderer's frame), as [`ImageData::new_premultiplied`].
+    pub fn on_demand_premultiplied(
+        width: u32,
+        height: u32,
+        make: impl FnOnce() -> Arc<[u8]> + Send + 'static,
+    ) -> Result<Self, &'static str> {
+        let mut image = Self::on_demand(width, height, make)?;
+        Arc::get_mut(&mut image.pixels)
+            .expect("made just now")
+            .premultiplied = true;
+        Ok(image)
+    }
+    /// Its pixels when not kept as a file: decoded, or made now if made on
+    /// demand (`on_demand`).
+    fn decoded(&self) -> &Arc<[u8]> {
+        match &*self.pixels.made {
+            Some(made) => made.pixels.get_or_init(|| {
+                let make = made.make.lock().ok().and_then(|mut make| make.take());
+                let len = self.width as usize * self.height as usize * 4;
+                make.map(|make| make())
+                    .filter(|pixels| pixels.len() == len)
+                    .unwrap_or_else(|| vec![0; len].into())
+            }),
+            None => &self.pixels.decoded,
+        }
     }
     /// A frame of a GPU view, its pixels left to the renderer, which asks the
     /// view to draw them (`crate::gpu_view`).
@@ -220,8 +361,10 @@ impl ImageData {
             height: frame.height.ceil() as u32,
             pixels: Arc::new(Pixels {
                 decoded: Arc::from(&[][..]),
+                premultiplied: false,
                 kept: std::mem::ManuallyDrop::new(None),
                 animation: std::mem::ManuallyDrop::new(None),
+                made: std::mem::ManuallyDrop::new(None),
             }),
             transform: crate::affine::Affine::IDENTITY,
             effect: ImageEffect::Plain,
@@ -248,6 +391,12 @@ impl ImageData {
     pub fn id(&self) -> u64 {
         self.id
     }
+    /// What tells whether anything still holds this image or a copy sharing
+    /// its pixels: once nothing does, nothing can show its identity again,
+    /// and a texture uploaded of it can go.
+    pub fn holders(&self) -> Holders {
+        Holders(Arc::downgrade(&self.pixels))
+    }
     /// Its width in pixels.
     pub fn width(&self) -> u32 {
         self.width
@@ -256,7 +405,8 @@ impl ImageData {
     pub fn height(&self) -> u32 {
         self.height
     }
-    /// Its RGBA8 bytes, four per pixel; none for a GPU view's frame
+    /// Its RGBA8 bytes, four per pixel, straight unless it was made
+    /// premultiplied (`is_premultiplied`); none for a GPU view's frame
     /// (`gpu_frame`).
     pub fn pixels(&self) -> &[u8] {
         match &*self.pixels.kept {
@@ -266,7 +416,7 @@ impl ImageData {
                     vec![0; self.width as usize * self.height as usize * 4].into()
                 })
             }),
-            None => &self.pixels.decoded,
+            None => self.decoded(),
         }
     }
     /// Share decoded pixels and GPU upload identity with a different paint
@@ -304,8 +454,10 @@ impl ImageData {
         // identity.
         still.pixels = Arc::new(Pixels {
             decoded: first.pixels.decoded.clone(),
+            premultiplied: first.pixels.premultiplied,
             kept: std::mem::ManuallyDrop::new(None),
             animation: std::mem::ManuallyDrop::new(Some(animation)),
+            made: std::mem::ManuallyDrop::new(None),
         });
         still
     }
@@ -432,17 +584,20 @@ impl ImageData {
         }
         let pixels = Arc::new(Pixels {
             decoded: Arc::from(&[][..]),
+            premultiplied: false,
             kept: std::mem::ManuallyDrop::new(Some(Kept {
                 encoded,
                 decode,
                 scaled,
                 held: std::sync::Mutex::new(None),
                 pending: std::sync::Mutex::new(None),
+                used: AtomicU64::new(0),
                 decoding: std::sync::atomic::AtomicU8::new(Decoding::Auto as u8),
                 failed: std::sync::atomic::AtomicBool::new(false),
                 pinned: std::sync::OnceLock::new(),
             })),
             animation: std::mem::ManuallyDrop::new(None),
+            made: std::mem::ManuallyDrop::new(None),
         });
         registry().push(Arc::downgrade(&pixels));
         Ok(Self {
@@ -461,10 +616,25 @@ impl ImageData {
     pub fn bytes(&self) -> usize {
         let own = match &*self.pixels.kept {
             Some(kept) => kept.encoded.len(),
+            None if self.pixels.made.is_some() => self.width as usize * self.height as usize * 4,
             None => self.pixels.decoded.len(),
         };
         // An animation's still: its other frames, or its stream, too.
         own + (self.pixels.animation.as_ref()).map_or(0, |animation| animation.bytes())
+    }
+    /// All its pixels, straight, for a moment (a copy to the clipboard): a
+    /// kept file's decoded for this and dropped with it, where `pixels` holds
+    /// them for as long as the image.
+    pub fn pixels_now(&self) -> Arc<[u8]> {
+        match &*self.pixels.kept {
+            Some(kept) => match kept.pinned.get() {
+                Some(pinned) => pinned.clone(),
+                None => (kept.decode)(&kept.encoded).unwrap_or_else(|_| {
+                    vec![0; self.width as usize * self.height as usize * 4].into()
+                }),
+            },
+            None => self.decoded().clone(),
+        }
     }
     /// Its pixels, straight, shared (`pixels`, by count).
     pub fn pixels_arc(&self) -> Arc<[u8]> {
@@ -474,7 +644,7 @@ impl ImageData {
                 let kept = self.pixels.kept.as_ref().expect("kept above");
                 kept.pinned.get().expect("pinned by `pixels`").clone()
             }
-            None => self.pixels.decoded.clone(),
+            None => self.decoded().clone(),
         }
     }
     /// When its kept file decodes as first drawn (`Decoding`); nothing for an
@@ -515,6 +685,8 @@ impl ImageData {
             && held.width >= size.0
             && held.height >= size.1
         {
+            kept.used
+                .store(USES.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
             return Some(held.clone());
         }
         if kept.failed.load(Ordering::Relaxed) {
@@ -525,7 +697,7 @@ impl ImageData {
         let now = match kept.decoding.load(Ordering::Relaxed) {
             d if d == Decoding::Sync as u8 => true,
             d if d == Decoding::Async as u8 => false,
-            _ => small,
+            _ => small || WHOLE_FRAMES.get(),
         };
         if now {
             return decode_at(&self.pixels, (self.width, self.height), size, false);
@@ -537,6 +709,51 @@ impl ImageData {
         }
         None
     }
+    /// Ask for its pixels at least `size` (what a renderer will ask, by
+    /// [`fitted_size`]) before it is drawn, off the main thread, after any
+    /// decode a picture drawn is waiting for: a list's row built ahead of its
+    /// view, so the picture shows as the row does. Nothing when its pixels
+    /// come as it is drawn anyway (small, not a kept file, `Decoding::Sync`),
+    /// are decoded or decoding at that size, or `AHEAD_MOST` wait already;
+    /// else what keeps it asked for: let go before it begins, it doesn't run.
+    pub fn decode_ahead(&self, size: (u32, u32)) -> Option<Ahead> {
+        let kept = self.pixels.kept.as_ref()?;
+        let size = (size.0.clamp(1, self.width), size.1.clamp(1, self.height));
+        let small = u64::from(self.width) * u64::from(self.height) <= SYNC_PIXELS;
+        if small
+            || kept.failed.load(Ordering::Relaxed)
+            || kept.decoding.load(Ordering::Relaxed) == Decoding::Sync as u8
+        {
+            return None;
+        }
+        let covers = |(w, h): (u32, u32)| w >= size.0 && h >= size.1;
+        let held = kept.held.lock().unwrap_or_else(|p| p.into_inner());
+        if held
+            .as_ref()
+            .is_some_and(|held| covers((held.width, held.height)))
+        {
+            return None;
+        }
+        drop(held);
+        let mut pending = kept.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.is_some_and(covers) {
+            return None;
+        }
+        let mut ahead = AHEAD.lock().unwrap_or_else(|p| p.into_inner());
+        if ahead.len() >= AHEAD_MOST {
+            return None;
+        }
+        *pending = Some(size);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ahead.push_back((
+            (Arc::clone(&self.pixels), (self.width, self.height), size),
+            dropped.clone(),
+        ));
+        drop(ahead);
+        drop(pending);
+        send_work(Work::Ahead);
+        Some(Ahead(dropped))
+    }
 }
 /// Gives back what kept files' decoded pixels hold (pinned ones aside):
 /// a renderer has them as textures, and they decode again if drawn
@@ -547,14 +764,109 @@ pub fn release_decoded() -> usize {
     list.retain(|weak| match weak.upgrade() {
         Some(pixels) => {
             if let Some(kept) = &*pixels.kept {
-                let mut held = kept.held.lock().unwrap_or_else(|p| p.into_inner());
-                freed += held.take().map_or(0, |held| held.pixels.len());
+                freed += hold(kept, None);
             }
             true
         }
         None => false,
     });
+    drop(list);
+    // Every copy given back: dropped images' too.
+    HELD.store(0, Ordering::Relaxed);
+    // What the decoding thread made is free now: it rests, if it ever ran.
+    if freed > 0 && WORKER.get().is_some() {
+        send_work(Work::Rest);
+    }
     freed
+}
+/// What kept files' decoded copies hold together, pinned ones aside, or
+/// more: a dropped image's copy stays counted until `shed` or
+/// `release_decoded` counts again, so an image's drop stays as it was (a
+/// style holding one drops it inline, and every style's drop would pay).
+static HELD: AtomicUsize = AtomicUsize::new(0);
+/// What they may hold before those used least recently go (`set_decoded_budget`).
+static BUDGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// A count of uses of decoded copies, for which was used least recently.
+static USES: AtomicU64 = AtomicU64::new(1);
+/// Decodes of kept files so far (`decodes`).
+static DECODES: AtomicU64 = AtomicU64::new(0);
+/// What kept files' decoded copies may hold together, pinned ones aside:
+/// past it, as a decode lands, those used least recently go. A renderer holds
+/// what it uploaded as textures, so a copy serves only to upload again (a
+/// texture given back, then drawn again, decodes again). Below it, nothing
+/// changes: an app showing few pictures never decodes twice. Unbounded until a
+/// host sets it for its windows (zgx-desktop: sixteen frames of its largest, 64
+/// to 192 MiB); a window at rest gives every copy back as well
+/// (`release_decoded`).
+pub fn set_decoded_budget(bytes: usize) {
+    BUDGET.store(bytes, Ordering::Relaxed);
+}
+/// The budget `set_decoded_budget` set.
+pub fn decoded_budget() -> usize {
+    BUDGET.load(Ordering::Relaxed)
+}
+/// How many decodes of kept files there have been in this process: with a
+/// count of pictures shown, how many decoded again. For tests and benches.
+pub fn decodes() -> u64 {
+    DECODES.load(Ordering::Relaxed)
+}
+/// Put `held` in place of `kept`'s copy, counting it: the bytes the copy it
+/// replaces held.
+fn hold(kept: &Kept, held: Option<Held>) -> usize {
+    let new = held.as_ref().map_or(0, |h| h.pixels.len());
+    let old = std::mem::replace(
+        &mut *kept.held.lock().unwrap_or_else(|p| p.into_inner()),
+        held,
+    )
+    .map_or(0, |h| h.pixels.len());
+    HELD.fetch_add(new, Ordering::Relaxed);
+    HELD.fetch_sub(old, Ordering::Relaxed);
+    old
+}
+/// Past the budget: count what the copies hold again (`HELD` may count
+/// dropped images'), then give back copies until it is under, those used
+/// least recently first; never `keep`'s (just decoded) nor one whose decode
+/// is under way.
+#[cold]
+#[inline(never)]
+fn shed(keep: &Pixels) {
+    let mut total = 0;
+    let mut held: Vec<(u64, Arc<Pixels>)> = {
+        let mut list = registry();
+        list.retain(|weak| weak.strong_count() > 0);
+        list.iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter_map(|pixels| {
+                let kept = pixels.kept.as_ref()?;
+                let bytes = kept
+                    .held
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .map(|held| held.pixels.len());
+                total += bytes.unwrap_or(0);
+                let decoding = kept
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some();
+                let used = kept.used.load(Ordering::Relaxed);
+                let spare = bytes.is_some() && !decoding && !std::ptr::eq(&*pixels, keep);
+                spare.then_some((used, pixels))
+            })
+            .collect()
+    };
+    HELD.store(total, Ordering::Relaxed);
+    held.sort_unstable_by_key(|(used, _)| *used);
+    let budget = BUDGET.load(Ordering::Relaxed);
+    for (.., pixels) in held {
+        if HELD.load(Ordering::Relaxed) <= budget {
+            break;
+        }
+        if let Some(kept) = &*pixels.kept {
+            hold(kept, None);
+        }
+    }
 }
 /// What kept files' decoded pixels hold now (pinned ones too).
 pub fn decoded_bytes() -> usize {
@@ -594,22 +906,144 @@ fn registry() -> std::sync::MutexGuard<'static, Vec<std::sync::Weak<Pixels>>> {
 type Job = (Arc<Pixels>, (u32, u32), (u32, u32));
 /// Queue a decode for the one thread decoding kept files, a file at a time:
 /// a page of photos holds one whole decode at once, not one each.
+/// What the decoding thread is sent: a decode, or word that the copies it
+/// made were given back (`release_decoded`).
+enum Work {
+    Decode(Job),
+    /// The next of the decodes asked for ahead (`AHEAD`).
+    Ahead,
+    Rest,
+}
+/// The most decodes asked for ahead of their pictures being drawn
+/// (`ImageData::decode_ahead`) and not yet begun: a fast scroll past rows
+/// long gone can't pile them up, and a picture drawn waits behind no more.
+pub const AHEAD_MOST: usize = 4;
+/// Decodes asked for ahead, in the order asked, each with word of whether
+/// whoever asked still wants it.
+static AHEAD: std::sync::Mutex<
+    std::collections::VecDeque<(Job, Arc<std::sync::atomic::AtomicBool>)>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+/// A decode asked for ahead of its picture being drawn
+/// (`ImageData::decode_ahead`), held by what asked (a list's row built ahead):
+/// let go before it begins (the row dropped), it doesn't run.
+#[derive(Debug)]
+pub struct Ahead(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+/// Whether another decode may be asked for ahead (`AHEAD_MOST`).
+pub fn ahead_room() -> bool {
+    AHEAD.lock().unwrap_or_else(|p| p.into_inner()).len() < AHEAD_MOST
+}
+/// The size a texture of a `width` by `height` image holds when drawn at
+/// `drawn` device pixels (`None`: all of it): scaled down, its shape kept,
+/// to the least that is at least that large on both axes; never up. What a
+/// renderer asks `pixels_at` for, and so what a decode ahead makes.
+pub fn fitted_size(width: u32, height: u32, drawn: Option<(f32, f32)>) -> (u32, u32) {
+    let Some((w, h)) = drawn.filter(|(w, h)| w.is_finite() && h.is_finite()) else {
+        return (width.max(1), height.max(1));
+    };
+    let scale = (w / width.max(1) as f32).max(h / height.max(1) as f32);
+    if scale >= 1. {
+        return (width.max(1), height.max(1));
+    }
+    let side = |v: u32| ((v as f32 * scale).ceil() as u32).clamp(1, v.max(1));
+    (side(width), side(height))
+}
+/// The one thread decoding kept files, once one has been queued.
+static WORKER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Work>>> =
+    std::sync::OnceLock::new();
+/// What the decoding thread runs once the copies it made are given back:
+/// the host's allocator collects that thread's heap (`set_decoder_rest`).
+static DECODER_REST: std::sync::RwLock<Option<fn()>> = std::sync::RwLock::new(None);
+/// Rests the decoding thread has had (`decoder_rests`).
+static RESTS: AtomicU64 = AtomicU64::new(0);
+/// What the thread decoding kept files runs after `release_decoded` gives
+/// back what it decoded: a host whose allocator keeps a thread's freed pages
+/// until that thread collects them (mimalloc: a block freed by another
+/// thread waits for its own) collects that thread's heap here. Decoded
+/// copies are made on that thread and given back by the main one, so
+/// without it the pages of every copy a long scroll made stayed in memory
+/// at rest. Nothing runs as pictures decode or draw.
+pub fn set_decoder_rest(rest: fn()) {
+    *DECODER_REST.write().unwrap_or_else(|p| p.into_inner()) = Some(rest);
+}
+/// How many times the decoding thread has rested (`set_decoder_rest`). For
+/// tests.
+#[doc(hidden)]
+pub fn decoder_rests() -> u64 {
+    RESTS.load(Ordering::Relaxed)
+}
 fn send(job: Job) {
-    static WORKER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> =
-        std::sync::OnceLock::new();
+    send_work(Work::Decode(job));
+}
+fn send_work(work: Work) {
     let sender = WORKER.get_or_init(|| {
-        let (send, receive) = std::sync::mpsc::channel::<Job>();
+        let (send, receive) = std::sync::mpsc::channel::<Work>();
         std::thread::Builder::new()
             .name("zgx image decode".into())
             .spawn(move || {
-                for (pixels, full, size) in receive {
-                    decode_at(&pixels, full, size, true);
+                for work in receive {
+                    match work {
+                        // Asked for larger since: that decode is queued
+                        // behind this one, and what this would make goes
+                        // unused.
+                        Work::Decode((pixels, full, size)) => {
+                            if !superseded(&pixels, size) {
+                                decode_at(&pixels, full, size, true);
+                            }
+                        }
+                        Work::Ahead => {
+                            let next = AHEAD.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+                            if let Some(((pixels, full, size), dropped)) = next {
+                                if dropped.load(Ordering::Relaxed) {
+                                    let_go(&pixels, size);
+                                } else if !superseded(&pixels, size) {
+                                    decode_at(&pixels, full, size, true);
+                                }
+                            }
+                        }
+                        Work::Rest => {
+                            let rest = *DECODER_REST.read().unwrap_or_else(|p| p.into_inner());
+                            if let Some(rest) = rest {
+                                rest();
+                            }
+                            RESTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             })
             .expect("a decoding thread");
         std::sync::Mutex::new(send)
     });
-    let _ = sender.lock().unwrap_or_else(|p| p.into_inner()).send(job);
+    let _ = sender.lock().unwrap_or_else(|p| p.into_inner()).send(work);
+}
+/// A decode asked for ahead whose row went before its turn: not made. It
+/// was what `pixels_at` waited on, so a picture drawn since asks again,
+/// woken to.
+fn let_go(pixels: &Pixels, size: (u32, u32)) {
+    let Some(kept) = pixels.kept.as_ref() else {
+        return;
+    };
+    let mut pending = kept.pending.lock().unwrap_or_else(|p| p.into_inner());
+    if *pending == Some(size) {
+        *pending = None;
+        drop(pending);
+        let wake = WAKE.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+}
+/// A larger decode of `pixels` than `size` has been queued since.
+fn superseded(pixels: &Pixels, size: (u32, u32)) -> bool {
+    let Some(kept) = pixels.kept.as_ref() else {
+        return false;
+    };
+    let pending = kept.pending.lock().unwrap_or_else(|p| p.into_inner());
+    pending.is_some_and(|(w, h)| w > size.0 || h > size.1)
 }
 /// Decode `pixels`' file whole, then premultiplied and shrunk to `size`,
 /// the whole decode dropped: held at that size.
@@ -658,12 +1092,23 @@ fn decode_at(
             pixels: rgba.map_or(straight, Arc::from),
         }
     });
-    *kept.pending.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    // (A larger one queued since stays pending: asked for again, it would decode twice.)
+    let mut pending = kept.pending.lock().unwrap_or_else(|p| p.into_inner());
+    if pending.is_some_and(|(w, h)| w <= size.0 && h <= size.1) {
+        *pending = None;
+    }
+    drop(pending);
     let Some(done) = done else {
         kept.failed.store(true, Ordering::Relaxed);
         return None;
     };
-    *kept.held.lock().unwrap_or_else(|p| p.into_inner()) = Some(done.clone());
+    hold(kept, Some(done.clone()));
+    kept.used
+        .store(USES.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+    DECODES.fetch_add(1, Ordering::Relaxed);
+    if HELD.load(Ordering::Relaxed) > BUDGET.load(Ordering::Relaxed) {
+        shed(pixels);
+    }
     // Off the main thread: whoever waited draws again.
     let wake = wake
         .then(|| WAKE.lock().unwrap_or_else(|p| p.into_inner()).clone())
@@ -673,11 +1118,35 @@ fn decode_at(
     }
     Some(done)
 }
-fn premultiply(rgba: &mut [u8]) {
-    for pixel in rgba.as_chunks_mut::<4>().0 {
-        let alpha = u16::from(pixel[3]);
-        for channel in &mut pixel[..3] {
-            *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+/// Straight RGBA pixels made premultiplied, in place, sixteen at a time: a
+/// block all opaque (a photo's, a video's) is as it was, one all
+/// transparent (around a canvas's marks) is zeros, and in the rest each
+/// colour is times its alpha, `(c · a + 127) / 255`, exactly, as a multiply
+/// and two shifts in 16 bits. No branch a pixel, so each part is
+/// vectorized: one per pixel (an early return for opaque pixels) made a
+/// canvas's a pixel at a time.
+pub fn premultiply(pixels: &mut [u8]) {
+    for block in pixels.chunks_mut(64) {
+        let (mut all, mut any) = (255u8, 0u8);
+        for pixel in block.as_chunks::<4>().0 {
+            all &= pixel[3];
+            any |= pixel[3];
+        }
+        if all == 255 {
+            continue;
+        }
+        if any == 0 {
+            block.fill(0);
+            continue;
+        }
+        for pixel in block.as_chunks_mut::<4>().0 {
+            let alpha = u16::from(pixel[3]);
+            for channel in &mut pixel[..3] {
+                // ⌊x / 255⌋ is (x + 1 + (x >> 8)) >> 8 for every x c · a + 127
+                // reaches (at most 65,152, where the sum is 65,407: 16 bits).
+                let x = u16::from(*channel) * alpha + 127;
+                *channel = ((x + 1 + (x >> 8)) >> 8) as u8;
+            }
         }
     }
 }
@@ -717,9 +1186,104 @@ pub mod resample {
     /// Premultiplied RGBA `width` by `height` at `to` (no larger), each texel
     /// the area-weighted mean of what it covers: from a halving at most twice
     /// its size, as sharp as a mip level, at any size.
+    ///
+    /// The weights are a product of one along each axis, so the mean is
+    /// taken down each target row's few source rows, then across: a few taps
+    /// each way, not every one of the area, each axis's weights summing to
+    /// one, with no division a texel.
     pub fn shrink(pixels: &[u8], width: u32, height: u32, to: (u32, u32)) -> Vec<u8> {
+        let (tw, th) = (to.0 as usize, to.1 as usize);
+        let (xs, ys) = (Taps::new(width, tw), Taps::new(height, th));
+        let row = width as usize * 4;
+        let mut out = vec![0u8; tw * th * 4];
+        // A target row's source rows, each texel's channels summed down.
+        let mut down = vec![0f32; row];
+        for (ty, target) in out.chunks_exact_mut(tw * 4).enumerate() {
+            down.fill(0.);
+            let (y0, wy) = ys.of(ty);
+            for (dy, &ky) in wy.iter().enumerate() {
+                // (A tap past a row's own span: nothing to add.)
+                if ky == 0. {
+                    continue;
+                }
+                let source = &pixels[(y0 + dy) * row..][..row];
+                for (sum, texel) in down.iter_mut().zip(source) {
+                    *sum += f32::from(*texel) * ky;
+                }
+            }
+            let texels = down.as_chunks::<4>().0;
+            for (tx, out) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let (x0, wx) = xs.of(tx);
+                let mut sum = [0f32; 4];
+                for (texel, kx) in texels[x0..x0 + wx.len()].iter().zip(wx) {
+                    for c in 0..4 {
+                        sum[c] += texel[c] * kx;
+                    }
+                }
+                for c in 0..4 {
+                    out[c] = sum[c].round() as u8;
+                }
+            }
+        }
+        out
+    }
+    /// Each target texel's span along an axis, as as many taps as the widest
+    /// covers (at most three from a halving twice the size): its first
+    /// source texel (moved back from the far edge so that its taps stay in
+    /// it) and the share each takes, summing to one, zero past its own.
+    struct Taps {
+        first: Vec<usize>,
+        weights: Vec<f32>,
+        taps: usize,
+    }
+    impl Taps {
+        fn new(from: u32, to: usize) -> Self {
+            let step = from as f32 / to as f32;
+            let spans: Vec<(u32, Vec<f32>)> = (0..to)
+                .map(|t| {
+                    let (start, end) = (t as f32 * step, (t + 1) as f32 * step);
+                    let first = start.floor() as u32;
+                    let last = (end.ceil() as u32).min(from);
+                    let weights: Vec<f32> = (first..last)
+                        .map(|s| ((s + 1) as f32).min(end) - (s as f32).max(start))
+                        .collect();
+                    let total: f32 = weights.iter().sum();
+                    (first, weights.iter().map(|w| w / total).collect())
+                })
+                .collect();
+            let taps = spans.iter().map(|(_, w)| w.len()).max().unwrap_or(1);
+            let (mut first, mut weights) = (Vec::with_capacity(to), vec![0.; to * taps]);
+            for (t, (own, shares)) in spans.into_iter().enumerate() {
+                // Near the far edge, its taps start earlier; its own shares
+                // then come later among them.
+                let start = (own as usize).min(from as usize - taps);
+                let at = t * taps + own as usize - start;
+                weights[at..at + shares.len()].copy_from_slice(&shares);
+                first.push(start);
+            }
+            Self {
+                first,
+                weights,
+                taps,
+            }
+        }
+        fn of(&self, t: usize) -> (usize, &[f32]) {
+            (self.first[t], &self.weights[t * self.taps..][..self.taps])
+        }
+    }
+}
+
+#[cfg(test)]
+mod resample_tests {
+    use super::resample::shrink;
+
+    /// A texel of a test image, by where it is.
+    type Texel = dyn Fn(u32, u32) -> [u8; 4];
+
+    /// The shrink as it was: each target texel the mean of its whole area,
+    /// divided by its weights' sum.
+    fn by_area(pixels: &[u8], width: u32, height: u32, to: (u32, u32)) -> Vec<u8> {
         let (tw, th) = to;
-        // Each target texel's span along an axis: (first source texel, weights).
         let spans = |from: u32, to: u32| -> Vec<(u32, Vec<f32>)> {
             let step = from as f32 / to as f32;
             (0..to)
@@ -758,6 +1322,89 @@ pub mod resample {
             }
         }
         out
+    }
+
+    /// Premultiplied RGBA `width` by `height`, each texel from `texel(x, y)`
+    /// (its colour times its alpha).
+    fn image(width: u32, height: u32, texel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .flat_map(|(x, y)| {
+                let [r, g, b, a] = texel(x, y);
+                let times = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+                [times(r), times(g), times(b), a]
+            })
+            .collect()
+    }
+
+    /// Shrunk across then down, a texel is what the whole area's mean made
+    /// of it, to the rounding (one 255th), in noise, fine lines, a
+    /// checkerboard and at an edge left over, from just under the size
+    /// drawn to half of it; and a flat colour stays that colour exactly.
+    #[test]
+    fn a_shrink_is_the_mean_of_the_area_each_texel_covers() {
+        let noise = |x: u32, y: u32| {
+            let h = (x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663))
+                .wrapping_mul(2_654_435_761);
+            [
+                (h >> 24) as u8,
+                (h >> 16) as u8,
+                (h >> 8) as u8,
+                (h as u8) | 1,
+            ]
+        };
+        let lines = |x: u32, _: u32| {
+            if x.is_multiple_of(3) {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 255]
+            }
+        };
+        let checks = |x: u32, y: u32| {
+            if (x + y).is_multiple_of(2) {
+                [250, 10, 30, 255]
+            } else {
+                [5, 240, 200, 128]
+            }
+        };
+        let sources: [(&str, &Texel); 3] =
+            [("noise", &noise), ("lines", &lines), ("checks", &checks)];
+        for (name, texel) in sources {
+            for (width, height) in [(161, 97), (64, 64)] {
+                let pixels = image(width, height, texel);
+                for to in [
+                    (width - 1, height - 1),
+                    (width * 2 / 3, height * 3 / 4),
+                    (width.div_ceil(2), height.div_ceil(2)),
+                    (1, 1),
+                ] {
+                    let (now, before) = (
+                        shrink(&pixels, width, height, to),
+                        by_area(&pixels, width, height, to),
+                    );
+                    assert_eq!(now.len(), before.len());
+                    let most = now
+                        .iter()
+                        .zip(&before)
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    assert!(
+                        most <= 1,
+                        "{name} {width}x{height} to {to:?}: off by {most}"
+                    );
+                }
+            }
+        }
+        let flat = image(161, 97, |_, _| [37, 180, 90, 255]);
+        let shrunk = shrink(&flat, 161, 97, (100, 61));
+        assert!(
+            shrunk
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|t| *t == [37, 180, 90, 255])
+        );
     }
 }
 
@@ -801,6 +1448,137 @@ mod kept_tests {
         Err("truncated".into())
     }
 
+    /// Decodes made of each of three 300 by 300 files (`decode_ahead`'s tests).
+    static AHEAD_DECODES: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+    fn counted(which: usize) -> Result<Arc<[u8]>, String> {
+        AHEAD_DECODES[which].fetch_add(1, Ordering::Relaxed);
+        Ok([0, 255, 0, 255].repeat(300 * 300).into())
+    }
+    fn counted_0(_: &[u8]) -> Result<Arc<[u8]>, String> {
+        counted(0)
+    }
+    fn counted_1(_: &[u8]) -> Result<Arc<[u8]>, String> {
+        counted(1)
+    }
+    fn counted_2(_: &[u8]) -> Result<Arc<[u8]>, String> {
+        counted(2)
+    }
+    /// A decode that holds the decoding thread until let go (`SLOW_GO`).
+    static SLOW_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SLOW_GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn slow(_: &[u8]) -> Result<Arc<[u8]>, String> {
+        SLOW_STARTED.store(true, Ordering::Relaxed);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !SLOW_GO.load(Ordering::Relaxed) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok([0, 0, 0, 255].repeat(300 * 300).into())
+    }
+    /// The decoding thread busy with a slow decode asked ahead: what it held.
+    fn busy() -> (ImageData, Ahead) {
+        SLOW_STARTED.store(false, Ordering::Relaxed);
+        SLOW_GO.store(false, Ordering::Relaxed);
+        let image = ImageData::kept(300, 300, Arc::from(&b"slow"[..]), slow).unwrap();
+        let ahead = image.decode_ahead((300, 300)).expect("asked ahead");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !SLOW_STARTED.load(Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the slow decode never began"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        (image, ahead)
+    }
+    fn pending(image: &ImageData) -> Option<(u32, u32)> {
+        *image.pixels.kept.as_ref().unwrap().pending.lock().unwrap()
+    }
+
+    /// A decode asked for ahead of a picture being drawn is made off this
+    /// thread, and drawn at that size the picture finds it, decoded once;
+    /// held, there's nothing more to ask.
+    #[test]
+    fn a_decode_asked_ahead_is_there_when_drawn() {
+        let _alone = alone();
+        let image = ImageData::kept(300, 300, Arc::from(&b"ahead"[..]), counted_0).unwrap();
+        let before = AHEAD_DECODES[0].load(Ordering::Relaxed);
+        let ahead = image.decode_ahead((150, 150)).expect("asked ahead");
+        let held = wait_for(&image, (150, 150));
+        assert_eq!((held.width, held.height), (150, 150));
+        assert_eq!(
+            AHEAD_DECODES[0].load(Ordering::Relaxed) - before,
+            1,
+            "decoded once"
+        );
+        assert!(
+            image.decode_ahead((150, 150)).is_none(),
+            "held, and asked again"
+        );
+        assert!(
+            image.decode_ahead((100, 100)).is_none(),
+            "held larger, and asked again"
+        );
+        drop(ahead);
+        release_decoded();
+    }
+
+    /// A decode asked for ahead and let go before its turn (its row dropped)
+    /// isn't made: the file isn't decoded, and nothing is left under way, so
+    /// a picture drawn later asks again.
+    #[test]
+    fn a_decode_let_go_before_its_turn_is_not_made() {
+        let _alone = alone();
+        let (slow, first) = busy();
+        let image = ImageData::kept(300, 300, Arc::from(&b"ahead"[..]), counted_1).unwrap();
+        let before = AHEAD_DECODES[1].load(Ordering::Relaxed);
+        let ahead = image.decode_ahead((300, 300)).expect("asked ahead");
+        assert_eq!(pending(&image), Some((300, 300)));
+        drop(ahead);
+        SLOW_GO.store(true, Ordering::Relaxed);
+        wait_for(&slow, (300, 300));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pending(&image).is_some() {
+            assert!(std::time::Instant::now() < until, "still under way");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            AHEAD_DECODES[1].load(Ordering::Relaxed),
+            before,
+            "decoded though let go"
+        );
+        drop(first);
+        release_decoded();
+    }
+
+    /// While the decoding thread is busy, `AHEAD_MOST` decodes may wait to
+    /// be made ahead and no more: the next asked gets none.
+    #[test]
+    fn decodes_asked_ahead_wait_no_more_than_the_most() {
+        let _alone = alone();
+        let (slow, first) = busy();
+        let images: Vec<ImageData> = (0..=AHEAD_MOST)
+            .map(|_| ImageData::kept(300, 300, Arc::from(&b"ahead"[..]), counted_2).unwrap())
+            .collect();
+        let asked: Vec<Option<Ahead>> = images
+            .iter()
+            .map(|image| image.decode_ahead((300, 300)))
+            .collect();
+        assert_eq!(
+            asked.iter().filter(|ahead| ahead.is_some()).count(),
+            AHEAD_MOST
+        );
+        assert!(asked[AHEAD_MOST].is_none(), "one past the most was asked");
+        assert!(!ahead_room());
+        SLOW_GO.store(true, Ordering::Relaxed);
+        wait_for(&slow, (300, 300));
+        for image in &images[..AHEAD_MOST] {
+            wait_for(image, (300, 300));
+        }
+        assert!(ahead_room());
+        drop((asked, first));
+        release_decoded();
+    }
+
     /// A kept file decodes nothing until drawn; then (asked to decode off
     /// the main thread) off this thread, at the size asked, premultiplied;
     /// it is given back once released, and what `pixels` borrows is decoded
@@ -828,6 +1606,106 @@ mod kept_tests {
         // Borrowed: whole, straight, and kept.
         assert_eq!(image.pixels().len(), 8 * 4 * 4);
         assert_eq!(image.pixels_arc().len(), 8 * 4 * 4);
+    }
+
+    /// The decoding thread rests once what it decoded is given back, and
+    /// only then: not as it decodes, nor as a release gives nothing back.
+    #[test]
+    fn the_decoding_thread_rests_after_its_copies_are_given_back() {
+        let _alone = alone();
+        static RUN: AtomicU64 = AtomicU64::new(0);
+        fn rest() {
+            RUN.fetch_add(1, Ordering::Relaxed);
+        }
+        set_decoder_rest(rest);
+        release_decoded();
+        let wait = |count: u64| {
+            for _ in 0..500 {
+                if RUN.load(Ordering::Relaxed) >= count {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("never rested");
+        };
+        // Whatever an earlier release asked for has run.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let before = RUN.load(Ordering::Relaxed);
+        let image = ImageData::kept(300, 300, Arc::from(&b"large"[..]), decode_large).unwrap();
+        image.set_decoding(Decoding::Async);
+        assert!(image.pixels_at((300, 300)).is_none(), "decoding");
+        wait_for(&image, (300, 300));
+        let other = ImageData::kept(300, 300, Arc::from(&b"large"[..]), decode_large).unwrap();
+        other.set_decoding(Decoding::Async);
+        wait_for(&other, (150, 150));
+        assert_eq!(RUN.load(Ordering::Relaxed), before, "none while it decodes");
+        assert!(release_decoded() > 0);
+        wait(before + 1);
+        let rests = decoder_rests();
+        // Nothing held: nothing to collect.
+        assert_eq!(release_decoded(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(RUN.load(Ordering::Relaxed), before + 1);
+        assert_eq!(decoder_rests(), rests);
+    }
+
+    /// Past the budget, a decode landing gives back the copies used least
+    /// recently, never its own; under it, nothing goes. A dropped image's
+    /// copy, counted until then, is counted again then, and takes no live
+    /// one's place.
+    #[test]
+    fn decoded_copies_past_the_budget_go_least_recently_used_first() {
+        let _alone = alone();
+        release_decoded();
+        let before = (decoded_budget(), decodes());
+        let file = || ImageData::kept(8, 4, Arc::from(&b"file"[..]), decode).unwrap();
+        let (a, b, c) = (file(), file(), file());
+        // Two copies fit (each 8 by 4, 128 bytes): small, they decode here.
+        set_decoded_budget(2 * 128 + 64);
+        assert!(a.pixels_at((8, 4)).is_some());
+        assert!(b.pixels_at((8, 4)).is_some());
+        assert_eq!(decoded_bytes(), 2 * 128, "under it: both kept");
+        // `a` used again: `b` is now the least recent.
+        assert!(a.pixels_at((8, 4)).is_some());
+        assert_eq!(decodes(), before.1 + 2, "used again, not decoded");
+        assert!(c.pixels_at((8, 4)).is_some());
+        assert_eq!(decoded_bytes(), 2 * 128, "past it: one went");
+        let held = |image: &ImageData| {
+            let kept = image.pixels.kept.as_ref().unwrap();
+            kept.held.lock().unwrap().is_some()
+        };
+        assert!(
+            held(&a) && !held(&b) && held(&c),
+            "the least recently used went"
+        );
+        // `a` dropped: its copy still counted, until `d`'s decode lands past
+        // the budget and they are counted again; `c` and `d` fit.
+        drop(a);
+        let d = file();
+        assert!(d.pixels_at((8, 4)).is_some());
+        assert!(held(&c) && held(&d), "a dropped copy took no place");
+        assert_eq!(HELD.load(Ordering::Relaxed), 2 * 128);
+        set_decoded_budget(before.0);
+        release_decoded();
+        assert_eq!(HELD.load(Ordering::Relaxed), 0);
+    }
+
+    /// Read whole for a moment (a copy to the clipboard), a kept file holds
+    /// nothing after; `pixels` holds it from then on, and it's read from there.
+    #[test]
+    fn pixels_read_now_are_not_kept() {
+        let _alone = alone();
+        let image = ImageData::kept(8, 4, Arc::from(&b"file"[..]), decode).unwrap();
+        release_decoded();
+        let before = decoded_bytes();
+        let now = image.pixels_now();
+        assert_eq!(now.len(), 8 * 4 * 4);
+        assert_eq!(&now[..4], &[255, 0, 0, 255]);
+        drop(now);
+        assert_eq!(decoded_bytes(), before, "nothing kept");
+        image.pixels();
+        assert_eq!(decoded_bytes(), before + 8 * 4 * 4);
+        assert!(Arc::ptr_eq(&image.pixels_now(), &image.pixels_arc()));
     }
 
     /// A small picture decodes in the frame that draws it (no pop-in); a

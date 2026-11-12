@@ -86,37 +86,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .map(|ms| ms.parse::<u64>().unwrap_or(2));
             let shade = cx.ui.signal(0_u32);
-            let popup =
-                if grow || tint.is_some() || std::env::var_os("POPUP_PROBE_POPOVER").is_some() {
-                    let tinted = tint.is_some();
-                    let popover = popover("Details", open.clone(), anchor).reactive_style({
-                        let (size, shade) = (size.clone(), shade.clone());
-                        move || {
-                            let (w, h) = size.get();
-                            let styles = Styles::new().w(w).h(h);
-                            if tinted {
-                                let step = shade.get() % 64;
-                                styles.bg(rgb(0x4a3768 + (step << 16) + (step << 8)))
-                            } else {
-                                styles
-                            }
-                        }
-                    });
-                    // Its colour stays put but for the tint: its arrow takes
-                    // the panel's styles as it mounts, not a reactive style's.
-                    let popover = if tinted {
-                        popover
-                    } else {
-                        popover.bg(rgb(0x4a3768))
-                    };
-                    popover.arrow(8.)
+            // `POPUP_PROBE_GLASS`: hard stripes under a translucent popover
+            // that blurs what's behind it, opening by itself, for
+            // `popup_glass_smoke.py`: `over` wholly over the window, `past`
+            // reaching past its bottom edge.
+            let glass = std::env::var("POPUP_PROBE_GLASS").ok();
+            let popup = if let Some(glass) = &glass {
+                // Once the window has the focus, which a popup closes without.
+                let opening = open.clone();
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(4)).await;
+                    opening.set(true);
+                });
+                let side = if glass == "past" {
+                    zgx::compose::PlacementSide::Bottom
                 } else {
-                    menu("File", open.clone(), anchor)
-                        .w(200.)
-                        .p(5.)
-                        .children(items)
+                    zgx::compose::PlacementSide::Top
                 };
-            let view = cx.render(column().w_full().h_full().p(16.).justify_end().child(popup));
+                popover("Glass", open.clone(), anchor)
+                    .w(200.)
+                    .h(120.)
+                    .bg(rgba(0x111113a6))
+                    .blur(24.)
+                    .placement(zgx::compose::Placement {
+                        side,
+                        ..Default::default()
+                    })
+            } else if grow || tint.is_some() || std::env::var_os("POPUP_PROBE_POPOVER").is_some() {
+                let tinted = tint.is_some();
+                let popover = popover("Details", open.clone(), anchor).reactive_style({
+                    let (size, shade) = (size.clone(), shade.clone());
+                    move || {
+                        let (w, h) = size.get();
+                        let styles = Styles::new().w(w).h(h);
+                        if tinted {
+                            let step = shade.get() % 64;
+                            styles.bg(rgb(0x4a3768 + (step << 16) + (step << 8)))
+                        } else {
+                            styles
+                        }
+                    }
+                });
+                // Its colour stays put but for the tint: its arrow takes
+                // the panel's styles as it mounts, not a reactive style's.
+                let popover = if tinted {
+                    popover
+                } else {
+                    popover.bg(rgb(0x4a3768))
+                };
+                popover.arrow(8.)
+            } else {
+                let menu = menu("File", open.clone(), anchor)
+                    .id("menu")
+                    .w(200.)
+                    .p(5.)
+                    .children(items);
+                // `POPUP_PROBE_SHADOW`: rounded and with a wide shadow, for
+                // `popup_windows_smoke.py` to see it with no compositor and
+                // under one.
+                if std::env::var_os("POPUP_PROBE_SHADOW").is_some() {
+                    menu.rounded(10.).shadow(zgx::scene::BoxShadow {
+                        color: rgba(0x00000066),
+                        offset: zgx::scene::Transform { x: 0., y: 8. },
+                        blur_radius: 40.,
+                        spread: 0.,
+                    })
+                } else {
+                    menu
+                }
+            };
+            // `POPUP_PROBE_INSET`: its content inset this much, so the popup
+            // opens between pixels (`wayland_popups_smoke.py`).
+            let inset = std::env::var("POPUP_PROBE_INSET")
+                .ok()
+                .and_then(|inset| inset.parse().ok())
+                .unwrap_or(16.);
+            let content = column()
+                .w_full()
+                .h_full()
+                .p(inset)
+                .justify_end()
+                .child(popup);
+            let view = cx.render(if glass.is_some() {
+                let stripes = (0..105).map(|at| {
+                    div()
+                        .w(4.)
+                        .h_full()
+                        .bg(rgb(if at % 2 == 0 { 0xffffff } else { 0x000000 }))
+                });
+                overlay()
+                    .w_full()
+                    .h_full()
+                    .child(row().w_full().h_full().children(stripes))
+                    .child(content)
+            } else {
+                content
+            });
             #[cfg(target_os = "macos")]
             {
                 let window = cx.window.clone();
@@ -141,7 +206,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 // Zoomed (`POPUP_PROBE_ZOOM`): the File button's box, and
                 // the menu's as it opens, in the scene's points (`FILE`,
-                // `MENU` x,y,w,h), where the zoom draws them these times it.
+                // `MENU` x,y,w,h: its panel, not its shadows' ink, which
+                // its window geometry leaves out), where the zoom draws them
+                // these times it.
                 // Only then: the polling would keep an idle window awake.
                 if std::env::var_os("POPUP_PROBE_ZOOM").is_some() {
                     let (ui, opened) = (cx.ui.downgrade(), open.clone());
@@ -164,8 +231,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if open && !reported {
                                 sleep(200).await;
                                 let scene = ui.scene.borrow();
-                                let menu =
-                                    scene.popups().first().and_then(|r| scene.popup_bounds(*r));
+                                let menu = view
+                                    .find("menu")
+                                    .filter(|_| !scene.popups().is_empty())
+                                    .map(|menu| scene.bounds(menu));
                                 if let Some(menu) = menu {
                                     line("MENU", menu);
                                     reported = true;
@@ -226,15 +295,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // compositor no script can click in (Weston).
                 if std::env::var_os("POPUP_PROBE_OPEN").is_some() {
                     let open = open.clone();
+                    let capabilities = cx.window_info.capabilities.clone();
                     cx.tasks.spawn(async move {
                         zgx::timer::sleep(std::time::Duration::from_millis(500)).await;
+                        println!("BLUR behind={}", capabilities.get().blur_behind);
                         open.set(true);
                     });
+                }
+                // `POPUP_PROBE_MAXIMIZE`: the window maximizes itself, and
+                // says when the system has done it.
+                if std::env::var_os("POPUP_PROBE_MAXIMIZE").is_some() {
+                    let window = cx.window.clone();
+                    cx.tasks.spawn(async move {
+                        zgx::timer::sleep(std::time::Duration::from_millis(500)).await;
+                        window.set_maximized(true);
+                    });
+                    let maximized = cx.maximized.clone();
+                    let told = cx.ui.runtime.effect(move || {
+                        println!("MAXIMIZED {}", maximized.get());
+                    });
+                    cx.on_closed(move || drop(told));
                 }
                 let report = cx.ui.runtime.effect(move || {
                     println!("OPEN {} CHOSEN {:?}", open.get(), chosen.get());
                 });
                 cx.on_closed(move || drop(report));
+                // `POPUP_PROBE_SHADOW`: what the system says of transparency,
+                // once its settings are read.
+                if std::env::var_os("POPUP_PROBE_SHADOW").is_some() {
+                    let ui = cx.ui.downgrade();
+                    cx.tasks.spawn(async move {
+                        zgx::timer::sleep(std::time::Duration::from_millis(100)).await;
+                        if let Some(ui) = ui.upgrade() {
+                            let preferences = ui.theme().system_preferences();
+                            println!("TRANSPARENCY reduced={}", preferences.reduced_transparency);
+                        }
+                    });
+                }
                 println!("READY");
             }
         })

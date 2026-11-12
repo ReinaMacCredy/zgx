@@ -26,6 +26,15 @@
 //!   Luau and restyles every reader on every display frame.
 //! - `update-copy`: `state:update(fn)` doing what `push`, `insert`, `remove`
 //!   or `set_key` do without copying the whole value through Luau.
+//! - `computed-markdown-state`: `ui.markdown(state, …)` inside a
+//!   `ui.computed`: given a state it answers a state of its blocks, kept
+//!   current in Rust, so the computed only makes one again each time it runs.
+//! - `computed-markdown-blocks`: a computed reading all of a `ui.markdown`
+//!   state's blocks: each chunk of a streamed reply converts and passes over
+//!   every block, where a row builder does its block alone.
+//! - `computed-markdown-rewrite`: `ui.markdown` given a computed's text, or a
+//!   rewrite of a state's text in a computed: each chunk rewrites the whole
+//!   reply and the parser can't follow its appends.
 //! - `list-key`: a positional `ui.list` over a list the file removes from or
 //!   inserts into: every row after the change is written again.
 //! - `list-measured`: a `ui.list` of fixed heights whose rows wrap text: a
@@ -128,7 +137,7 @@ pub const RULES: &[(&str, &str)] = &[
     ),
     (
         "update-copy",
-        "state:update(fn) copying the whole value for one change",
+        "state:update(fn), or table.clone(state:peek()) and state:set, copying the whole value for one change",
     ),
     (
         "append-concat",
@@ -137,6 +146,18 @@ pub const RULES: &[(&str, &str)] = &[
     (
         "computed-sort",
         "a computed that sorts a whole list again each time it runs",
+    ),
+    (
+        "computed-markdown-state",
+        "ui.markdown given a state inside a computed: a state of blocks made again each run",
+    ),
+    (
+        "computed-markdown-blocks",
+        "a computed reading all of a ui.markdown state's blocks each chunk",
+    ),
+    (
+        "computed-markdown-rewrite",
+        "ui.markdown given text a computed rewrites whole each chunk",
     ),
     (
         "list-key",
@@ -173,6 +194,10 @@ pub const RULES: &[(&str, &str)] = &[
     (
         "window-size-layout",
         "an element's size computed from ui.window.size rather than laid out",
+    ),
+    (
+        "size-inert",
+        "`size` on an element that isn't a box: it does nothing",
     ),
     (
         "unknown-token",
@@ -253,7 +278,10 @@ const NOT_ELEMENTS: &[&str] = &[
     "image_size",
     "raw",
     "tween",
+    // Blocks to draw, not an element: what it reads in a computed is followed.
+    "markdown",
     "spring",
+    "spring_to",
     "loop",
     "web",
     "term",
@@ -602,6 +630,7 @@ fn lint_tokens(file: &Path, tokens: &[Token], comments: &[(u32, String)]) -> Vec
     };
     linter.run();
     linter.list_key();
+    linter.markdown_computed_text();
     linter.component_id();
     linter.list_measured();
     linter.reserved_system_key();
@@ -770,6 +799,26 @@ struct Frame {
     /// For a function: its parameters.
     params: Vec<String>,
 }
+
+/// Elements `size` does nothing on (`Kind::takes_size`): a box's width and
+/// height at once, on a split the state its divider follows.
+const SIZE_INERT: &[&str] = &[
+    "ui.text",
+    "ui.rich",
+    "ui.markdown_view",
+    "ui.button",
+    "ui.input",
+    "ui.textarea",
+    "ui.checkbox",
+    "ui.image",
+    "ui.canvas",
+    "ui.progress",
+    "ui.slider",
+    "ui.terminal",
+    "ui.webview",
+    "ui.glass",
+    "ui.menu_item",
+];
 
 /// Element fields layout sizes and places by itself.
 const LAID_OUT: &[&str] = &[
@@ -1451,7 +1500,98 @@ impl Linter<'_> {
     }
 
     /// Rules about a call or field at `at`, given the frames around it.
+    /// `local copy = table.clone(state:peek())` at `at` (its `table`), one
+    /// change to the copy, then `state:set(copy)`: what `update-copy` says of
+    /// `state:update`, written out. What does the change alone, if it's that.
+    fn cloned_for_one_change(&self, at: usize) -> Option<&'static str> {
+        if !(self.is(at, "table") && self.is(at + 1, ".") && self.is(at + 2, "clone")) {
+            return None;
+        }
+        if !(self.is(at + 3, "(")
+            && self.is(at.checked_sub(1)?, "=")
+            && self.is(at.checked_sub(3)?, "local"))
+        {
+            return None;
+        }
+        let copy = self.name(at - 2)?;
+        // The state: `state` or `a.b`, up to `:peek()` or `:get()`.
+        let path = at + 4;
+        let mut colon = path;
+        while self.name(colon).is_some() && self.is(colon + 1, ".") {
+            colon += 2;
+        }
+        self.name(colon)?;
+        colon += 1;
+        if !(self.is(colon, ":")
+            && (self.is(colon + 1, "peek") || self.is(colon + 1, "get"))
+            && self.is(colon + 2, "(")
+            && self.is(colon + 3, ")")
+            && self.is(colon + 4, ")"))
+        {
+            return None;
+        }
+        let state = &self.tokens[path..colon];
+        let mut next = colon + 5;
+        // The one change, and what does it alone.
+        let method = if self.is(next, copy) && self.is(next + 1, "[") {
+            next = self.closing(next + 1) + 1;
+            "`:set_key({ key }, value)`"
+        } else if self.is(next, copy) && self.is(next + 1, ".") && self.name(next + 2).is_some() {
+            next += 3;
+            "`:set_key({ \"field\" }, value)` or `:patch({ … })`"
+        } else if self.is(next, "table")
+            && self.is(next + 1, ".")
+            && self.is(next + 2, "insert")
+            && self.is(next + 3, "(")
+            && self.is(next + 4, copy)
+        {
+            let close = self.closing(next + 3);
+            // (A move, the value taken from the copy, isn't one insert.)
+            return ((next + 5..close).all(|j| !self.is(j, copy))
+                && self.sets_after(close + 1, state, copy))
+            .then_some("`:push(value)` or `:insert(at, value)`");
+        } else {
+            return None;
+        };
+        // (Taking a key away isn't setting one: no method does it alone.)
+        if !self.is(next, "=") || self.is(next + 1, "nil") {
+            return None;
+        }
+        // Past the value, which never reads the copy, to the write.
+        let end = (next + 1..next + 64).find(|j| self.sets_after(*j, state, copy))?;
+        (next + 1..end)
+            .all(|j| {
+                !self.is(j, copy)
+                    && !["local", "if", "for", "while", "function", "return", "end"]
+                        .iter()
+                        .any(|keyword| self.is(j, keyword))
+            })
+            .then_some(method)
+    }
+    /// Whether `state:set(copy)` starts at `at`.
+    fn sets_after(&self, at: usize, state: &[Token], copy: &str) -> bool {
+        let n = state.len();
+        state
+            .iter()
+            .enumerate()
+            .all(|(i, token)| self.is(at + i, &token.text))
+            && self.is(at + n, ":")
+            && self.is(at + n + 1, "set")
+            && self.is(at + n + 2, "(")
+            && self.is(at + n + 3, copy)
+            && self.is(at + n + 4, ")")
+    }
     fn token_rules(&mut self, at: usize, stack: &[Frame]) {
+        if let Some(method) = self.cloned_for_one_change(at) {
+            self.report(
+                at,
+                "update-copy",
+                format!(
+                    "this copies the whole value into Luau and back for one change; \
+                     {method} copies only what it changes."
+                ),
+            );
+        }
         let function = stack.iter().rposition(|f| f.open == Open::Function);
         let inside = |from: Option<usize>| &stack[from.map_or(0, |f| f + 1)..];
         // `state:get()` built into an element, with no function between.
@@ -1542,6 +1682,27 @@ impl Linter<'_> {
                 at,
                 "window-option",
                 format!("`ui.window` has no option `{key}`: it takes `{known}`."),
+            );
+        }
+        // `ui.text { size = 14 }`: a box's size, on what has none to set.
+        if let Some(frame) = stack.last()
+            && frame.open == Open::Brace
+            && let Some(callee) = frame.callee.as_deref()
+            && SIZE_INERT.contains(&callee)
+            && self.is(at, "size")
+            && self.is(at + 1, "=")
+        {
+            let instead = match callee {
+                "ui.text" | "ui.rich" | "ui.markdown_view" => "`text_size` for its type's size",
+                _ => "`w` and `h` for its width and height",
+            };
+            self.report(
+                at,
+                "size-inert",
+                format!(
+                    "`size` does nothing on `{callee}`: it is a box's width and height at once. \
+                     Use {instead}."
+                ),
             );
         }
         // `w = function() … ui.window.size … end`: a size from the window's.
@@ -1851,8 +2012,166 @@ impl Linter<'_> {
                     .into(),
             );
         }
+        // `ui.computed(function() return ui.markdown(reply, …) end)` with
+        // `reply` a state: given a state, `ui.markdown` keeps a state of
+        // its blocks current itself, which the computed makes again each run.
+        // A computed reading all of a markdown state's blocks: each chunk
+        // converts them for the script and reads the result back whole.
+        if computes
+            && let Some(at) = body.clone().find(|&j| {
+                (self.is(j + 1, ":"))
+                    && (self.is(j + 2, "get") || self.is(j + 2, "peek"))
+                    && self.is(j + 3, "(")
+                    && self
+                        .name(j)
+                        .is_some_and(|name| self.holds_markdown_state(name))
+            })
+        {
+            self.report(
+                at,
+                "computed-markdown-blocks",
+                "this computed reads every block of a `ui.markdown` state each time a chunk \
+                 arrives, converting them all and reading its answer back whole, so a chunk \
+                 costs the reply's length: work on one block belongs in `ui.each`'s row builder, \
+                 which runs for the block that changed."
+                    .into(),
+            );
+        }
+        // A rewrite of a state's text as `ui.markdown`'s text, in a computed:
+        // `ui.markdown(reply:get(), …)` alone is followed as it grows.
+        if computes
+            && let Some(at) = body.clone().find(|&j| {
+                self.is(j, "ui")
+                    && self.is(j + 1, ".")
+                    && self.is(j + 2, "markdown")
+                    && self.is(j + 3, "(")
+                    && self.rewrites_a_read(j + 3)
+            })
+        {
+            self.report(at, "computed-markdown-rewrite", REWRITE_MESSAGE.into());
+        }
+        if computes
+            && let Some(at) = body.clone().find(|&j| {
+                self.is(j, "ui")
+                    && self.is(j + 1, ".")
+                    && self.is(j + 2, "markdown")
+                    && self.is(j + 3, "(")
+                    && (self.is(j + 5, ",") || self.is(j + 5, ")"))
+                    && self.name(j + 4).is_some_and(|name| self.holds_state(name))
+            })
+        {
+            self.report(
+                at,
+                "computed-markdown-state",
+                "given a state, `ui.markdown` answers a state of its blocks and keeps it current \
+                 as the text grows: `local blocks = ui.markdown(reply, { key = … })`, then \
+                 `ui.each(blocks, …)`, with no computed around it (which makes that state again \
+                 each time it runs)."
+                    .into(),
+            );
+        }
+    }
+    /// `ui.markdown(text, …)` outside a computed with `text` a computed's:
+    /// what it answers is whole each time, so the parser can't follow it.
+    fn markdown_computed_text(&mut self) {
+        let computeds: Vec<(usize, usize)> = (0..self.tokens.len())
+            .filter(|&j| {
+                self.is(j, "ui")
+                    && self.is(j + 1, ".")
+                    && self.is(j + 2, "computed")
+                    && self.is(j + 3, "(")
+            })
+            .map(|j| (j, self.closing(j + 3)))
+            .collect();
+        for at in 0..self.tokens.len() {
+            if self.is(at, "ui")
+                && self.is(at + 1, ".")
+                && self.is(at + 2, "markdown")
+                && self.is(at + 3, "(")
+                && (self.is(at + 5, ",") || self.is(at + 5, ")"))
+                && !computeds.iter().any(|&(from, to)| from < at && at < to)
+                && self.name(at + 4).is_some_and(|name| {
+                    (0..self.tokens.len()).any(|j| {
+                        self.name(j) == Some(name)
+                            && self.is(j + 1, "=")
+                            && self.is(j + 2, "ui")
+                            && self.is(j + 3, ".")
+                            && self.is(j + 4, "computed")
+                    })
+                })
+            {
+                self.report(at, "computed-markdown-rewrite", REWRITE_MESSAGE.into());
+            }
+        }
+    }
+    /// Whether the call opening at `open` has a first argument that calls
+    /// something on a state's read, rather than being that read alone.
+    fn rewrites_a_read(&self, open: usize) -> bool {
+        let close = self.closing(open);
+        let mut depth = 0;
+        let mut end = close;
+        for j in open + 1..close {
+            match self.tokens[j].text.as_str() {
+                _ if self.tokens[j].kind != Kind::Punct => {}
+                "(" | "{" | "[" => depth += 1,
+                ")" | "}" | "]" => depth -= 1,
+                "," if depth == 0 => {
+                    end = j;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let reads = (open + 1..end).any(|j| {
+            self.is(j, ":")
+                && (self.is(j + 1, "get") || self.is(j + 1, "peek"))
+                && self.is(j + 2, "(")
+        });
+        // `name:get()` is five tokens.
+        reads && end - (open + 1) != 5
+    }
+    /// Whether the file makes `name` a state of blocks: `name =
+    /// ui.markdown(state, …)`.
+    fn holds_markdown_state(&self, name: &str) -> bool {
+        (0..self.tokens.len()).any(|j| {
+            self.name(j) == Some(name)
+                && self.is(j + 1, "=")
+                && self.is(j + 2, "ui")
+                && self.is(j + 3, ".")
+                && self.is(j + 4, "markdown")
+                && self.is(j + 5, "(")
+                && (self.is(j + 7, ",") || self.is(j + 7, ")"))
+                && self.name(j + 6).is_some_and(|text| self.holds_state(text))
+        })
+    }
+    /// Whether the file makes `name` a state: `name = ui.state(…)`, or a
+    /// shared, persisted, component, computed or sorted one.
+    fn holds_state(&self, name: &str) -> bool {
+        (0..self.tokens.len()).any(|j| {
+            self.name(j) == Some(name)
+                && self.is(j + 1, "=")
+                && self.is(j + 2, "ui")
+                && self.is(j + 3, ".")
+                && [
+                    "state",
+                    "use_state",
+                    "shared",
+                    "persist",
+                    "computed",
+                    "sorted",
+                ]
+                .iter()
+                .any(|call| self.is(j + 4, call))
+                && self.is(j + 5, "(")
+        })
     }
 }
+
+/// What `computed-markdown-rewrite` says, for its two shapes.
+const REWRITE_MESSAGE: &str = "this text is rewritten whole each time a chunk arrives, and the \
+    parser, given new text with no edits to follow, can't parse only what came, so a chunk \
+    costs the reply's length: rewrite each piece as it's appended (`reply:append(rewrite(piece))`, \
+    holding back a delimiter split across pieces) and give `ui.markdown` that state.";
 
 /// A call whose argument is a starting value, read once by design.
 fn is_initial_value(callee: &str) -> bool {
@@ -2051,6 +2370,53 @@ ui.div { w = "30%", grow = 1 }
     }
 
     #[test]
+    fn a_size_on_what_is_no_box_is_reported() {
+        let source = r##"
+ui.text { "a", size = 14 }
+ui.button { "b", size = 24 }
+ui.div { size = 50 }
+ui.column { size = { 120, 60 } }
+ui.presence(tab, build, { size = 50 })
+ui.split { size = width }
+Icon { name = "x", size = 16 }
+ui.text { "c", ui.window.size }
+ui.text { "d", text_size = 14 }
+"##;
+        assert_eq!(
+            rules(source),
+            [(2, "size-inert".to_string()), (3, "size-inert".to_string())]
+        );
+    }
+
+    /// A string is one token, whatever it holds: a script handed to a renderer
+    /// of its own means what that renderer means by `size`.
+    #[test]
+    fn a_size_inside_a_string_or_a_comment_is_not_reported() {
+        let source = r##"
+local a = "ui.text { 'x', size = 14 }"
+local b = 'ui.text { "x", size = 14 }'
+local c = [[
+    ui.text { "x", size = 14 }
+    ui.button { "y", size = 24 }
+]]
+local d = [==[ ui.text { "x", size = 14 } ]] still inside ]==]
+local e = `ui.text \{ "x", size = 14 \}`
+local f = `{name}: ui.text \{ size = 14 \} {other}`
+local g = `{ui.text { "x", size = 14 }}`
+-- ui.text { "x", size = 14 }
+--[[ ui.text { "x", size = 14 } ]]
+--[==[ ui.button { "y", size = 24 } ]==]
+ui.text { [[ size = 14 ]], text_size = 14 }
+ui.text { "size = 14", text_size = 14 }
+"##;
+        assert_eq!(rules(source), Vec::<(u32, String)>::new());
+        // After all of them, a real one is still seen, on its own line.
+        let real = format!("{source}ui.text {{ \"x\", size = 14 }}\n");
+        let line = real.lines().count() as u32;
+        assert_eq!(rules(&real), [(line, "size-inert".to_string())]);
+    }
+
+    #[test]
     fn a_zoom_beside_a_zoomable_is_reported() {
         let source = r##"
 local z = ui.state("z", 1)
@@ -2182,6 +2548,107 @@ local sorted = ui.sort({ 3, 1, 2 }, function(n) return n end) -- fine: once
 local live = ui.sorted(rows, { by = "price" })
 "##;
         assert_eq!(rules(source), one(4, "computed-sort"));
+    }
+
+    #[test]
+    fn a_computed_around_markdown_given_a_state_is_reported() {
+        let source = r##"
+local reply = ui.state("reply", "")
+local blocks = ui.computed(function()
+    return ui.markdown(reply, { key = "reply" })
+end)
+local text = ui.computed(function()
+    return ui.markdown(reply:get(), { key = "text" }) -- fine: a string, followed
+end)
+local direct = ui.markdown(reply, { key = "direct" }) -- fine: no computed
+local function draw(source: string)
+    return ui.computed(function() return ui.markdown(source) end) -- fine: not a state
+end
+"##;
+        assert_eq!(rules(source), one(4, "computed-markdown-state"));
+    }
+
+    #[test]
+    fn a_computed_over_a_markdown_states_blocks_is_reported() {
+        let source = r##"
+local reply = ui.state("reply", "")
+local blocks = ui.markdown(reply, { key = "reply" })
+local marked = ui.computed(function()
+    local out = {}
+    for i, b in blocks:get() do out[i] = b end
+    return out
+end)
+local peeked = ui.computed(function() return blocks:peek() end)
+local counted = ui.computed(function() return blocks:len() end) -- fine: no block read
+local first = ui.computed(function() return blocks:at(1) end) -- fine: one block
+local other = ui.state("other", {})
+local copied = ui.computed(function() return other:get() end) -- fine: not blocks
+"##;
+        assert_eq!(
+            rules(source),
+            vec![
+                (6, "computed-markdown-blocks".into()),
+                (9, "computed-markdown-blocks".into())
+            ]
+        );
+    }
+
+    /// The form that stays flat: each block's work in its row builder.
+    #[test]
+    fn a_row_builder_over_a_markdown_state_is_clean() {
+        let source = r##"
+local reply = ui.state("reply", "")
+local blocks = ui.markdown(reply, { key = "reply" })
+local function mark(b) return b end
+return ui.column {
+    ui.each(blocks, function(b) return ui.text { mark(b).t } end),
+}
+"##;
+        assert_eq!(rules(source), vec![]);
+    }
+
+    #[test]
+    fn markdown_given_a_rewritten_text_is_reported() {
+        let source = r##"
+local reply = ui.state("reply", "")
+local function rewrite(s) return s end
+local text = ui.computed(function() return rewrite(reply:get()) end)
+local fed = ui.markdown(text, { key = "fed" })
+local within = ui.computed(function()
+    return ui.markdown(rewrite(reply:get()), { key = "within" })
+end)
+local method = ui.computed(function()
+    return ui.markdown(reply:get():lower(), { key = "method" })
+end)
+local read = ui.computed(function()
+    return ui.markdown(reply:get(), { key = "read" }) -- fine: a string, followed
+end)
+"##;
+        assert_eq!(
+            rules(source),
+            vec![
+                (5, "computed-markdown-rewrite".into()),
+                (7, "computed-markdown-rewrite".into()),
+                (10, "computed-markdown-rewrite".into())
+            ]
+        );
+    }
+
+    /// The form that stays flat: each piece rewritten as it's appended, and
+    /// a rewrite of something other than a state's read.
+    #[test]
+    fn a_rewrite_of_each_piece_is_clean() {
+        let source = r##"
+local reply = ui.state("reply", "")
+local function rewrite(s) return s end
+local blocks = ui.markdown(reply, { key = "reply" })
+ui.command { id = "chunk", run = function()
+    reply:append(rewrite("a piece"))
+end }
+local once = ui.markdown(rewrite("# a title"))
+return ui.column { ui.each(blocks, function(b) return ui.text { b.t } end) }
+"##;
+        assert_eq!(rules(source), vec![]);
     }
 
     #[test]
@@ -2345,6 +2812,64 @@ items:update(function(list) return sort(list) end)
                 (4, "update-copy".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_clone_for_one_change_is_an_update_written_out() {
+        let source = r##"
+local a = table.clone(map:peek())
+a[key] = value
+map:set(a)
+local b = table.clone(config:get())
+b.theme = "dark"
+config:set(b)
+local c = table.clone(items:peek())
+table.insert(c, row)
+items:set(c)
+local d = table.clone(state.volumes:peek())
+d[id] = level + 1
+state.volumes:set(d)
+"##;
+        assert_eq!(
+            rules(source),
+            [
+                (2, "update-copy".to_string()),
+                (5, "update-copy".to_string()),
+                (8, "update-copy".to_string()),
+                (11, "update-copy".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_clone_for_more_than_one_change_is_a_clone() {
+        // Two changes, a loop, a key taken away, a value read from the copy,
+        // a copy written elsewhere, or kept: none does it alone.
+        let source = r##"
+local a = table.clone(map:peek())
+a.x = 1
+a.y = 2
+map:set(a)
+local b = table.clone(map:peek())
+for k in other do b[k] = true end
+map:set(b)
+local c = table.clone(map:peek())
+c[key] = nil
+map:set(c)
+local d = table.clone(map:peek())
+d.x = d.y
+map:set(d)
+local e = table.clone(map:peek())
+e[key] = value
+other:set(e)
+local f = table.clone(map:peek())
+f[key] = value
+return f
+local g = table.clone(list:peek())
+table.insert(g, to, table.remove(g, from))
+list:set(g)
+"##;
+        assert_eq!(rules(source), Vec::<(u32, String)>::new());
     }
 
     #[test]

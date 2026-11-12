@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/zgx", "crates/zgx-3d", "crates/zgx-components", "crates/zgx-desktop", "crates/zgx-ghostty-sys", "crates/zgx-gpu", "crates/zgx-script", "crates/zgx-run", "crates/zgx-terminal", "comparisons/workload", "comparisons/demo"]
+members = ["crates/zgx", "crates/zgx-3d", "crates/zgx-components", "crates/zgx-desktop", "crates/zgx-fx", "crates/zgx-video", "crates/zgx-ghostty-sys", "crates/zgx-gpu", "crates/zgx-script", "crates/zgx-run", "crates/zgx-terminal", "comparisons/workload", "comparisons/demo"]
 exclude = [
     "comparisons/gpui",
     "comparisons/quickgui",
@@ -11,8 +11,10 @@ exclude = [
     "vendor/alacritty-terminal",
     "vendor/cosmic-text",
     "vendor/harfrust",
+    "vendor/swash",
     "vendor/mlua",
     "vendor/taffy",
+    "vendor/vte",
     "vendor/winit",
     "vendor/zune-jpeg",
 ]

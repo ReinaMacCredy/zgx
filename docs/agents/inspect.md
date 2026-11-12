@@ -81,6 +81,8 @@ frame 3230 (6.95 ms, then 6.12 ms waiting for the display): page_scroll, 1 unnam
 
 The notes say which fast path a frame missed and what stopped it: a scroll that repainted its view rather than moving its pixels (a node drawing over the scroll view, what lies under it showing through, a move between device pixels), a frame that missed its refresh or was held to the last frame's cadence, scroll input applied all at once while the window wasn't presenting. `gpu` is the GPU's time alone; `present` also counts waiting for the window server and the display, so a `present` well above `gpu` is the system's time, not the frame's.
 
+An entry `spare 412` rather than `frame 412` is what the window did with time its frames left over (a list's [rows built ahead](../reference/scrolling.md#building-ahead)): nothing waited for it, and a replay's and `summary`'s numbers leave it out.
+
 A binding is a node's (`@67`, its kind or the script line that made it); an effect a script's `ui.effect` (its line) or the engine's. The phases are `ZGX_PROFILE`'s (input, script, update, style, layout, text, damage, paint, encode, submit, present, wait), measured only while devtools serve, so no restart: a frame with no writes (a scroll, an animation's layout) shows with its phases alone. `wait` is pacing, not work: on macOS a frame is held to render and hand over at its point in a refresh, up to a refresh long (8.3 ms at 120 Hz, 16.7 at 60), so the frame's time leaves it out and says it apart (`then 6.10 ms waiting for the display`). `present` includes waiting for the GPU to finish the frame. Use it to find what a write costs, what reads too much, and which phase a slow frame spent.
 
 A tree line is `@n #id role "name or text" ="value" x,y wxh` and flags (`focused`, `disabled`, `checked`), indented two spaces a level, in document order. Boxes with nothing to say (no id, role or text) are left out and their children shown in their place; a button's own label text is folded into the button. `--all` shows every node. Same tree, same text: compare runs with `diff`.
@@ -104,8 +106,8 @@ What the running app holds, measured when asked, with nothing to build or switch
 | --- | --- |
 | `process` | `footprint` (macOS, what Activity Monitor shows), `resident` (Linux) or `private` (Windows) |
 | `heap` | mimalloc's memory committed, at its peak and in use (the gap is what it keeps for later); or the system allocator's in use and free |
-| `gpu` | the glyph atlas, image textures, layers (allocated, and `layers live`: what their content takes of that), canvases, SVGs, vertex buffers, and the device's allocations where wgpu counts them |
-| `gpu layer` | each isolated layer, largest first: `@n #id`, its content's pixels, its scale, its live MiB, and whether it is transformed or parked; its bytes are what its texture allocates |
+| `gpu` | the glyph atlas, image textures, `images softer for the budget` (how many are held softer than they're drawn), layers (allocated, and `layers live`: what their content takes of that), canvases, SVGs, vertex buffers, and the device's allocations where wgpu counts them |
+| `gpu layer` | each isolated layer, largest first: `@n #id`, its content's pixels, its scale, its live MiB, and whether it is transformed, parked or coarser for its budget; its bytes are what its texture allocates |
 | `text` | shaped nodes, prepared lines, measures, shaped runs, rasterized glyphs and outlines |
 | `scene` | nodes mounted, nodes removed and not yet freed, slots |
 | `devtools` | the frame log and the effect names it keeps (`--inspect` only) |
@@ -225,7 +227,7 @@ The summary adds them up over the interaction (`layout`: `measured`, `micros`, a
 
 The JSON gives the work's `p50`, `p90`, `p95`, `p99`, `max` and `mean` (`work_ms`), the input events (`events`) and each one's share of the frame it came in (`per_event_ms`: a drag's moves, one a frame, cost what their frames did), and each phase's spread and total, the costliest at p95 first (`phases`). Each frame of `frames` says the input it took (`2 input events`; `events` in its JSON). A command's own fields can be given as `key=value` words (`frames n=300`, `mark name=drag`), and a field that takes a number refuses anything else rather than falling back to its default.
 
-A tape can move the pointer as well as the wheel, for an interaction a script plays the same way each time: `pointer`, where from the target's centre in points (across, down), and `down`, `moved` or `up` (the primary button). Each event comes at its time, so a move a frame apart lands in a frame of its own, through the window's own input path:
+A tape can move the pointer as well as the wheel, for an interaction a script plays the same way each time: `pointer`, where from the target's centre in points (across, down), and `down`, `moved` or `up` (the primary button). Each event comes at its time, so a move a frame apart lands in a frame of its own, through the window's own input path; moves due at once, in a window running behind them, come as one, the last, as a platform's do:
 
 ```text
 0 pointer 0 0 down
@@ -317,6 +319,10 @@ What the runs tell you:
 | few or cheap runs, yet `layout`, `text` or `paint` is most of the frame | the cost is the interface's size or drawing, not the script | a box laid out from its content (no `w`/`h`), a long text re-measured, a blur or shadow redrawn; `zgx inspect tree --depth 2` shows which boxes are large or deep enough to cost |
 | a slow frame with no writes and no runs | a scroll or an animation laying out or drawing a lot | the same as above: the phases say which |
 | `why: scroll @n repainted its view: @m … draws over it` | a node (a sticky header, a floating nav) painting over the scroll view, so its pixels can't simply move | keep what draws over a scroll view outside its box: make the scroll view start beside it |
+| `why: … reads what is under it or the window, or runs passes each frame` | in the scroll view's content, a backdrop blur, a blend, or a shader reading the backdrop or the window or running passes each frame: what it draws doesn't simply move with it (a fade or a plain layer does, and copies) | keep such a node out of what scrolls, or accept the repaint |
+| `why: … is a dithered picture` | its dots lie on the screen's grid while the picture slides under them | as above |
+| `why: … is a blurred, masked or shaded layer under a fade` | a fade's bands draw differently with such a layer in their run, so a copy's bands would not match | move the layer out from under the fade, or accept the repaint |
+| `why: it lies under two fades around it` | the scroll view and an ancestor both fade their edges | fade one of them |
 | `why: … shows under it` | the scroll view has no opaque fill of its own, so what lies beneath shows through | give the scroll view an opaque `bg`, exactly its box |
 | `present` far above `gpu`, frames 16.7 ms apart at 120 Hz with `waited a refresh more to keep the last frame's cadence` | the GPU or the window server took long once, and the frames after kept the slower cadence | make each frame cheaper (the notes above), then measure with `--repeat` |
 
@@ -329,6 +335,6 @@ What the runs tell you:
 
 ## Safety and cost
 
-Devtools are built only with zgx-run's `inspect` feature (on by default for development) or zgx-script's `inspect`; an app built without it cannot be driven, whatever its environment says. Even when built in, nothing listens unless the host serves it: there is no thread, socket or bookkeeping until then. The socket belongs to the user who started the app: a Unix socket (mode 0600) in `$TMPDIR/zgx-inspect-<uid>` (0700); on Windows a loopback port that answers only requests carrying the token written beside it in `%LOCALAPPDATA%\zgx-inspect`.
+Devtools are built only with zgx-run's `inspect` feature (on by default for development) or zgx-script's `inspect`; an app built without it cannot be driven, whatever its environment says. Even when built in, nothing listens unless the host serves it: there is no thread, socket or bookkeeping until then. The socket belongs to the user who started the app: a Unix socket (mode 0600) in `$TMPDIR/zgx-inspect-<uid>` (0700); on Windows a loopback port that answers only requests carrying the token written beside it in `%LOCALAPPDATA%\zgx-inspect`. A socket's path binds only up to 103 bytes on Apple's systems and 107 on Linux: where the temporary directory is too long for that (an iOS simulator app's container is about 150 bytes), the app serves from `/tmp/zgx-inspect-<uid>`, which `zgx inspect` reads too. `ZGX_INSPECT_DIR` names another directory, for the app and for `zgx inspect` alike (give both the same); a path still too long is refused with an error saying so, which `zgx-run` prints, rather than a socket that never listens.
 
 A Rust host serves devtools with `zgx_script::inspect::serve(Session::new(&cx.ui, handle, &host, Some(cx.inspector.clone())), "my app", |task| cx.tasks.spawn(task))`, where `handle` is what `cx.render(host.view())` returned.

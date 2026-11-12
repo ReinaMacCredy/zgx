@@ -6,6 +6,7 @@
 //! first shared subtree. Scripts see values as read-only tables and change
 //! state through its methods: `set`, `set_key`, `patch`, `update`, `insert`.
 use mlua::{FromLua, IntoLua, Lua, Table, UserData, UserDataMethods};
+use rustc_hash::FxHashMap;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -15,7 +16,7 @@ use zgx::reactive::{Runtime, Signal};
 
 /// A script value. State holds these, so equal writes are suppressed like any
 /// other signal.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 #[non_exhaustive]
 pub enum Value {
     /// `nil`.
@@ -49,12 +50,131 @@ pub enum Value {
     Folded(Rc<Folded>),
 }
 
+/// A list made from another by changing its end alone (a streamed reply's
+/// blocks, `ui.markdown` given a state), held folded (`Appended::into_value`)
+/// rather than as a variant of its own, which would cost every value's drop:
+/// its items in chunks of [`Appended::CHUNK`], those wholly before the
+/// change the very chunks of the list it was made from, so making it costs
+/// what changed, not its length.
+pub struct Appended {
+    chunks: Vec<Rc<[Value]>>,
+    len: usize,
+    /// The list it was made from, and how many first items they share.
+    from: Option<(std::rc::Weak<Appended>, usize)>,
+    /// Its items in one slice, made the first time something reads it as
+    /// a list.
+    flat: std::cell::OnceCell<Rc<[Value]>>,
+}
+impl std::fmt::Debug for Appended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+impl Appended {
+    /// Items a chunk holds (the last may hold fewer).
+    pub const CHUNK: usize = 32;
+    /// `items` as a list grown from `from`, whose first `shared` items are
+    /// `items`' first: the chunks wholly within them are `from`'s own.
+    pub fn grown<'a>(
+        from: Option<&Rc<Appended>>,
+        shared: usize,
+        len: usize,
+        items: impl FnOnce(usize) -> Box<dyn Iterator<Item = &'a Value> + 'a>,
+    ) -> Rc<Appended> {
+        let kept = from.map_or(0, |from| {
+            (shared.min(from.len).min(len) / Self::CHUNK).min(from.chunks.len())
+        });
+        let mut chunks: Vec<Rc<[Value]>> = Vec::with_capacity(len.div_ceil(Self::CHUNK));
+        if let Some(from) = from {
+            chunks.extend(from.chunks[..kept].iter().cloned());
+        }
+        let mut rest = items(kept * Self::CHUNK);
+        for start in (kept * Self::CHUNK..len).step_by(Self::CHUNK) {
+            let size = Self::CHUNK.min(len - start);
+            let chunk: Rc<[Value]> = rest.by_ref().take(size).cloned().collect();
+            assert_eq!(chunk.len(), size, "as many items as said");
+            chunks.push(chunk);
+        }
+        Rc::new(Appended {
+            chunks,
+            len,
+            from: from.map(|from| (Rc::downgrade(from), shared.min(from.len).min(len))),
+            flat: std::cell::OnceCell::new(),
+        })
+    }
+    /// How many items it holds.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Its items, in order.
+    pub fn iter(&self) -> impl Iterator<Item = &Value> {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+    /// Its items from the `from`th (from 0) on: a chunk's look to reach.
+    pub fn iter_from(&self, from: usize) -> impl Iterator<Item = &Value> {
+        let skip = from % Self::CHUNK;
+        self.chunks[(from / Self::CHUNK).min(self.chunks.len())..]
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .skip(skip)
+    }
+    /// Its `index`th item (from 0): a chunk's look.
+    pub fn get(&self, index: usize) -> Option<&Value> {
+        self.chunks
+            .get(index / Self::CHUNK)?
+            .get(index % Self::CHUNK)
+    }
+    /// Its items as one slice, made once.
+    pub fn flat(&self) -> &Rc<[Value]> {
+        self.flat.get_or_init(|| self.iter().cloned().collect())
+    }
+    /// How many first items it shares with `then`, if it was made from it.
+    pub fn grown_from(&self, then: &Rc<Appended>) -> Option<usize> {
+        let (from, shared) = self.from.as_ref()?;
+        std::ptr::addr_eq(from.as_ptr(), Rc::as_ptr(then)).then_some(*shared)
+    }
+    /// As a value: folded, opening to the list it holds for scripts and for
+    /// Rust reading it as a list.
+    pub fn into_value(list: Rc<Appended>) -> Value {
+        Value::Folded(Rc::new(Folded {
+            id: Value::Nil,
+            source: Box::new(list),
+            open: RefCell::default(),
+            kept: std::cell::OnceCell::new(),
+        }))
+    }
+}
+impl Unfold for Rc<Appended> {
+    fn unfold(&self) -> Value {
+        Value::List(self.flat().clone())
+    }
+    fn appended(&self) -> Option<&Rc<Appended>> {
+        Some(self)
+    }
+}
+/// The grown list `value` holds, if it holds one (`Appended::into_value`).
+pub(crate) fn grown_list(value: &Value) -> Option<&Rc<Appended>> {
+    match value {
+        Value::Folded(folded) => folded.source.appended(),
+        _ => None,
+    }
+}
+
 /// What a folded value opens to, made as it's read. The host keeps what makes
 /// it however it likes: a long list's row out of view need hold no more than
 /// that.
 pub trait Unfold {
     /// The whole value: the same each time.
     fn unfold(&self) -> Value;
+    /// The grown list it is, if it is one (zgx's own: `Appended`).
+    #[doc(hidden)]
+    fn appended(&self) -> Option<&Rc<Appended>> {
+        None
+    }
 }
 
 /// A table's fields, as `Value::Map` holds them.
@@ -80,6 +200,16 @@ impl std::fmt::Debug for Folded {
     }
 }
 impl Folded {
+    /// Its field `key`: `id` without opening it, any other opened for good
+    /// (scripts read these, and hosts their own rows).
+    #[cold]
+    #[inline(never)]
+    fn field(&self, key: &str) -> Option<&Value> {
+        if key == "id" {
+            return Some(&self.id);
+        }
+        self.kept.get_or_init(|| self.opened()).field(key)
+    }
     /// The value it opens to, opened again only if nothing holds the last.
     fn opened(&self) -> Value {
         if let Some(kept) = self.kept.get() {
@@ -98,6 +228,16 @@ impl Folded {
 
 /// A value's room in a list or map, for `Value::weight`.
 const SLOT: usize = std::mem::size_of::<Value>();
+/// What values hold on the heap, as a memory report counts it (`Value::holding`).
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct Holding {
+    /// All of it.
+    pub bytes: usize,
+    /// Of that, its strings' text.
+    pub text: usize,
+    /// Rows kept folded (`Value::Folded`): their data is the host's.
+    pub folded: usize,
+}
 
 /// A mounted (or once mounted) element held in state, or a picked folder.
 #[derive(Clone)]
@@ -182,6 +322,25 @@ fn find_key(fields: &[(Rc<str>, Value)], key: &str) -> Result<usize, usize> {
 }
 
 /// Shared subtrees compare equal without being walked.
+// By hand, as derived but always inlined: a variant of its own (`Folded`)
+// otherwise makes every clone of a common value a call.
+impl Clone for Value {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        match self {
+            Value::Nil => Value::Nil,
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Num(n) => Value::Num(*n),
+            Value::Str(s) => Value::Str(s.clone()),
+            Value::Text(t) => Value::Text(t.clone()),
+            Value::List(items) => Value::List(items.clone()),
+            Value::Map(fields) => Value::Map(fields.clone()),
+            Value::Element(e) => Value::Element(e.clone()),
+            Value::Image(image) => Value::Image(image.clone()),
+            Value::Folded(folded) => Value::Folded(folded.clone()),
+        }
+    }
+}
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -278,11 +437,57 @@ impl Value {
             Value::Nil | Value::Bool(_) | Value::Num(_) => 0,
         }
     }
+    /// What it holds on the heap, for a memory report: each part shared with
+    /// another counted once (`seen`, by address), its text apart, and its
+    /// folded rows, whose data the host holds, counted but not opened.
+    pub(crate) fn holding(&self, seen: &mut rustc_hash::FxHashSet<usize>, into: &mut Holding) {
+        match self {
+            Value::Str(s) => {
+                if seen.insert(s.as_ptr() as usize) {
+                    into.bytes += 16 + s.len();
+                    into.text += s.len();
+                }
+            }
+            Value::Text(t) => {
+                if seen.insert(t.id() as usize) {
+                    into.bytes += 16 + t.len();
+                    into.text += t.len();
+                }
+            }
+            Value::List(items) => {
+                if seen.insert(items.as_ptr() as usize) {
+                    into.bytes += 16 + items.len() * SLOT;
+                    for item in items.iter() {
+                        item.holding(seen, into);
+                    }
+                }
+            }
+            Value::Map(fields) => {
+                if seen.insert(fields.as_ptr() as usize) {
+                    into.bytes += 16 + fields.len() * (16 + SLOT);
+                    for (_, field) in fields.iter() {
+                        field.holding(seen, into);
+                    }
+                }
+            }
+            Value::Element(_) => into.bytes += 64,
+            Value::Image(image) => {
+                if seen.insert(std::sync::Arc::as_ptr(image) as usize) {
+                    into.bytes += 64 + image.bytes();
+                }
+            }
+            Value::Folded(folded) => {
+                if seen.insert(Rc::as_ptr(folded) as usize) {
+                    into.bytes += 64;
+                    into.folded += 1;
+                }
+            }
+            Value::Nil | Value::Bool(_) | Value::Num(_) => {}
+        }
+    }
     /// JSON as a value (`to_json`'s inverse), or `None` if it is not JSON.
     pub fn from_json(json: &str) -> Option<Value> {
-        serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .map(|_| crate::node::json_value(json))
+        crate::json::parse(json).ok()
     }
     /// This value, keeping `old`'s own parts wherever they are equal (as
     /// Solid's `reconcile`): what did not change stays the same `Rc`, so
@@ -442,6 +647,25 @@ impl Value {
             _ => None,
         }
     }
+    /// Its `index`th item (from 0) if it is a list: a grown list's without
+    /// making it one slice.
+    pub fn item(&self, index: usize) -> Option<&Value> {
+        match self {
+            Value::List(items) => items.get(index),
+            Value::Folded(_) => grown_list(self)?.get(index),
+            _ => None,
+        }
+    }
+    /// Its items if it is a list or a grown list (`Appended`, made one
+    /// slice once), else none: for a reader of a state's list as a whole.
+    /// (`list`, which a table's every read takes, leaves the grown one out.)
+    pub fn items(&self) -> &[Value] {
+        match self {
+            Value::List(items) => items,
+            Value::Folded(_) => grown_list(self).map_or(&[], |list| &list.flat()[..]),
+            _ => &[],
+        }
+    }
     /// Its items if it is a list, else none.
     pub fn list(&self) -> &[Value] {
         match self {
@@ -453,9 +677,8 @@ impl Value {
     pub fn field(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Map(fields) => find_key(fields, key).ok().map(|i| &fields[i].1),
-            Value::Folded(folded) if key == "id" => Some(&folded.id),
-            // (Opened for good: scripts read these, and hosts their own rows.)
-            Value::Folded(folded) => folded.kept.get_or_init(|| folded.opened()).field(key),
+            // (Apart, so a map's field stays inlined where it's read.)
+            Value::Folded(folded) => folded.field(key),
             _ => None,
         }
     }
@@ -465,7 +688,7 @@ impl Value {
         for step in path {
             value = match step {
                 PathKey::Key(k) => value.field(k)?,
-                PathKey::Index(i) => value.list().get(i.checked_sub(1)?)?,
+                PathKey::Index(i) => value.item(i.checked_sub(1)?)?,
             };
         }
         Some(value)
@@ -813,8 +1036,9 @@ fn raw_table(t: &Table, old: Option<&Value>) -> Option<mlua::Result<Value>> {
     use mlua::ffi;
     use std::ffi::c_int;
     struct Cx<'a> {
-        held: Option<std::cell::Ref<'a, HashMap<usize, (Value, usize)>>>,
-        strings: HashMap<usize, Rc<str>>,
+        held: Option<std::cell::Ref<'a, FxHashMap<usize, (Value, usize)>>>,
+        /// By the Luau string's address (no script chooses it, so Fx).
+        strings: FxHashMap<usize, Rc<str>>,
     }
     const TABLE: c_int = 1;
     const IDS: c_int = 2;
@@ -868,7 +1092,7 @@ fn raw_table(t: &Table, old: Option<&Value>) -> Option<mlua::Result<Value>> {
     fn string(cx: &mut Cx, at: usize, bytes: &[u8]) -> Rc<str> {
         cx.strings
             .entry(at)
-            .or_insert_with(|| String::from_utf8_lossy(bytes).into())
+            .or_insert_with(|| str_of(bytes))
             .clone()
     }
     unsafe fn read_table(
@@ -986,7 +1210,7 @@ fn raw_table(t: &Table, old: Option<&Value>) -> Option<mlua::Result<Value>> {
     let ids = cache.as_ref().map(|c| c.ids.borrow().clone());
     let mut cx = Cx {
         held: cache.as_ref().map(|c| c.held.borrow()),
-        strings: HashMap::new(),
+        strings: FxHashMap::default(),
     };
     let mut out = Err(Unread::General);
     // SAFETY: `exec_raw` runs the closure as a C function inside a protected
@@ -1102,9 +1326,6 @@ impl FromLua for Value {
 /// As script data: tables are read-only (`frozen`) when they are state's
 /// own, or a mutable copy for `state:update`.
 pub(crate) fn to_lua(value: &Value, lua: &Lua, frozen: bool) -> mlua::Result<mlua::Value> {
-    if matches!(value, Value::List(_) | Value::Map(_)) {
-        CONVERTED.set(CONVERTED.get() + 1);
-    }
     match value {
         Value::Nil => Ok(mlua::Value::Nil),
         Value::Bool(b) => Ok(mlua::Value::Boolean(*b)),
@@ -1117,12 +1338,21 @@ pub(crate) fn to_lua(value: &Value, lua: &Lua, frozen: bool) -> mlua::Result<mlu
                 .map(mlua::Value::String)
         },
         Value::List(items) => {
-            count_items(items.len());
             if items.len() >= 64 && items.iter().all(is_plain) {
+                CONVERTED.set(CONVERTED.get() + 1);
+                count_items(items.len());
                 let table = plain_table(lua, items)?;
                 table.set_readonly(frozen);
                 return Ok(mlua::Value::Table(table));
             }
+            // A row of a few values or a tree holding lists and maps: one
+            // C call (a map or long list of plain values has its own, above
+            // and below, without the walk).
+            if let Some(objects) = raw_tree(value, 0) {
+                return raw_to_lua(value, lua, frozen, objects).map(mlua::Value::Table);
+            }
+            CONVERTED.set(CONVERTED.get() + 1);
+            count_items(items.len());
             let table = lua.create_table_with_capacity(items.len(), 0)?;
             for (i, item) in items.iter().enumerate() {
                 table.raw_set(i + 1, to_lua(item, lua, frozen)?)?;
@@ -1131,12 +1361,17 @@ pub(crate) fn to_lua(value: &Value, lua: &Lua, frozen: bool) -> mlua::Result<mlu
             Ok(mlua::Value::Table(table))
         }
         Value::Map(fields) if !fields.is_empty() && fields.iter().all(|(_, v)| is_plain(v)) => {
+            CONVERTED.set(CONVERTED.get() + 1);
             count_items(fields.len());
             let table = plain_map(lua, fields)?;
             table.set_readonly(frozen);
             Ok(mlua::Value::Table(table))
         }
         Value::Map(fields) => {
+            if let Some(objects) = raw_tree(value, 0) {
+                return raw_to_lua(value, lua, frozen, objects).map(mlua::Value::Table);
+            }
+            CONVERTED.set(CONVERTED.get() + 1);
             let table = lua.create_table_with_capacity(0, fields.len())?;
             for (key, value) in fields.iter() {
                 table.raw_set(&**key, to_lua(value, lua, frozen)?)?;
@@ -1159,6 +1394,176 @@ pub(crate) fn to_lua(value: &Value, lua: &Lua, frozen: bool) -> mlua::Result<mlu
             .map(mlua::Value::UserData),
         Value::Folded(folded) => to_lua(&folded.opened(), lua, frozen),
     }
+}
+/// Whether `value`, a list or a map, is a tree of nil, booleans, numbers,
+/// strings, texts, lists and maps at most `DEPTH` deep, which `raw_to_lua`
+/// makes in one C call; and whether it holds an empty map (an object, marked
+/// so). `None` leaves it to `to_lua`'s walk (an element, a picture, a fold).
+fn raw_tree(value: &Value, depth: u32) -> Option<bool> {
+    fn walk(value: &Value, depth: u32, objects: &mut bool) -> bool {
+        match value {
+            Value::Nil | Value::Bool(_) | Value::Num(_) | Value::Str(_) | Value::Text(_) => true,
+            Value::List(items) => {
+                depth < DEPTH && items.iter().all(|v| walk(v, depth + 1, objects))
+            }
+            Value::Map(fields) => {
+                *objects |= fields.is_empty();
+                depth < DEPTH && fields.iter().all(|(_, v)| walk(v, depth + 1, objects))
+            }
+            _ => false,
+        }
+    }
+    if !matches!(value, Value::List(_) | Value::Map(_)) {
+        return None;
+    }
+    let mut objects = false;
+    walk(value, depth, &mut objects).then_some(objects)
+}
+/// `to_lua` of a tree `raw_tree` passed, made through Luau's C API in one
+/// protected call: through mlua each field of a map holding a list (a feed's
+/// message) was set in a call of its own, a closure made and called for each,
+/// most of a decoded feed's conversion. The same tables, counted the same.
+fn raw_to_lua(value: &Value, lua: &Lua, frozen: bool, objects: bool) -> mlua::Result<Table> {
+    use mlua::ffi;
+    use std::ffi::c_int;
+    const MARKER: &std::ffi::CStr = c"zgx.json_object";
+    // Made before the call, if any table is to be marked an object.
+    if objects {
+        object_marker(lua)?;
+    }
+    /// # Safety
+    ///
+    /// `state` is inside `exec_raw`'s C call. Each level asks for the stack
+    /// it uses (`luaL_checkstack`, which raises a Luau error past the limit,
+    /// as an allocation failing does: either unwinds these frames, which
+    /// hold nothing to drop, to `exec_raw`'s protected call), and leaves one
+    /// value pushed. The collector may run as values are made; each is on
+    /// the stack, in the table being filled, and so kept.
+    unsafe fn push(state: *mut ffi::lua_State, value: &Value, frozen: bool) {
+        // SAFETY: as this function's.
+        unsafe {
+            match value {
+                Value::Nil => ffi::lua_pushnil(state),
+                Value::Bool(b) => ffi::lua_pushboolean(state, c_int::from(*b)),
+                Value::Num(n) => ffi::lua_pushnumber(state, *n),
+                Value::Str(s) => {
+                    ffi::lua_pushlstring(state, s.as_ptr().cast(), s.len());
+                }
+                Value::Text(t) => push_text(state, t),
+                Value::List(items) => {
+                    CONVERTED.set(CONVERTED.get() + 1);
+                    count_items(items.len());
+                    ffi::luaL_checkstack(state, 2, c"a list nested too deep".as_ptr());
+                    let n = c_int::try_from(items.len()).unwrap_or(c_int::MAX);
+                    ffi::lua_createtable(state, n, 0);
+                    for (i, item) in items.iter().enumerate() {
+                        push(state, item, frozen);
+                        ffi::lua_rawseti_(state, -2, i as c_int + 1);
+                    }
+                    if frozen {
+                        ffi::lua_setreadonly(state, -1, 1);
+                    }
+                }
+                Value::Map(fields) => {
+                    CONVERTED.set(CONVERTED.get() + 1);
+                    count_items(fields.len());
+                    ffi::luaL_checkstack(state, 3, c"a table nested too deep".as_ptr());
+                    let n = c_int::try_from(fields.len()).unwrap_or(c_int::MAX);
+                    ffi::lua_createtable(state, 0, n);
+                    for (key, field) in fields.iter() {
+                        ffi::lua_pushlstring(state, key.as_ptr().cast(), key.len());
+                        push(state, field, frozen);
+                        ffi::lua_rawset(state, -3);
+                    }
+                    // Empty, it stays an object going back (`ui.object`).
+                    if fields.is_empty() {
+                        ffi::lua_rawgetfield(state, ffi::LUA_REGISTRYINDEX, MARKER.as_ptr());
+                        ffi::lua_setmetatable(state, -2);
+                    }
+                    if frozen {
+                        ffi::lua_setreadonly(state, -1, 1);
+                    }
+                }
+                // `raw_tree` passed only the kinds above.
+                _ => ffi::lua_pushnil(state),
+            }
+        }
+    }
+    // SAFETY: `push` leaves the tree's one value, `exec_raw`'s result: a
+    // table, as `raw_tree` passed only a list or a map.
+    unsafe { lua.exec_raw::<Table>((), |state| push(state, value, frozen)) }
+}
+/// The tables of a JSON document read onto a tape (`json::decode_to_lua`),
+/// made through Luau's C API in one protected call, as `raw_to_lua` makes a
+/// value's: counted the same, an empty map an object.
+pub(crate) fn tape_to_lua(
+    lua: &Lua,
+    toks: &[crate::json::TapeTok],
+    bytes: &[u8],
+    objects: bool,
+) -> mlua::Result<mlua::Value> {
+    use crate::json::TapeTok as Tok;
+    use mlua::ffi;
+    use std::ffi::c_int;
+    const MARKER: &std::ffi::CStr = c"zgx.json_object";
+    if objects {
+        object_marker(lua)?;
+    }
+    /// # Safety
+    ///
+    /// As `raw_to_lua`'s `push`: inside `exec_raw`'s C call, each level asks
+    /// for its stack, leaves one value pushed, and holds nothing to drop (the
+    /// tape is borrowed), so a Luau error unwinds it to the protected call.
+    /// `at` is a value's place in `toks`, a well-formed tape's (a list or map
+    /// followed by as many items as its count), and is moved past it.
+    unsafe fn push(state: *mut ffi::lua_State, toks: &[Tok], bytes: &[u8], at: &mut usize) {
+        // SAFETY: as this function's.
+        unsafe {
+            let tok = toks[*at];
+            *at += 1;
+            match tok {
+                Tok::Nil => ffi::lua_pushnil(state),
+                Tok::Bool(b) => ffi::lua_pushboolean(state, c_int::from(b)),
+                Tok::Num(n) => ffi::lua_pushnumber(state, n),
+                Tok::Str(from, len) => {
+                    let s = &bytes[from as usize..][..len as usize];
+                    ffi::lua_pushlstring(state, s.as_ptr().cast(), s.len());
+                }
+                Tok::List(n) => {
+                    CONVERTED.set(CONVERTED.get() + 1);
+                    count_items(n as usize);
+                    ffi::luaL_checkstack(state, 2, c"a list nested too deep".as_ptr());
+                    let size = c_int::try_from(n).unwrap_or(c_int::MAX);
+                    ffi::lua_createtable(state, size, 0);
+                    for i in 0..n {
+                        push(state, toks, bytes, at);
+                        ffi::lua_rawseti_(state, -2, i as c_int + 1);
+                    }
+                }
+                Tok::Map(n) => {
+                    CONVERTED.set(CONVERTED.get() + 1);
+                    count_items(n as usize);
+                    ffi::luaL_checkstack(state, 3, c"a table nested too deep".as_ptr());
+                    let size = c_int::try_from(n).unwrap_or(c_int::MAX);
+                    ffi::lua_createtable(state, 0, size);
+                    for _ in 0..n {
+                        // Its key, a string; then its value.
+                        push(state, toks, bytes, at);
+                        push(state, toks, bytes, at);
+                        ffi::lua_rawset(state, -3);
+                    }
+                    if n == 0 {
+                        ffi::lua_rawgetfield(state, ffi::LUA_REGISTRYINDEX, MARKER.as_ptr());
+                        ffi::lua_setmetatable(state, -2);
+                    }
+                }
+            }
+        }
+    }
+    let mut at = 0;
+    // SAFETY: a tape `json::decode_to_lua` read is well formed; `push` leaves
+    // its one value, `exec_raw`'s result.
+    unsafe { lua.exec_raw::<mlua::Value>((), |state| push(state, toks, bytes, &mut at)) }
 }
 /// Push `text` as a string, its chunks copied straight in.
 ///
@@ -1450,6 +1855,7 @@ impl IntoLua for Value {
 thread_local! {
     static CONVERTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ITEMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// How many tables state values have been converted into for scripts on
 /// this thread, ever: for budgets (a delta's work must not grow with what
@@ -1462,6 +1868,14 @@ pub fn tables_converted() -> u64 {
 /// `tables_converted` however many rows it holds.
 pub fn values_converted() -> u64 {
     ITEMS.get()
+}
+/// How many tables were filed in the conversion cache on this thread, ever:
+/// each converted, and each a computed handed back (`remember`). For tests:
+/// what a script is given, or gives back, must cost the same whenever the
+/// collector last ran.
+#[doc(hidden)]
+pub fn values_filed() -> u64 {
+    FILED.get()
 }
 fn count_items(n: usize) {
     ITEMS.set(ITEMS.get() + n as u64);
@@ -1492,29 +1906,18 @@ fn large(value: &Value) -> bool {
     }
     matches!(value, Value::List(_) | Value::Map(_)) && count(value, &mut CACHED_FROM.clone())
 }
-/// A table whose keys don't keep what they name.
-fn weak_keys(lua: &Lua) -> mlua::Result<Table> {
-    let t = lua.create_table()?;
-    let meta = lua.create_table()?;
-    meta.raw_set("__mode", "k")?;
-    t.set_metatable(Some(meta))?;
-    Ok(t)
-}
 /// Give a new VM its cache of converted values.
 pub(crate) fn install_cache(lua: &Lua) {
-    let weak = |mode: &str| -> mlua::Result<Table> {
-        let t = lua.create_table()?;
-        let meta = lua.create_table()?;
-        meta.raw_set("__mode", mode)?;
-        t.set_metatable(Some(meta))?;
-        Ok(t)
-    };
-    let tables = weak("v");
+    // Tables by id strong: whether a read finds its table must not depend
+    // on when the collector last ran. What no script holds goes as the host
+    // goes idle (`weaken_cache`, `sweep_idle`). Ids by table weak: a table
+    // the collector could take is one no read has in hand to look up.
+    let (tables, ids) = (lua.create_table(), weak(lua, "k"));
     let clone = lua
         .globals()
         .get::<Table>("table")
         .and_then(|t| t.get::<mlua::Function>("clone"));
-    if let (Ok(tables), Ok(ids), Ok(clone)) = (tables, weak_keys(lua), clone) {
+    if let (Ok(tables), Ok(ids), Ok(clone)) = (tables, ids, clone) {
         lua.set_app_data(Converted {
             held: Default::default(),
             tables: RefCell::new(tables),
@@ -1525,9 +1928,17 @@ pub(crate) fn install_cache(lua: &Lua) {
             swept: std::cell::Cell::new(0),
             recent: Default::default(),
             next_recent: std::cell::Cell::new(0),
-            recent_large: Default::default(),
         });
     }
+}
+/// A table whose keys (`"k"`) or values (`"v"`) don't keep what they are
+/// alive.
+fn weak(lua: &Lua, mode: &str) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    let meta = lua.create_table()?;
+    meta.raw_set("__mode", mode)?;
+    t.set_metatable(Some(meta))?;
+    Ok(t)
 }
 /// A VM's converted values, by the identity of their contents. `held` keeps
 /// each value alive while it is cached, so an address is never reused for
@@ -1537,21 +1948,25 @@ pub(crate) fn install_cache(lua: &Lua) {
 /// not as the collector happened to have run, and what a delta costs would
 /// vary from run to run.
 struct Converted {
-    /// id → the value and its `weight`.
-    held: std::cell::RefCell<HashMap<usize, (Value, usize)>>,
-    /// id → table, while `held` holds its value and a script holds the table
-    /// (weak values: a long list's rows are not a copy of it in the VM once
-    /// no script reads them). (Handles, not registry keys: looked up for
-    /// every row converted.)
+    /// id → the value and its `weight`. (Ids are addresses, which no
+    /// script chooses: hashed by a multiply, not SipHash, which guards
+    /// against keys made to collide.)
+    held: std::cell::RefCell<FxHashMap<usize, (Value, usize)>>,
+    /// id → table, while `held` holds its value. Strong: a long list's rows
+    /// no script holds any more go as the host goes idle (`weaken_cache`),
+    /// not as the collector happens to run. (Handles, not registry keys:
+    /// looked up for every row converted.)
     tables: RefCell<Table>,
-    /// table → id, weak keys: a read-only table given back (a computed
-    /// returning a row it read) is its value again, without a walk.
+    /// table → id: a read-only table given back (a computed returning a row
+    /// it read) is its value again, without a walk. Weak keys: one the
+    /// collector could take is a table no read has in hand to look up, and
+    /// the collector need not mark what only `tables` holds twice.
     ids: RefCell<Table>,
     /// Luau's `table.clone`: a table copied in C (see `derive`).
     clone: mlua::Function,
     /// id → the value a list was written from (`derives_from`), whose
     /// table its own is derived from when a script reads it.
-    bases: std::cell::RefCell<HashMap<usize, Value>>,
+    bases: std::cell::RefCell<FxHashMap<usize, Value>>,
     /// The `weight` of what is held.
     weight: std::cell::Cell<usize>,
     /// The `weight` of what was held after the last sweep.
@@ -1561,21 +1976,7 @@ struct Converted {
     recent: std::cell::RefCell<Vec<(usize, Value, Table)>>,
     /// Where the next one goes once `recent` is full.
     next_recent: std::cell::Cell<usize>,
-    /// The last few large tables a script read, as `recent`: read again and
-    /// again and held by none between, each is converted once all the same.
-    /// Long lists apart from the rest, which a list's rows would crowd out, and
-    /// each a whole conversion to read again.
-    recent_large: [Recent; 2],
 }
-/// Tables kept from their last conversions, and where the next one goes once
-/// they're full.
-#[derive(Default)]
-struct Recent {
-    tables: std::cell::RefCell<Vec<(usize, Value, Table)>>,
-    next: std::cell::Cell<usize>,
-}
-/// What counts as a long list, in `Converted::recent_large`.
-const LONG_LIST: usize = 64;
 /// Sweeps wait until the cache holds this much (`weight`) at least.
 const SWEPT_FROM: usize = 1 << 12;
 /// The values a cached value's table holds, its small parts counted all the
@@ -1603,6 +2004,21 @@ fn part_weight(value: &Value) -> usize {
     }
     if large(value) { 1 } else { all(value) }
 }
+/// How many first items `list` shares with `from`, if it was grown from it
+/// (`Appended`): each the same value, none compared.
+pub(crate) fn shared_start(list: &Value, from: &Value) -> Option<usize> {
+    grown_list(list)?.grown_from(grown_list(from)?)
+}
+/// Whether `a` (a state's value) and `b` are equal: a list grown from the
+/// other compares its items after those they share alone.
+pub(crate) fn same(a: &Value, b: &Value) -> bool {
+    if let (Some(then), Some(now)) = (grown_list(a), grown_list(b))
+        && let Some(shared) = now.grown_from(then)
+    {
+        return now.len() == then.len() && now.iter_from(shared).eq(then.iter_from(shared));
+    }
+    a == b
+}
 pub(crate) fn identity(value: &Value) -> usize {
     match value {
         Value::List(items) => Rc::as_ptr(items) as *const u8 as usize,
@@ -1622,38 +2038,10 @@ pub(crate) fn shared_lua(value: &Value, lua: &Lua) -> mlua::Result<mlua::Value> 
     if !large(value) {
         return recent_lua(value, lua);
     }
-    let converted = shared_part(value, lua)?;
-    if let mlua::Value::Table(table) = &converted {
-        keep_large(lua, value, table);
-    }
-    Ok(converted)
-}
-/// `table`, `value`'s, among the large tables kept for the reads to come
-/// (`Converted::recent_large`).
-fn keep_large(lua: &Lua, value: &Value, table: &Table) {
-    let Some(cache) = lua.app_data_ref::<Converted>() else {
-        return;
-    };
-    let id = identity(value);
-    let kept = &cache.recent_large[usize::from(value.list().len() >= LONG_LIST)];
-    let mut recent = kept.tables.borrow_mut();
-    if recent.iter().any(|(at, ..)| *at == id) {
-        return;
-    }
-    // Held with its value, so its address is not another's meanwhile.
-    let entry = (id, value.clone(), table.clone());
-    if recent.len() < RECENT_LARGE {
-        recent.push(entry);
-    } else {
-        let at = kept.next.get();
-        recent[at] = entry;
-        kept.next.set((at + 1) % RECENT_LARGE);
-    }
+    shared_part(value, lua)
 }
 /// Small tables kept from their last conversions (`Converted::recent`).
 const RECENT: usize = 32;
-/// Large ones (`Converted::recent_large`).
-const RECENT_LARGE: usize = 8;
 /// `to_lua` for a small value, a table converted lately given again: a row's
 /// item read by its key and then by the row (`row:get()`), or by every
 /// function of the row, is converted once until it is written.
@@ -1889,6 +2277,7 @@ fn file_weighed(lua: &Lua, value: &Value, table: &Table, added: usize) -> mlua::
     let Some(cache) = lua.app_data_ref::<Converted>() else {
         return Ok(());
     };
+    FILED.set(FILED.get() + 1);
     let id = identity(value);
     // Held before it is filed, as in `raw_shared`: a filing that fails
     // part way (an allocation over the limit) must not leave `tables[id]`
@@ -1904,9 +2293,11 @@ fn file_weighed(lua: &Lua, value: &Value, table: &Table, added: usize) -> mlua::
     ids.raw_set(table, id_key(id))?;
     sweep(lua)
 }
-/// Sweep as the cache doubles in weight: amortized, each conversion pays a
-/// little, and what nothing else holds costs at most as much again as what
-/// is held.
+/// Sweep as the cache triples in weight: amortized, each conversion pays a
+/// little, and what nothing else holds costs at most twice what is held. (A
+/// sweep looks at every value held, a few times over as letting go of one
+/// lets go of its parts: as the cache doubled, a list replaced on every
+/// write paid that more often than it paid to convert.)
 fn sweep(lua: &Lua) -> mlua::Result<()> {
     sweep_when(lua, false)
 }
@@ -1915,25 +2306,37 @@ fn sweep_when(lua: &Lua, now: bool) -> mlua::Result<()> {
     let Some(cache) = lua.app_data_ref::<Converted>() else {
         return Ok(());
     };
-    let (tables, ids) = (cache.tables.borrow().clone(), cache.ids.borrow().clone());
-    if now || cache.weight.get() >= (cache.swept.get() * 2).max(SWEPT_FROM) {
+    if now || cache.weight.get() >= (cache.swept.get() * 3).max(SWEPT_FROM) {
+        let (tables, ids) = (cache.tables.borrow().clone(), cache.ids.borrow().clone());
         let mut gone: Vec<usize> = Vec::new();
         {
             let mut held = cache.held.borrow_mut();
+            // As the host goes idle, what no script holds any more: its table
+            // collected. (Not as the cache grows: a look-up for each value
+            // held is most of a sweep's cost, and a value filed again is
+            // weighed once.)
+            if now {
+                for id in held.keys() {
+                    if !matches!(
+                        tables.raw_get::<mlua::Value>(id_key(*id)),
+                        Ok(mlua::Value::Table(_))
+                    ) {
+                        gone.push(*id);
+                    }
+                }
+                for id in &gone {
+                    if let Some((_, w)) = held.remove(id) {
+                        cache.weight.set(cache.weight.get() - w);
+                    }
+                }
+            }
             // Until none is left: letting go of a value lets go of its
             // parts.
             loop {
                 let before = gone.len();
-                // (Or its table has been collected: no script holds it.)
                 gone.extend(
                     held.iter()
-                        .filter(|(id, (v, _))| {
-                            only_cached(v)
-                                || !matches!(
-                                    tables.raw_get::<mlua::Value>(id_key(**id)),
-                                    Ok(mlua::Value::Table(_))
-                                )
-                        })
+                        .filter(|(_, (v, _))| only_cached(v))
                         .map(|(id, _)| *id),
                 );
                 if gone.len() == before {
@@ -1957,23 +2360,35 @@ fn sweep_when(lua: &Lua, now: bool) -> mlua::Result<()> {
     }
     Ok(())
 }
+/// The cache's tables held weakly until `sweep_idle`: as the host goes idle,
+/// before the collection that frees what only the cache still holds, which
+/// `sweep_idle` then lets go of and files strongly again. Only there, at a
+/// point the host fixes, so what a read costs never depends on when the
+/// collector ran.
+pub(crate) fn weaken_cache(lua: &Lua) {
+    let weakened = (|| {
+        let Some(cache) = lua.app_data_ref::<Converted>() else {
+            return Ok(());
+        };
+        // (`ids` is weak already.)
+        let tables = weak(lua, "v")?;
+        for pair in cache.tables.borrow().pairs::<mlua::Value, mlua::Value>() {
+            let (id, table) = pair?;
+            tables.raw_set(id, table)?;
+        }
+        *cache.tables.borrow_mut() = tables;
+        Ok::<_, mlua::Error>(())
+    })();
+    // (Left strong on an error: the next idle pass tries again.)
+    let _ = weakened;
+}
 /// Everything no script holds let go of now, whatever the cache weighs: as a
-/// host goes idle, after a collection has cleared what scripts dropped. The
-/// large tables kept for reads to come go too.
+/// host goes idle, after `weaken_cache` and a collection have cleared what
+/// only the cache held. Its tables are strong again after.
 pub(crate) fn sweep_idle(lua: &Lua) {
     let Some(cache) = lua.app_data_ref::<Converted>() else {
         return;
     };
-    let [others, lists] = &cache.recent_large;
-    others.tables.borrow_mut().clear();
-    others.next.set(0);
-    // (A list a state still has stays, its table read at each wake: those let go
-    // are held here and by `held` alone.)
-    lists
-        .tables
-        .borrow_mut()
-        .retain(|(_, value, _)| matches!(value, Value::List(items) if Rc::strong_count(items) > 2));
-    lists.next.set(0);
     cache.bases.borrow_mut().clear();
     drop(cache);
     let _ = sweep_when(lua, true);
@@ -1985,18 +2400,15 @@ fn rebuild_cache(lua: &Lua) -> mlua::Result<()> {
     let Some(cache) = lua.app_data_ref::<Converted>() else {
         return Ok(());
     };
-    let weak = |mode: &str| -> mlua::Result<Table> {
-        let t = lua.create_table()?;
-        let meta = lua.create_table()?;
-        meta.raw_set("__mode", mode)?;
-        t.set_metatable(Some(meta))?;
-        Ok(t)
-    };
-    let (new_tables, new_ids) = (weak("v")?, weak("k")?);
+    let (new_tables, new_ids) = (lua.create_table()?, weak(lua, "k")?);
     let old = cache.tables.borrow().clone();
     {
         let mut held = cache.held.borrow_mut();
-        for id in held.keys() {
+        // In order of id, not of the map's hasher: the tables lay out the
+        // same on every run.
+        let mut ids: Vec<usize> = held.keys().copied().collect();
+        ids.sort_unstable();
+        for id in &ids {
             if let mlua::Value::Table(t) = old.raw_get::<mlua::Value>(id_key(*id))? {
                 new_tables.raw_set(id_key(*id), &t)?;
                 new_ids.raw_set(t, id_key(*id))?;
@@ -2007,6 +2419,12 @@ fn rebuild_cache(lua: &Lua) -> mlua::Result<()> {
     *cache.tables.borrow_mut() = new_tables;
     *cache.ids.borrow_mut() = new_ids;
     Ok(())
+}
+/// `value`'s table for scripts, if it has one now (`cached`): for a holder
+/// outside the VM to keep it past the host's idle sweeps (`markdown`'s
+/// stream, deriving each answer from the last).
+pub(crate) fn table_of(lua: &Lua, value: &Value) -> mlua::Result<Option<Table>> {
+    cached(lua, value)
 }
 /// The cached table of `value`, if it has one.
 fn cached(lua: &Lua, value: &Value) -> mlua::Result<Option<Table>> {
@@ -2149,7 +2567,6 @@ pub(crate) fn remember(lua: &Lua, table: &Table, value: &Value) -> mlua::Result<
     let copy: Table = clone.call(table)?;
     copy.set_readonly(true);
     file(lua, value, &copy)?;
-    keep_large(lua, value, &copy);
     Ok(())
 }
 /// How many values a VM's conversion cache holds.
@@ -2378,6 +2795,11 @@ impl State {
     /// A state over `signal`.
     pub fn new(signal: Signal<Value>) -> Self {
         Self(signal, None)
+    }
+    /// What it holds, as a script's `get` reads it: brought up to date,
+    /// and followed by what reads it.
+    pub(crate) fn read(&self) -> Value {
+        self.fresh().get()
     }
     /// A computed's value is current when read, even in a handler or a
     /// batch, where its effect would otherwise run only afterwards.
@@ -2668,6 +3090,18 @@ impl UserData for State {
 /// so the app's states write without a check.
 #[derive(Clone)]
 pub(crate) struct ReadState(pub State, pub Rc<str>);
+/// The state a handle is (`ui.state`'s, a computed's, or a plugin's
+/// read-only one), to read as its `get` reads it ([`State::read`]); `None`
+/// for anything else.
+pub(crate) fn state_handle(value: &mlua::Value) -> Option<State> {
+    let mlua::Value::UserData(ud) = value else {
+        return None;
+    };
+    if let Ok(state) = ud.borrow::<State>() {
+        return Some(state.clone());
+    }
+    ud.borrow::<ReadState>().ok().map(|state| state.0.clone())
+}
 /// What a `State` writes with: a `ReadState` refuses each.
 const WRITES: [&str; 10] = [
     "set", "update", "set_key", "append", "patch", "toggle", "add", "push", "insert", "remove",
@@ -2720,7 +3154,7 @@ fn add_reads<T: 'static, M: UserDataMethods<T>>(
     // Of a derived list (a sorted view) as it is now: brought up to date
     // first, as `at` is, inside a batch that wrote what it derives from.
     methods.add_method("len", move |_, s: &T, ()| {
-        Ok(state(s).fresh().with(|v| v.list().len()))
+        Ok(state(s).fresh().with(|v| v.items().len()))
     });
     // Where the first item whose `field` is `value` is (from 1), or nil,
     // tracked as `get` is: `messages:index_of("id", 42)`, found without
@@ -2744,7 +3178,7 @@ fn add_reads<T: 'static, M: UserDataMethods<T>>(
         Ok(state(s).fresh().with(|v| {
             index
                 .checked_sub(1)
-                .and_then(|i| v.list().get(i).cloned())
+                .and_then(|i| v.item(i).cloned())
                 .unwrap_or(Value::Nil)
         }))
     });
@@ -2941,6 +3375,7 @@ fn search(
 fn list_of<'a>(value: &'a Value, method: &str) -> mlua::Result<&'a [Value]> {
     match value {
         Value::List(items) => Ok(items),
+        Value::Folded(_) if let Some(list) = grown_list(value) => Ok(list.flat()),
         Value::Nil => Ok(&[]),
         other => Err(fail(
             method,
@@ -3016,6 +3451,12 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value is three words: every slot of every list and map holds one.
+    #[test]
+    fn a_value_is_three_words() {
+        assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
 
     fn map(pairs: &[(&str, Value)]) -> Value {
         Value::record(pairs.iter().map(|(k, v)| (*k, v.clone())))
@@ -3261,6 +3702,93 @@ mod tests {
         let back = to_lua(&first, &lua, true).unwrap();
         assert!(*back.as_string().unwrap().as_bytes() == *long.as_bytes());
         assert!(matches!(set("short"), Value::Str(_)));
+    }
+
+    /// A tree of lists and maps, nested deep, made into tables in one C call
+    /// (`raw_to_lua`), is what the walk made: it reads back the same, an
+    /// empty map stays an object, frozen every table at every depth is
+    /// read-only, a long text reads whole, and its tables and their items
+    /// are counted as they were.
+    #[test]
+    fn a_nested_tree_is_made_into_the_tables_the_walk_made() {
+        let lua = Lua::new();
+        let long: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+        let Value::Text(text) =
+            convert(mlua::Value::String(lua.create_string(&long).unwrap()), None).unwrap()
+        else {
+            panic!("a long string is a text");
+        };
+        let map = |fields: Vec<(&str, Value)>| {
+            Value::Map(fields.into_iter().map(|(k, v)| (Rc::from(k), v)).collect())
+        };
+        let message = |i: usize| {
+            map(vec![
+                ("author", Value::Str(format!("a{i}").into())),
+                ("id", Value::Num(i as f64)),
+                ("meta", map(vec![])),
+                ("ok", Value::Bool(i.is_multiple_of(2))),
+                (
+                    "paragraphs",
+                    Value::List(Rc::from(vec![Value::List(Rc::from(vec![
+                        map(vec![
+                            ("s", Value::Str("bold".into())),
+                            ("t", Value::Str("hi".into())),
+                        ]),
+                        map(vec![("t", Value::Text(text.clone()))]),
+                    ]))])),
+                ),
+            ])
+        };
+        // And a chain 100 lists deep.
+        let mut deep = Value::Num(1.);
+        for _ in 0..100 {
+            deep = Value::List(Rc::from(vec![deep]));
+        }
+        let tree = map(vec![
+            ("deep", deep),
+            ("messages", Value::List((0..300).map(message).collect())),
+        ]);
+        assert!(raw_tree(&tree, 0) == Some(true), "made in one call");
+        // Its tables and items, counted down the tree.
+        fn counts(value: &Value) -> (u64, u64) {
+            match value {
+                Value::List(items) => items
+                    .iter()
+                    .map(counts)
+                    .fold((1, items.len() as u64), |a, b| (a.0 + b.0, a.1 + b.1)),
+                Value::Map(fields) => fields
+                    .iter()
+                    .map(|(_, v)| counts(v))
+                    .fold((1, fields.len() as u64), |a, b| (a.0 + b.0, a.1 + b.1)),
+                _ => (0, 0),
+            }
+        }
+        for frozen in [false, true] {
+            let (tables, items) = (tables_converted(), values_converted());
+            let made = to_lua(&tree, &lua, frozen).unwrap();
+            assert_eq!(
+                (tables_converted() - tables, values_converted() - items),
+                counts(&tree)
+            );
+            assert!(
+                convert(made.clone(), None).unwrap() == tree,
+                "reads back the same"
+            );
+            fn check(value: &mlua::Value, frozen: bool, objects: &mut usize) {
+                if let mlua::Value::Table(t) = value {
+                    assert_eq!(t.is_readonly(), frozen);
+                    if is_object(t) {
+                        *objects += 1;
+                    }
+                    for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
+                        check(&pair.unwrap().1, frozen, objects);
+                    }
+                }
+            }
+            let mut objects = 0;
+            check(&made, frozen, &mut objects);
+            assert_eq!(objects, 300, "each empty map an object");
+        }
     }
 
     /// A search finds what `string.find` would, one match after another,

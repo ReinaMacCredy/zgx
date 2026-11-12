@@ -19,7 +19,7 @@ The types: `Color` is `"#rgb"`, `"#rrggbb"`, `"#rrggbbaa"`, `"rgb(…)"`, `"rgba
 | Property | Type | Default | |
 | --- | --- | --- | --- |
 | `w`, `h` | `Length` | its content's size | border-box: the border and padding are inside |
-| `size` | `Pair` | | `w` and `h` at once |
+| `size` | `Pair` | | `w` and `h` at once, on a box (`div`, `column`, `row`, `grid`, `overlay`, `scroll`, `presence`); a number is both. It does nothing on anything else (`zgx lint`: `size-inert`), and on `ui.split` it is the state its divider follows |
 | `min_w`, `max_w`, `min_h`, `max_h` | `Length` | | also [size math](#size-math) and [content sizes](#content-sizes) |
 | `w_full`, `h_full` | `boolean` | `false` | `w = "100%"`, `h = "100%"` |
 | `aspect` | `number` | | width over height; supplies the missing side |
@@ -334,7 +334,11 @@ return ui.div {
 | `shader_params` | `{ Color \| { number } }` | zeros | up to four vec4s: colors (0 to 1) or lists of numbers; animate `shaderTime`, `shaderParam0` to `shaderParam15` |
 | `blend` | `"multiply" \| "screen" \| "overlay" \| "darken" \| "lighten" \| "color-dodge" \| "color-burn" \| "hard-light" \| "soft-light" \| "difference" \| "exclusion" \| "hue" \| "saturation" \| "color" \| "luminosity"` | `"normal"` | CSS `mix-blend-mode`: the node and its children paint into a cached layer that mixes with what lies beneath it (the window, or the layer it sits in) by the mode's formula, as it composites |
 | `layer_shader` | `LayerShader` | | `ui.layer_shader(wgsl, { fps })`: the subtree, cached as a layer, composites through it, pixel by pixel over the box (see [Images and canvas](media.md)) |
-| `layer_params` | `{ Color \| { number } }` | zeros | its four vec4s, as `shader_params`; animate `layerTime`, `layerParam0` to `layerParam15`, which composite again without repainting |
+| `layer_params` | `{ Color \| { number } }`, or a function returning them | zeros | its four vec4s, as `shader_params`, a function followed; animate `layerTime`, `layerParam0` to `layerParam15`, which composite again without repainting |
+| `layer_clock`, `shader_clock` | `boolean` | `false` | the engine steps the layer shader's or `bg_shader`'s time on the frame clock, with no script per step, while the node shows and motion isn't reduced |
+| `layer_on` | `Reactive<boolean>` | `true` | while false, no layer shader, no layer and no clock |
+| `layer_bleed` | `number` | `0` | how many points past the box the layer shader runs and paints (a glow, a ripple): cut by the clips around the node, not its own, and taking no layout |
+| `layer_reach` | `number` | `0` | how many points past the box and bleed its `zgx_backdrop(p)` reads (a haze's or a lens's displacement); a read past that holds at its edge |
 | `clip_inset` | `Sides` | | paints only inside the box shrunk by `{ top, right, bottom, left }` (CSS `clip-path: inset()`); animate `clipTop`, `clipRight`, `clipBottom`, `clipLeft` |
 | `clip_feather` | `number` | `0` | where it clips (`overflow = "hidden"`), its content fades out over this many points inside its rounded edge rather than being cut there, in the fragment shader quads already run (no layer, no mask). Its corners follow its clip inset, held to half the inset box: with `rounded = 9999` and the clip inset animated from the middle out, a soft circle opens, compositing alone |
 
@@ -361,7 +365,7 @@ return ui.div {
 | `align` | `"start" \| "left" \| "center" \| "right"` | `"start"` | |
 | `font` | `string` | the system's | `"mono"` (`"monospace"`), `"sans"` (`"sans-serif"`), `"serif"`, or a family name the host registered |
 | `wrap` | `boolean \| "balance"` | `false` | wrap at the box's width. `"balance"` also balances the lines (CSS's `text-wrap: balance`): they break at the narrowest width that keeps as many, so a heading's last line isn't left short, for up to six lines, the box as it was. It's inherited: on a container, the text in it balances |
-| `truncate` | `boolean` | `false` | one line ending in "…" |
+| `truncate` | `boolean` | `false` | end the text with "…" where it overflows: on one line, or on the last of `lines` when that is set, here or on a parent |
 | `lines` | `number` | all | clamp to that many lines |
 | `line_height` | `number` | the font's | points |
 | `letter_spacing` | `number` | `0` | points |
@@ -402,7 +406,7 @@ return ui.textarea {
 
 ## Transforms
 
-`x`, `y` (`number`, points), `scale`, `scale_x`, `scale_y` (`number`, `1`), `rotate`, `skew`, `skew_x`, `skew_y`, `rotate_x`, `rotate_y` (`number`, degrees), `perspective` (`number`, points, `0`: none) and `origin` (`Pair`, fractions of the node, `{ 0.5, 0.5 }`). They apply after layout: the node keeps its place in the flow, and hit testing follows the transform. Rotation, scale, skew and tilt paint the subtree into a cached layer. `rotate_x` and `rotate_y` tilt it about the axes through `origin` (CSS `rotateX`, `rotateY`), seen from `perspective` points away (CSS `perspective()`): the nearer side shows larger, the layer composited as a projected quad; without a perspective a tilt only narrows it.
+`x`, `y` (`number`, points), `scale`, `scale_x`, `scale_y` (`number`, `1`), `rotate`, `skew`, `skew_x`, `skew_y`, `rotate_x`, `rotate_y` (`number`, degrees), `perspective` (`number`, points, `0`: none) and `origin` (`Pair`, fractions of the node, `{ 0.5, 0.5 }`). They apply after layout: the node keeps its place in the flow, and hit testing follows the transform. Rotation, scale, skew and tilt paint the subtree into a cached layer; magnified (`scale` above 1, here or on an ancestor), it rasterizes at the size it shows, as sharp as drawn there; while its transform animates it keeps that raster (in √2 steps as it grows), so text moves as one picture. `rotate_x` and `rotate_y` tilt it about the axes through `origin` (CSS `rotateX`, `rotateY`), seen from `perspective` points away (CSS `perspective()`): the nearer side shows larger, the layer composited as a projected quad; without a perspective a tilt only narrows it.
 
 Known limit: where a tilted node's edge comes past the eye (`perspective` smaller than how far that edge comes forward), it doesn't draw as CSS draws it, cut off at the eye: the quad's depth is clamped at a tiny distance, so it shows as a distorted sliver, wherever the node lies. The frame doesn't fail. The clamp is in the shared quad shader, `draw.wgsl`, whose Direct3D 11 form is compiled ahead with FXC on Windows (`crates/zgx-gpu/src/dxbc/`), so it can only change along with those binaries.
 
@@ -457,7 +461,7 @@ return ui.scroll {
 | `class` | `string` | | space-separated, for selectors (`".name"`) |
 | `ref` | `Ref \| { Ref }` | | see [State](state.md#refs) |
 | `focusable` | `boolean` | controls: `true` | takes keyboard focus |
-| `pointer_events` | `"none"`, `"auto"`, `boolean`, or a state or function of one | `"auto"` | `"none"` or `false` lets the pointer pass through to what is under the node (presses, hover, the wheel, drops, and a web view or terminal, even where the node paints over it); descendants with their own handlers still receive input |
+| `pointer_events` | `"none"`, `"auto"`, `boolean`, or a state or function of one | `"auto"` | `"none"` or `false` lets the pointer pass through to what is under the node (presses, hover, the wheel, drops, and a web view or terminal, even where the node paints over it); descendants with handlers of their own still receive input, and an `id`, a class or `on_mount` isn't one. `ui.show`, `ui.switch` and `ui.presence` without sizing add no box to catch it; the cursor comes from what is under it too |
 | `hit` | `"target"`, `"shown"` | `"shown"` | `"target"`: while an animation moves it, it takes clicks and hover where it's going ([hit at target](#hit-at-target)) |
 
 ## Accessibility
@@ -476,6 +480,7 @@ What assistive technology (VoiceOver, Narrator, Orca) reads for a node beyond wh
 | `description` | `string` | | read after the name, as a hint (`aria-description`) |
 | `error` | `string \| state \| function` | | what is wrong with its value, followed; nil while fine: assistive technology hears it invalid (`aria-invalid`), and the message after its description. `field` gives a form's |
 | `aria_hidden` | `boolean` | `false` | leaves it and what it holds out of the accessibility tree (`aria-hidden`): decoration such as an unread dot, or what is said elsewhere |
+| `aria_modal` | `boolean` | `false` | while it shows, assistive technology reads it alone, not what lies behind it (`aria-modal`): a sheet or dialog the app builds itself (`ui.modal` is modal already) |
 | `focus_group` | `"vertical" \| "horizontal" \| "both"` | `role = "listbox"`: `"vertical"`; `"toolbar"`, `"tablist"`: `"horizontal"` | one Tab stop for the focusable things inside, as ARIA's composite widgets are: Tab lands on the one last focused there (else the `selected` one, else the first), and the arrows along the axis, Home and End move among them. A field inside keeps its own arrows |
 
 ```lua
@@ -544,7 +549,7 @@ return ui.column {
 
 - A state or function whose value does not fit the property (a string for `w` that is not a length, a boolean for `bg`) is ignored at run time; a literal that does not fit is an error. In the editor both are type errors.
 - `hover`, `active`, `focus`, `disabled` and `context_menu_style` take plain values: a state, function or binding in them is an error. To animate on hover, animate the base style from `on_hover`.
-- Children stretch across their container (`items = "stretch"`) and shrink in one too small for them (`shrink = 1`), as CSS's flexbox; text does not wrap (`wrap = false`) unless asked. A child that shrinks stops at its content's narrowest (CSS's `min-width: auto`: a text's longest word), unless it clips (`overflow`, a scroll) or sets `min_w = 0`; `shrink = 0` holds it.
+- Children stretch across their container (`items = "stretch"`) and shrink in one too small for them (`shrink = 1`), as CSS's flexbox; text does not wrap (`wrap = false`) unless asked. A child that shrinks stops at its content's narrowest (CSS's `min-width: auto`: a text's longest word), unless it clips (`overflow`, a scroll), is text that ends in "…" (`truncate = true`) or sets `min_w = 0`; `shrink = 0` holds it.
 - `gap` is points only; `gap_x` and `gap_y` take percentages.
 - A transparent border still takes its width; a ring that must not move content is `border_over = true`.
 - `bg_fit` and the shape of `mask`, `bg_shader`, `shader_params`, `layer_shader` and `layer_params` are read once, as literals.

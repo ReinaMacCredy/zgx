@@ -11,6 +11,8 @@ mod async_handlers;
 mod calls;
 #[path = "../converted_at_idle.rs"]
 mod converted_at_idle;
+#[path = "../converted_with_collection.rs"]
+mod converted_with_collection;
 #[path = "../form_values.rs"]
 mod form_values;
 #[path = "../guard_doors.rs"]
@@ -19,6 +21,8 @@ mod guard_doors;
 mod io;
 #[path = "../large_data.rs"]
 mod large_data;
+#[path = "../markdown_incremental.rs"]
+mod markdown_incremental;
 #[path = "../module_overrides.rs"]
 mod module_overrides;
 #[path = "../notify.rs"]

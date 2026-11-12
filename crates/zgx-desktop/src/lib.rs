@@ -108,7 +108,11 @@ mod text_drop;
 mod thumbnail;
 mod url;
 #[cfg(target_os = "linux")]
+mod wayland_blur;
+#[cfg(target_os = "linux")]
 mod wayland_data;
+#[cfg(target_os = "linux")]
+mod wayland_output;
 mod window_chrome;
 mod window_info;
 mod window_place;
@@ -186,6 +190,8 @@ pub use application::{
     Application, TaskSpawner, WindowContext, WindowFactory, WindowHandle, WindowOptions,
 };
 
+#[cfg(target_os = "macos")]
+mod coast;
 #[cfg(windows)]
 mod input_pane;
 #[cfg(target_os = "linux")]

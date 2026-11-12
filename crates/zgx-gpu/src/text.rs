@@ -115,6 +115,9 @@ fn font_features(settings: &[([u8; 4], u32)]) -> cosmic_text::FontFeatures {
     }
     features
 }
+// Inlined where it is called, as it was before `spaced` took the rare part
+// out of it (LTO had stopped inlining it into the text cache).
+#[inline(always)]
 pub(crate) fn attrs(font: &zgx::text_layout::FontStyle, size: f32) -> Attrs<'_> {
     use zgx::text_layout::FontFamily;
     let family = match &font.family {
@@ -141,13 +144,25 @@ pub(crate) fn attrs(font: &zgx::text_layout::FontStyle, size: f32) -> Attrs<'_> 
         } else {
             cosmic_text::Style::Normal
         });
-    let spacing = font.letter_spacing.pixels();
-    if spacing == 0. {
+    if font.letter_spacing == zgx::text_layout::LetterSpacing::ZERO {
         attrs
     } else {
-        // cosmic-text 0.14 accepts tracking in EM, while our public styles use
-        // logical pixels. Use the same effective size as Buffer's metrics.
-        attrs.letter_spacing(spacing / size.max(1.))
+        spaced(attrs, font.letter_spacing, size)
+    }
+}
+/// `attrs` with `spacing`, tracking or a grid of cells (a terminal's), both
+/// in EM: out of line, so text without spacing (most) pays nothing for it.
+#[inline(never)]
+fn spaced(
+    attrs: cosmic_text::Attrs<'_>,
+    spacing: zgx::text_layout::LetterSpacing,
+    size: f32,
+) -> cosmic_text::Attrs<'_> {
+    match spacing.cell() {
+        Some(cell) => attrs.cell_grid(cell / size.max(1.)),
+        // cosmic-text 0.14 accepts tracking in EM, while our public styles
+        // use logical pixels. Use the same effective size as Buffer's metrics.
+        None => attrs.letter_spacing(spacing.pixels() / size.max(1.)),
     }
 }
 pub(crate) fn alignment(font: &zgx::text_layout::FontStyle) -> Option<cosmic_text::Align> {
@@ -438,6 +453,30 @@ impl ShapedText {
         }
         fallback
     }
+    /// The caret after the glyph that ends nearest before `byte_index`:
+    /// where an offset no glyph covers on either side shows. Spaces a wrap
+    /// leaves hanging past the line's end have no glyph (a word that fills
+    /// the line, then two spaces); the caret stays after the line's last,
+    /// where they hang, as AppKit's text views keep it, not at the text's
+    /// start.
+    fn caret_after_nearest(&self, byte_index: usize) -> Option<Rect> {
+        let mut before: Option<(usize, Rect)> = None;
+        for run in self.buffer.layout_runs() {
+            let offset = self.line_offsets[run.line_i];
+            for glyph in run.glyphs {
+                let end = offset + glyph.end;
+                if end <= byte_index && before.is_none_or(|(at, _)| end >= at) {
+                    let x = if glyph.level.is_rtl() {
+                        glyph.x
+                    } else {
+                        glyph.x + glyph.w
+                    };
+                    before = Some((end, Rect::new(x, run.line_top, 1., run.line_height)));
+                }
+            }
+        }
+        before.map(|(_, rect)| rect)
+    }
     /// Returns visual rectangles, including disjoint spans for mixed-direction text.
     pub fn selection(&self, range: Range<usize>) -> Vec<Rect> {
         let start = range.start.min(range.end);
@@ -513,7 +552,35 @@ impl ShapedText {
     }
 }
 
+/// Where the inline boxes of `runs` (of lines starting at `line_starts`)
+/// are: each one's character's offset, its left and its top, as its glyph
+/// says (`CacheKeyFlags::INLINE_BOX`: its `y_offset` is how far its top is
+/// above the baseline).
+pub(crate) fn inline_box_places<'a>(
+    runs: impl Iterator<Item = cosmic_text::LayoutRun<'a>>,
+    line_starts: &[usize],
+) -> Vec<(usize, f32, f32)> {
+    let mut boxes = Vec::new();
+    for run in runs {
+        for glyph in run.glyphs {
+            if glyph
+                .cache_key_flags
+                .contains(cosmic_text::CacheKeyFlags::INLINE_BOX)
+            {
+                boxes.push((
+                    line_starts.get(run.line_i).copied().unwrap_or(0) + glyph.start,
+                    glyph.x,
+                    run.line_y - glyph.y_offset * glyph.font_size,
+                ));
+            }
+        }
+    }
+    boxes
+}
 impl zgx::text_layout::TextLayout for ShapedText {
+    fn inline_boxes(&self) -> Vec<(usize, f32, f32)> {
+        inline_box_places(self.buffer.layout_runs(), &self.line_offsets)
+    }
     fn cache_weight(&self) -> Option<usize> {
         // Charge capacities of all publicly inspectable owned shape/layout
         // vectors, including spare capacity. cosmic-text hides String capacity
@@ -612,16 +679,15 @@ impl zgx::text_layout::TextLayout for ShapedText {
             };
             let end = clusters.iter().map(|c| c.1).max().unwrap_or(start);
             let mut carets = Vec::new();
-            for (i, _) in self.text[start..end].grapheme_indices(true) {
-                let at = start + i;
+            for grapheme in zgx::text_layout::grapheme_ranges(&self.text[start..end]) {
+                let at = start + grapheme.start;
                 let k = clusters.partition_point(|c| c.0 <= at);
                 let x = match k.checked_sub(1).map(|k| clusters[k]) {
                     Some((s, e, x, w, rtl)) if at < e => {
                         let cluster = &self.text[s..e];
-                        let count = cluster.graphemes(true).count().max(1);
-                        let before = cluster
-                            .grapheme_indices(true)
-                            .filter(|(i, _)| s + i < at)
+                        let count = zgx::text_layout::grapheme_ranges(cluster).count().max(1);
+                        let before = zgx::text_layout::grapheme_ranges(cluster)
+                            .filter(|range| s + range.start < at)
                             .count();
                         let fraction = before as f32 / count as f32;
                         if rtl {
@@ -738,6 +804,7 @@ impl zgx::text_layout::TextLayout for ShapedText {
                 },
             )
         })
+        .or_else(|| self.caret_after_nearest(offset))
         .unwrap_or(Rect::new(0., 0., 1., self.line_height))
     }
     fn visual_line_range(
@@ -921,6 +988,62 @@ mod visual_line_tests {
             .sum();
         assert!(selected > 0.);
         assert!(shaped.hit_test(0., 0.).is_some());
+    }
+
+    /// A word that fills the line, then spaces: they hang past its end, as
+    /// AppKit's text views hang them, and the caret after them stays at the
+    /// line's end (it went to the text's start once the second space had no
+    /// glyph). Typed on, the next word starts the next line.
+    #[test]
+    fn spaces_after_a_word_that_fills_the_line_keep_the_caret_at_its_end() {
+        let mut fonts = FontSystem::new();
+        let word = "sdfjsfkjdhsfjkdshfkjsdhfjdksfh";
+        let w = ShapedText::new(&mut fonts, word, 14., None).size().0;
+        let end_of_word = |shaped: &ShapedText| {
+            shaped.caret_position(TextPosition {
+                byte_offset: word.len(),
+                affinity: TextAffinity::Before,
+            })
+        };
+        for extra in [0., 0.5, 2., 3.5] {
+            for spaces in 1..=3 {
+                let text = format!("{word}{}", " ".repeat(spaces));
+                let shaped = ShapedText::new(&mut fonts, text.as_str(), 14., Some(w + extra));
+                let word_end = end_of_word(&shaped);
+                for affinity in [TextAffinity::Before, TextAffinity::After] {
+                    let caret = shaped.caret_position(TextPosition {
+                        byte_offset: text.len(),
+                        affinity,
+                    });
+                    // After the word on its line, where the spaces hang, or
+                    // on a line the spaces wrapped to; never back before
+                    // the word's end on its own line.
+                    let after = caret.y == word_end.y && caret.x >= word_end.x - 0.5;
+                    assert!(
+                        after || caret.y > word_end.y,
+                        "{spaces} space(s), width +{extra}: caret at ({}, {}), the word ends at ({}, {})",
+                        caret.x,
+                        caret.y,
+                        word_end.x,
+                        word_end.y
+                    );
+                    if spaces == 1 {
+                        assert!(after, "one space hangs on the word's line (width +{extra})");
+                    }
+                }
+            }
+            // Typed on after two spaces: the next word starts the next line.
+            let text = format!("{word}  x");
+            let shaped = ShapedText::new(&mut fonts, text.as_str(), 14., Some(w + extra));
+            let caret = shaped.caret_position(TextPosition {
+                byte_offset: text.len(),
+                affinity: TextAffinity::After,
+            });
+            assert!(
+                caret.y > end_of_word(&shaped).y,
+                "width +{extra}: the next word wraps"
+            );
+        }
     }
 
     #[test]
@@ -1381,6 +1504,16 @@ mod letter_spacing_tests {
                 );
             }
             assert!(attrs(&font(0.), size).letter_spacing_opt.is_none());
+            // A grid goes to cosmic-text as one, in EM, with no tracking.
+            let grid = FontStyle {
+                letter_spacing: LetterSpacing::cells(7.),
+                ..Default::default()
+            };
+            let on_grid = attrs(&grid, size);
+            // In the padding, a NaN no padding is; no tracking with it.
+            let cell = on_grid.padding_opt.and_then(|spacing| spacing.cell());
+            assert!((cell.unwrap() - 7. / size).abs() < 1e-5);
+            assert!(on_grid.letter_spacing_opt.is_none());
             assert_eq!(
                 attrs(&font(3.), size).letter_spacing_opt.unwrap().0,
                 3. / size
@@ -1570,6 +1703,11 @@ pub(crate) fn truncated(
             run.background = None;
             run.underline = None;
             run.strikethrough = None;
+            // Taken from a box's run: it is text.
+            if run.font.features.is_inline_box() {
+                run.font.features = run.font.features.without_inline_box();
+                run.padding = [0.; 2];
+            }
             runs.push(run);
         }
         if content.is_empty()
@@ -1584,7 +1722,7 @@ pub(crate) fn truncated(
             buffer.shape_until_scroll(fonts, false);
             return buffer;
         }
-        let truncated = zgx::rich_text::RichText::new(content, runs).unwrap();
+        let truncated = rich.remade(content, runs).unwrap();
         rich_buffer_raw(fonts, &truncated, width, None, ellipsis)
     };
     if options.overflow == TextOverflow::Clip {
@@ -1829,6 +1967,9 @@ pub(crate) fn rich_buffer_unshaped(
     // (`run_at`). The ellipsis run stays apart, marked by `usize::MAX`.
     let runs = rich.runs();
     let ellipsis_run = ellipsis.then(|| runs.len().saturating_sub(1));
+    // Its inline boxes, found at the first: a box's run is a padded one,
+    // which most text has none of.
+    let mut boxes = None;
     let mut index = 0;
     while index < runs.len() {
         let run = &runs[index];
@@ -1839,7 +1980,7 @@ pub(crate) fn rich_buffer_unshaped(
             && runs[end].font == run.font
             && runs[end].font_size == run.font_size
             && runs[end].range.start == runs[end - 1].range.end
-            // A padded run's room goes around it alone.
+            // A padded run's room goes around it alone (an inline box is one).
             && run.padding[0] == 0.
             && runs[end].padding[0] == 0.
         {
@@ -1848,6 +1989,10 @@ pub(crate) fn rich_buffer_unshaped(
         let mut attributes = attrs(&run.font, run.font_size.max(1.));
         if run.padding[0] > 0. {
             attributes = attributes.padding(run.padding[0] / run.font_size.max(1.));
+            if run.font.features.is_inline_box() {
+                let boxes = boxes.get_or_insert_with(|| rich.inline_boxes());
+                attributes = attributes.inline_box(box_at(boxes, run.range.start));
+            }
         }
         let attributes = attributes
             .metrics(Metrics::new(
@@ -1873,7 +2018,37 @@ pub(crate) fn rich_buffer_unshaped(
         Shaping::Advanced,
         alignment(base.map_or(&default_font, |run| &run.font)),
     );
+    if boxes.is_some() {
+        buffer.find_inline_boxes();
+    }
     buffer
+}
+
+/// The box at byte `at` of `boxes` (`RichText::inline_boxes`, in order),
+/// as cosmic-text takes one.
+fn box_at(boxes: &[zgx::rich_text::InlineBox], at: usize) -> cosmic_text::InlineBox {
+    use zgx::rich_text::InlineAlign as A;
+    let b = boxes.binary_search_by_key(&at, |b| b.at).map_or_else(
+        |_| zgx::rich_text::InlineBox {
+            baseline: 0.,
+            ..zgx::rich_text::InlineBox::new(at)
+        },
+        |i| boxes[i],
+    );
+    cosmic_text::InlineBox {
+        width: b.width,
+        height: b.height,
+        baseline: b.baseline,
+        align: match b.align {
+            A::Middle => cosmic_text::InlineAlign::Middle,
+            A::TextTop => cosmic_text::InlineAlign::TextTop,
+            A::TextBottom => cosmic_text::InlineAlign::TextBottom,
+            A::Top => cosmic_text::InlineAlign::Top,
+            A::Bottom => cosmic_text::InlineAlign::Bottom,
+            A::Raise(by) => cosmic_text::InlineAlign::Raise(by),
+            _ => cosmic_text::InlineAlign::Baseline,
+        },
+    }
 }
 
 #[cfg(test)]
