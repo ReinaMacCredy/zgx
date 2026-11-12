@@ -206,9 +206,10 @@ const PRINT_SCRIPT: &str = "(() => { const handler = window.webkit && window.web
 /// Defines `window.zgx.postMessage(value)`, sending `value` as JSON.
 const CHANNEL_SCRIPT: &str = "(() => { const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.zgx; if (!handler || window.zgx) return; Object.defineProperty(window, 'zgx', { value: Object.freeze({ postMessage(value) { handler.postMessage(JSON.stringify(value === undefined ? null : value)); } }) }); Object.defineProperty(window, 'zgui', { value: window.zgx }); })();"; // rename-to-zgx: keep
 
-// SAFETY: a WKWebView subclass, main-thread only as views are, adding no
-// state; `performKeyEquivalent:` and `keyDown:` have NSResponder's
-// signatures and call WKWebView's own for every key they do not take.
+// SAFETY: a WKWebView subclass, main-thread only as views are, its state
+// cells; `performKeyEquivalent:`, `keyDown:` and `scrollWheel:` have
+// NSResponder's signatures and call WKWebView's own for every event they do
+// not take.
 define_class!(
     /// The page view: WKWebView as it is, configured as the app asks, but
     /// for the shortcuts the app keeps whatever has the keyboard
@@ -218,9 +219,26 @@ define_class!(
     #[unsafe(super(WKWebView, NSView, objc2_app_kit::NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "ZgxWebView"]
-    #[ivars = ()]
+    #[ivars = WheelState]
     pub(crate) struct ZgxWebView;
     impl ZgxWebView {
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &objc2_app_kit::NSEvent) {
+            let state = self.ivars();
+            let chain = state.web.upgrade().map(|web| web.scroll_chain()).unwrap_or_default();
+            let (latch, on) = state.latch.get().next(Wheel::of(event), chain);
+            state.latch.set(latch);
+            if on {
+                // SAFETY: the view's own next responder (its superview, up to
+                // zgx's view), handed the event AppKit gave this one.
+                if let Some(next) = unsafe { self.nextResponder() } {
+                    next.scrollWheel(event);
+                }
+            } else {
+                // SAFETY: WKWebView's own, with the same event.
+                let _: () = unsafe { msg_send![super(self), scrollWheel: event] };
+            }
+        }
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &objc2_app_kit::NSEvent) -> bool {
             // SAFETY: WKWebView's own, with the same event.
@@ -236,6 +254,103 @@ define_class!(
         }
     }
 );
+
+/// What the page view keeps to hand scrolls on (`WebView::set_scroll_chain`).
+pub(crate) struct WheelState {
+    web: WeakWebView,
+    latch: Cell<Latch>,
+}
+
+/// A scroll event as the hand-on decides it: its phase and distance (toward
+/// the page's right and bottom).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Wheel {
+    phase: Phase,
+    dx: f64,
+    dy: f64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// A mouse wheel's notch: no gesture.
+    Free,
+    /// Fingers down (`MayBegin`, `Began`).
+    Begin,
+    Move,
+    /// Fingers up (`Ended`, `Cancelled`).
+    End,
+    Momentum,
+    MomentumEnd,
+}
+impl Wheel {
+    fn of(event: &objc2_app_kit::NSEvent) -> Self {
+        use objc2_app_kit::NSEventPhase as P;
+        let (momentum, phase) = (event.momentumPhase(), event.phase());
+        let phase = if !momentum.is_empty() {
+            if momentum.intersects(P::Ended | P::Cancelled) {
+                Phase::MomentumEnd
+            } else {
+                Phase::Momentum
+            }
+        } else if phase.intersects(P::MayBegin | P::Began) {
+            Phase::Begin
+        } else if phase.intersects(P::Ended | P::Cancelled) {
+            Phase::End
+        } else if phase.is_empty() {
+            Phase::Free
+        } else {
+            Phase::Move
+        };
+        // AppKit's deltas are toward the top and left.
+        Self {
+            phase,
+            dx: -event.scrollingDeltaX(),
+            dy: -event.scrollingDeltaY(),
+        }
+    }
+}
+
+/// Where the current gesture's scrolls go: a gesture that began over the
+/// page stays with it until it reaches an edge the app chains past, then
+/// goes on (momentum included) and never comes back; one that began
+/// elsewhere (the page scrolled under a still pointer) goes on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Latch {
+    #[default]
+    Idle,
+    /// Fingers down on the page, nothing moved yet.
+    Open,
+    Page,
+    App,
+    /// Fingers up, momentum may follow: whether the gesture had gone on.
+    Lifted(bool),
+}
+impl Latch {
+    /// The state after `wheel`, and whether it goes on to the app.
+    fn next(self, wheel: Wheel, chain: zgx::web_view::ScrollChain) -> (Self, bool) {
+        let passes = chain.passes(wheel.dx, wheel.dy);
+        let owner = |from: Self| match (from, passes) {
+            (Self::App, _) | (_, Some(true)) => Self::App,
+            (_, Some(false)) => Self::Page,
+            (from, None) => from,
+        };
+        let now = match (wheel.phase, self) {
+            (Phase::Free, _) => return (Self::Idle, passes.unwrap_or(false)),
+            (Phase::Begin, _) if chain == zgx::web_view::ScrollChain::ALL => Self::App,
+            (Phase::Begin, _) => owner(Self::Open),
+            (Phase::Move | Phase::End, Self::Open | Self::Page) => owner(self),
+            (Phase::Momentum | Phase::MomentumEnd, Self::Open | Self::Page) => owner(Self::Page),
+            (Phase::Momentum | Phase::MomentumEnd, Self::Lifted(false)) => owner(Self::Page),
+            _ => Self::App,
+        };
+        let on = now == Self::App;
+        let after = match wheel.phase {
+            Phase::End => Self::Lifted(on),
+            Phase::MomentumEnd => Self::Idle,
+            _ => now,
+        };
+        (after, on)
+    }
+}
 
 pub(crate) struct ObserverState {
     web: WeakWebView,
@@ -1137,9 +1252,13 @@ impl MacWebView {
                 }
             }
             // SAFETY: WKWebView's designated initializer, on a fresh
-            // allocation of zgx's subclass, which adds no state.
+            // allocation of zgx's subclass with its state set.
+            let state = WheelState {
+                web: web.downgrade(),
+                latch: Cell::new(Latch::Idle),
+            };
             let view: Retained<ZgxWebView> = msg_send![
-                super(mtm.alloc::<ZgxWebView>().set_ivars(())),
+                super(mtm.alloc::<ZgxWebView>().set_ivars(state)),
                 initWithFrame: NSRect::ZERO,
                 configuration: &*configuration
             ];
@@ -1477,9 +1596,106 @@ pub(crate) fn backend(web: &WebView, mtm: MainThreadMarker) -> Rc<dyn WebViewBac
 
 #[cfg(test)]
 mod tests {
-    use super::json;
+    use super::{Latch, Phase, Wheel, json};
     use objc2::{msg_send, rc::Retained, runtime::AnyObject};
     use objc2_foundation::{NSData, NSError};
+    use zgx::web_view::ScrollChain;
+
+    /// A gesture's scrolls in turn (`dy` toward the page's bottom) and where
+    /// each went: `true` on to the app.
+    fn gesture(chain: impl Fn(usize) -> ScrollChain, steps: &[(Phase, f64)]) -> Vec<bool> {
+        let mut latch = Latch::Idle;
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, &(phase, dy))| {
+                let (next, on) = latch.next(Wheel { phase, dx: 0., dy }, chain(i));
+                latch = next;
+                on
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_page_with_nothing_to_scroll_hands_on_every_gesture_from_its_start() {
+        use Phase::*;
+        let all = |_| ScrollChain::ALL;
+        let steps = [
+            (Begin, 0.),
+            (Move, 8.),
+            (Move, -8.),
+            (End, 0.),
+            (Momentum, 4.),
+            (MomentumEnd, 0.),
+        ];
+        assert_eq!(gesture(all, &steps), vec![true; 6]);
+        assert_eq!(gesture(all, &[(Free, 3.)]), vec![true], "a mouse's notch");
+        let none = |_| ScrollChain::default();
+        assert_eq!(
+            gesture(none, &steps),
+            vec![false; 6],
+            "by default the page keeps them"
+        );
+    }
+
+    #[test]
+    fn a_scrolling_page_keeps_a_gesture_until_its_edge_then_hands_on_the_rest() {
+        use Phase::*;
+        let at_bottom_from = |edge: usize| {
+            move |i: usize| ScrollChain {
+                down: i >= edge,
+                ..ScrollChain::default()
+            }
+        };
+        let steps = [
+            (Begin, 0.),
+            (Move, 8.),
+            (Move, 8.),
+            (Move, 8.),
+            (Move, -8.),
+            (End, 0.),
+            (Momentum, -4.),
+            (MomentumEnd, 0.),
+        ];
+        assert_eq!(
+            gesture(at_bottom_from(3), &steps),
+            vec![false, false, false, true, true, true, true, true],
+            "the page scrolls to its bottom, the rest goes on and never comes back"
+        );
+        let lifted = [
+            (Begin, 0.),
+            (Move, 8.),
+            (End, 0.),
+            (Momentum, 8.),
+            (Momentum, 8.),
+            (MomentumEnd, 0.),
+        ];
+        assert_eq!(
+            gesture(at_bottom_from(4), &lifted),
+            vec![false, false, false, false, true, true],
+            "the page's own momentum hands on at the edge"
+        );
+        assert_eq!(
+            gesture(at_bottom_from(9), &[(Begin, 0.), (Move, -8.)]),
+            vec![false, false],
+            "toward its top: the page's"
+        );
+    }
+
+    #[test]
+    fn a_gesture_begun_elsewhere_goes_on_over_the_page() {
+        use Phase::*;
+        let none = |_| ScrollChain::default();
+        assert_eq!(
+            gesture(none, &[(Move, 8.), (End, 0.), (Momentum, 8.)]),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            gesture(none, &[(Begin, 0.), (Move, 8.), (End, 0.), (Move, 8.)]),
+            vec![false, false, false, true],
+            "after the page's gesture lifted, a stray scroll is not its"
+        );
+    }
 
     /// What a page posts as an object (`postMessage({ … })`): a dictionary,
     /// back as its JSON. A debug build checks each message's declared types.

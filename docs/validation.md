@@ -1196,6 +1196,17 @@ two-finger swipes there scroll and navigate nothing, as they should. AppKit's
 tracking of a two-finger swipe (`trackSwipeEventWithOptions`) needs a real
 trackpad: `swipe_probe --manual` counts the steps.
 
+## macOS scrolls a page hands on
+
+`scripts/macos_scroll_chain_probe.py` runs the scroll_chain_probe example and
+sends trackpad scrolls (CGEvent scrolls with their phases) to its own window
+over a page in a zgx scroll view (`WebView::set_scroll_chain`): a page that
+fits, with no chain, keeps the gesture and the view stays; chaining every
+way, the view scrolls; a page four times its box, chaining as its edges say
+(it posts them as it scrolls), scrolls itself and the view stays, and a
+longer gesture scrolls it to its bottom and then the view on. Passed on
+macOS 26 (M5), 2026-11-13.
+
 ## macOS window deactivation and return
 
 `scripts/macos_deactivation_probe.py` (the `deactivation_probe` example, run

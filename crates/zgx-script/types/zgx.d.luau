@@ -1332,6 +1332,9 @@ declare extern type Web with
 	function exit_full_screen(self): ()
 	function zoom(self, zoom: number): ()
 	function run(self, js: string): ()
+	-- The scrolls over the page that go on to the app under it (macOS), as
+	-- a nested frame hands on what it can't scroll; nil, none (the default).
+	function scroll_chain(self, chain: { up: boolean?, down: boolean?, left: boolean?, right: boolean? }?): ()
 	-- Each navigation, asked first: `false` refuses it. `kind`: "link",
 	-- "form", "back_forward", "reload", "form_resubmission" or "other".
 	function decide_navigation(

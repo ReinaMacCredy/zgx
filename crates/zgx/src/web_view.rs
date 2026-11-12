@@ -526,6 +526,40 @@ impl std::fmt::Debug for WebViewCommand {
     }
 }
 
+/// The directions a page hands scrolls on in ([`WebView::set_scroll_chain`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrollChain {
+    /// Scrolls toward the page's top.
+    pub up: bool,
+    /// Scrolls toward the page's bottom.
+    pub down: bool,
+    /// Scrolls toward the page's left.
+    pub left: bool,
+    /// Scrolls toward the page's right.
+    pub right: bool,
+}
+impl ScrollChain {
+    /// Every scroll goes on: a page with nothing to scroll.
+    pub const ALL: Self = Self {
+        up: true,
+        down: true,
+        left: true,
+        right: true,
+    };
+    /// Whether a scroll by `(dx, dy)` (toward the page's right and bottom,
+    /// as zgx's wheel deltas) goes on, by the axis it moves along most;
+    /// `None` for one that moves nothing.
+    pub fn passes(&self, dx: f64, dy: f64) -> Option<bool> {
+        if dx.abs() >= dy.abs() && dx != 0. {
+            Some(if dx > 0. { self.right } else { self.left })
+        } else if dy != 0. {
+            Some(if dy > 0. { self.down } else { self.up })
+        } else {
+            None
+        }
+    }
+}
+
 /// How [`WebView::find`] searches. Matches wrap past the page's end.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -599,6 +633,7 @@ struct Inner {
     /// What answers the page's file inputs: the latest node showing it.
     chooser: RefCell<Option<Chooser>>,
     downloads: RefCell<Option<DownloadHandler>>,
+    chain: Cell<ScrollChain>,
 }
 /// The window's file dialogs and the component that waits on them, from
 /// the node showing a page (`WebView::choose_files`).
@@ -687,6 +722,7 @@ impl WebView {
             policy: RefCell::new(None),
             chooser: RefCell::new(None),
             downloads: RefCell::new(None),
+            chain: Cell::new(ScrollChain::default()),
         }))
     }
     /// Files for the page's file input (`<input type=file>`), chosen in the
@@ -982,6 +1018,19 @@ impl WebView {
     pub fn set_zoom(&self, zoom: f64) {
         self.run(WebViewCommand::SetZoom(zoom));
     }
+    /// Hand the scrolls `chain` names on to what is under the page in the
+    /// app (macOS; elsewhere the page keeps every scroll), as a frame nested
+    /// in a browser's page passes on a scroll it has no room for: a page in
+    /// a scroll view that is at an edge, or has nothing to scroll, then
+    /// never traps the wheel. The app follows the page's edges (a script
+    /// reporting them); by default the page keeps every scroll.
+    pub fn set_scroll_chain(&self, chain: ScrollChain) {
+        self.0.chain.set(chain);
+    }
+    /// The scrolls the page hands on (see [`WebView::set_scroll_chain`]).
+    pub fn scroll_chain(&self) -> ScrollChain {
+        self.0.chain.get()
+    }
     /// Decide each navigation before it starts: `false` cancels it. Called on
     /// the UI thread from inside the platform's callback, so it must answer
     /// at once and not call back into this controller.
@@ -1242,6 +1291,32 @@ mod tests {
         for malformed in ["", "MyApp", "2app", "my app", "my:app", "app/x"] {
             assert!(!is_app_scheme(malformed), "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn a_scroll_goes_on_along_the_axis_it_moves_most_where_the_page_hands_it_on() {
+        let runtime = crate::reactive::Runtime::new();
+        let web = WebView::new(&runtime, WebViewOptions::default());
+        assert_eq!(
+            web.scroll_chain(),
+            ScrollChain::default(),
+            "a page keeps every scroll"
+        );
+        let at_top = ScrollChain {
+            up: true,
+            left: true,
+            right: true,
+            down: false,
+        };
+        web.set_scroll_chain(at_top);
+        let chain = web.scroll_chain();
+        assert_eq!(chain.passes(0., -12.), Some(true), "up, past the top");
+        assert_eq!(chain.passes(0., 12.), Some(false), "down, into the page");
+        assert_eq!(chain.passes(3., 12.), Some(false), "mostly down");
+        assert_eq!(chain.passes(-12., 3.), Some(true), "mostly left");
+        assert_eq!(chain.passes(0., 0.), None, "nothing moved");
+        assert_eq!(ScrollChain::default().passes(0., -12.), Some(false));
+        assert_eq!(ScrollChain::ALL.passes(0., 12.), Some(true));
     }
 
     #[test]

@@ -740,6 +740,41 @@ fn a_page_asks_the_script_before_each_navigation_and_its_kind_is_told() {
 }
 
 #[test]
+fn a_script_names_the_scrolls_its_page_hands_on() {
+    use zgx::web_view::ScrollChain;
+    let mut h = Harness::inline(
+        r##"local web = ui.web("c1", { profile = "ephemeral" })
+        local chain = ui.state("chain", "none")
+        ui.effect(function()
+            local now = chain:get()
+            web:scroll_chain(if now == "all" then { up = true, down = true, left = true, right = true }
+                elseif now == "top" then { up = true } else nil)
+        end)
+        return ui.column {
+            ui.webview { web = web, w = 200, h = 100 },
+            ui.button { id = "all", w = 20, h = 20, on_click = function() chain:set("all") end },
+            ui.button { id = "top", w = 20, h = 20, on_click = function() chain:set("top") end },
+            ui.button { id = "none", w = 20, h = 20, on_click = function() chain:set("none") end },
+        }"##,
+    );
+    let web = page(&mut h);
+    assert_eq!(web.scroll_chain(), ScrollChain::default());
+    h.click("all");
+    assert_eq!(web.scroll_chain(), ScrollChain::ALL);
+    h.click("top");
+    assert_eq!(
+        web.scroll_chain(),
+        ScrollChain {
+            up: true,
+            ..ScrollChain::default()
+        }
+    );
+    h.click("none");
+    assert_eq!(web.scroll_chain(), ScrollChain::default());
+    assert_eq!(h.error(), None);
+}
+
+#[test]
 fn a_page_can_keep_the_apps_scripts_in_a_world_of_their_own() {
     use zgx::web_view::UserScript;
     let mut h = Harness::inline(

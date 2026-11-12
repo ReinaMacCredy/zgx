@@ -374,6 +374,23 @@ impl UserData for WebUd {
             w.0.set_zoom(zoom);
             Ok(())
         });
+        // `web:scroll_chain({ up, down, left, right })`: the scrolls the page
+        // hands on to the app under it; nil, none.
+        methods.add_method("scroll_chain", |_, w, chain: Option<Table>| {
+            let way = |key: &str| -> mlua::Result<bool> {
+                Ok(match &chain {
+                    Some(chain) => chain.get::<Option<bool>>(key)?.unwrap_or(false),
+                    None => false,
+                })
+            };
+            w.0.set_scroll_chain(zgx::web_view::ScrollChain {
+                up: way("up")?,
+                down: way("down")?,
+                left: way("left")?,
+                right: way("right")?,
+            });
+            Ok(())
+        });
         methods.add_method("run", |_, w, js: String| {
             w.0.run_js(js);
             Ok(())
