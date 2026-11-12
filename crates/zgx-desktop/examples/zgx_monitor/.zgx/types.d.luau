@@ -1210,6 +1210,9 @@ declare extern type Element with
 	-- scrolls into view, focused or not.
 	function set_selection_bytes(self, a: number, b: number?): boolean
 	function selection_bytes(self): (number?, number?)
+	-- Where its caret is, in the window's points; nil for what isn't an
+	-- editor.
+	function caret_rect(self): { x: number, y: number, w: number, h: number }?
 	-- The selection replaced by `text`, as typing it would (one step of
 	-- undo): a search's Replace.
 	function replace_selection(self, text: string): boolean
