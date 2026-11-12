@@ -43,56 +43,79 @@ fn uncovered(damage: &[Rect], painted: Rect) -> usize {
     n
 }
 
-const LANE: Rect = Rect { x: 0., y: 100., width: 60., height: 16. };
+const LANE: Rect = Rect {
+    x: 0.,
+    y: 100.,
+    width: 60.,
+    height: 16.,
+};
 
 #[test]
 fn removed_after_a_jump_past_the_view() {
-    let mut l = lab();
+    let l = lab();
     l.offset.set(600.);
     l.ui.prepare_frame();
     l.shown.set(false);
     l.ui.prepare_frame();
     let damage = l.ui.scene.borrow_mut().flush().damage;
-    println!("after-jump damage={damage:?} uncovered={}", uncovered(&damage, LANE));
+    println!(
+        "after-jump damage={damage:?} uncovered={}",
+        uncovered(&damage, LANE)
+    );
     assert_eq!(uncovered(&damage, LANE), 0, "stale pixels: {damage:?}");
 }
 
 #[test]
 fn removed_before_a_jump_past_the_view() {
-    let mut l = lab();
+    let l = lab();
     l.shown.set(false);
     l.ui.prepare_frame();
     l.offset.set(600.);
     l.ui.prepare_frame();
     let damage = l.ui.scene.borrow_mut().flush().damage;
-    println!("before-jump damage={damage:?} uncovered={}", uncovered(&damage, LANE));
+    println!(
+        "before-jump damage={damage:?} uncovered={}",
+        uncovered(&damage, LANE)
+    );
     assert_eq!(uncovered(&damage, LANE), 0, "stale pixels: {damage:?}");
 }
 
 #[test]
 fn removed_one_flush_after_the_jump() {
-    let mut l = lab();
+    let l = lab();
     l.offset.set(600.);
     l.ui.prepare_frame();
     let first = l.ui.scene.borrow_mut().flush().damage;
     l.shown.set(false);
     l.ui.prepare_frame();
     let second = l.ui.scene.borrow_mut().flush().damage;
-    println!("next-flush first={first:?} second={second:?} uncovered={}", uncovered(&first, LANE));
+    println!(
+        "next-flush first={first:?} second={second:?} uncovered={}",
+        uncovered(&first, LANE)
+    );
     assert_eq!(uncovered(&first, LANE), 0, "stale pixels: {first:?}");
 }
 
 #[test]
 fn removed_after_a_small_move_stays_in_the_view() {
-    let mut l = lab();
+    let l = lab();
     l.offset.set(30.);
     l.ui.prepare_frame();
     l.shown.set(false);
     l.ui.prepare_frame();
     let report = l.ui.scene.borrow_mut().flush();
-    println!("small-move damage={:?} moves={:?}", report.damage, l.ui.scene.borrow().scroll_moves());
+    println!(
+        "small-move damage={:?} moves={:?}",
+        report.damage,
+        l.ui.scene.borrow().scroll_moves()
+    );
     let moved = Rect { y: 70., ..LANE };
-    assert_eq!(uncovered(&report.damage, moved), 0, "stale pixels: {:?}", report.damage);
+    assert_eq!(
+        uncovered(&report.damage, moved),
+        0,
+        "stale pixels: {:?}",
+        report.damage
+    );
 }
 
 fn shrink_lab() -> (Ui, zgx::reactive::Signal<f32>, zgx::reactive::Signal<bool>) {
@@ -120,13 +143,21 @@ fn shrink_lab() -> (Ui, zgx::reactive::Signal<f32>, zgx::reactive::Signal<bool>)
 
 #[test]
 fn shrunk_after_a_jump_past_the_view() {
-    let (mut ui, offset, wide) = shrink_lab();
+    let (ui, offset, wide) = shrink_lab();
     offset.set(600.);
     ui.prepare_frame();
     wide.set(false);
     ui.prepare_frame();
     let damage = ui.scene.borrow_mut().flush().damage;
-    let bar = Rect { x: 0., y: 100., width: 120., height: 16. };
-    println!("shrunk damage={damage:?} uncovered={}", uncovered(&damage, bar));
+    let bar = Rect {
+        x: 0.,
+        y: 100.,
+        width: 120.,
+        height: 16.,
+    };
+    println!(
+        "shrunk damage={damage:?} uncovered={}",
+        uncovered(&damage, bar)
+    );
     assert_eq!(uncovered(&damage, bar), 0, "stale pixels: {damage:?}");
 }

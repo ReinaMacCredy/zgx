@@ -5242,7 +5242,9 @@ fn paragraph_effect<const LOCATING: bool>(
                         let underline = span.underline.or(inherited);
                         match span.underline_color {
                             None => underline,
-                            Some(crate::theme::Themed::Value(tint)) => underline.map(|d| d.color(tint)),
+                            Some(crate::theme::Themed::Value(tint)) => {
+                                underline.map(|d| d.color(tint))
+                            }
                             Some(crate::theme::Themed::Token(token)) => underline.map(|d| {
                                 d.color(
                                     theme

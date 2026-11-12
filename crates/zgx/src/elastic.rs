@@ -546,7 +546,11 @@ fn follow_swipe(ui: &Ui, delta_x: f32, delta_y: f32, result: &DispatchResult) ->
         let Some(target) = result.target else {
             return false;
         };
-        if ui.input.swipe_follower(&ui.scene.borrow(), target).is_none() {
+        if ui
+            .input
+            .swipe_follower(&ui.scene.borrow(), target)
+            .is_none()
+        {
             return false;
         }
         state.touch.0 += delta_x;
