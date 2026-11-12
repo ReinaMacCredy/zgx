@@ -66,5 +66,7 @@ mod editor_theme_marks;
 mod editor_undo_keys;
 #[path = "../editor_wrap_navigation.rs"]
 mod editor_wrap_navigation;
+#[path = "../editor_wrapped_estimate.rs"]
+mod editor_wrapped_estimate;
 #[path = "../ime_clauses.rs"]
 mod ime_clauses;

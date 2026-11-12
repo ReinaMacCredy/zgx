@@ -5363,78 +5363,100 @@ impl Ui {
                         affinity: TextAffinity::After,
                     }
                 };
-            let caret_rect = layout.caret_position(caret_position);
-            let cx = caret_rect.x;
-            let cy = caret_rect.y;
-            let line_height = caret_rect.height;
             let mut scroll = scroll_for_draw.borrow_mut();
             let reveal = draw_reveal_caret.replace(true) && draw_gesture.mode.get().is_none();
             // A place asked for (find's match), else the caret.
             let (place, align) = draw_hint.reveal_at.take().unzip();
-            let (rx, ry, rh, asked) = match place {
-                Some(at) => {
-                    let r = layout.caret_position(TextPosition {
-                        byte_offset: at,
-                        affinity: TextAffinity::After,
-                    });
-                    (r.x, r.y, r.height, true)
-                }
-                _ => (cx, cy, line_height, draw_hint.reveal.take()),
-            };
-            if (*focus.borrow() || asked) && reveal {
-                if rx - scroll.0 > (inner_width - 8.).max(0.) {
-                    scroll.0 = rx - ((inner_width - 8.).max(0.));
-                }
-                if rx < scroll.0 {
-                    scroll.0 = rx;
-                }
-                if ry - scroll.1 > (inner_height - rh).max(0.) {
-                    scroll.1 = ry - ((inner_height - rh).max(0.));
-                }
-                if ry < scroll.1 {
-                    scroll.1 = ry;
-                }
-                match align {
-                    Some(crate::compose::RowAlign::Start) => scroll.1 = ry,
-                    Some(crate::compose::RowAlign::Center) => {
-                        scroll.1 = ry - (inner_height - rh) / 2.
-                    }
-                    Some(crate::compose::RowAlign::End) => scroll.1 = ry - (inner_height - rh),
-                    _ => {}
-                }
-            }
-            let (tw, th) = layout.size();
-            let limit = (
-                if draw_wrap.get() {
-                    0.
-                } else {
-                    (tw + 2. - inner_width).max(0.)
-                },
-                (th - inner_height).max(0.),
-            );
-            draw_scroll_limit.set(limit);
-            // Unwrapped text aligned right (right to left, by default) or
-            // centred lies that far into the field while it is narrower:
-            // as a scroll before its start, so the caret, selection and
-            // pointer, all placed from the layout, follow it.
+            let asked = place.is_some() || draw_hint.reveal.take();
             let factor = match font.align {
                 _ if draw_wrap.get() => 0.,
                 crate::text_layout::TextAlign::Right => 1.,
                 crate::text_layout::TextAlign::Center => 0.5,
                 _ => 0.,
             };
-            let lead = (inner_width - 1. - tw).max(0.) * factor;
-            scroll.0 = if lead > 0. {
-                -lead
-            } else {
-                scroll.0.clamp(0., limit.0)
+            let entered = *scroll;
+            let mut passes = 0;
+            let (caret_rect, tw, th, limit) = loop {
+                *scroll = entered;
+                let caret_rect = layout.caret_position(caret_position);
+                let revealed = match place {
+                    Some(at) => layout.caret_position(TextPosition {
+                        byte_offset: at,
+                        affinity: TextAffinity::After,
+                    }),
+                    _ => caret_rect,
+                };
+                let (rx, ry, rh) = (revealed.x, revealed.y, revealed.height);
+                if (*focus.borrow() || asked) && reveal {
+                    if rx - scroll.0 > (inner_width - 8.).max(0.) {
+                        scroll.0 = rx - ((inner_width - 8.).max(0.));
+                    }
+                    if rx < scroll.0 {
+                        scroll.0 = rx;
+                    }
+                    if ry - scroll.1 > (inner_height - rh).max(0.) {
+                        scroll.1 = ry - ((inner_height - rh).max(0.));
+                    }
+                    if ry < scroll.1 {
+                        scroll.1 = ry;
+                    }
+                    match align {
+                        Some(crate::compose::RowAlign::Start) => scroll.1 = ry,
+                        Some(crate::compose::RowAlign::Center) => {
+                            scroll.1 = ry - (inner_height - rh) / 2.
+                        }
+                        Some(crate::compose::RowAlign::End) => scroll.1 = ry - (inner_height - rh),
+                        _ => {}
+                    }
+                }
+                let (tw, th) = layout.size();
+                let limit = (
+                    if draw_wrap.get() {
+                        0.
+                    } else {
+                        (tw + 2. - inner_width).max(0.)
+                    },
+                    (th - inner_height).max(0.),
+                );
+                // Unwrapped text aligned right (right to left, by default) or
+                // centred lies that far into the field while it is narrower:
+                // as a scroll before its start, so the caret, selection and
+                // pointer, all placed from the layout, follow it.
+                let lead = (inner_width - 1. - tw).max(0.) * factor;
+                scroll.0 = if lead > 0. {
+                    -lead
+                } else {
+                    scroll.0.clamp(0., limit.0)
+                };
+                scroll.1 = if multiline {
+                    scroll.1.clamp(0., limit.1)
+                } else {
+                    // One line, centred in the box (negative: pushed down).
+                    (caret_rect.height - inner_height) / 2.
+                };
+                passes += 1;
+                // Wrapped lines are estimated until shaped: place again once those shown are.
+                let Some(lines) = long_lines.as_ref().filter(|_| passes < 4) else {
+                    break (caret_rect, tw, th, limit);
+                };
+                let row = caret_rect.height;
+                lines.lines_between(scroll.1 - row, scroll.1 + inner_height + row);
+                if lines.size() == (tw, th)
+                    && layout.caret_position(caret_position) == caret_rect
+                    && place.is_none_or(|at| {
+                        layout.caret_position(TextPosition {
+                            byte_offset: at,
+                            affinity: TextAffinity::After,
+                        }) == revealed
+                    })
+                {
+                    break (caret_rect, tw, th, limit);
+                }
             };
-            scroll.1 = if multiline {
-                scroll.1.clamp(0., limit.1)
-            } else {
-                // One line, centred in the box (negative: pushed down).
-                (line_height - inner_height) / 2.
-            };
+            draw_scroll_limit.set(limit);
+            let cx = caret_rect.x;
+            let cy = caret_rect.y;
+            let line_height = caret_rect.height;
             if let Some(code) = draw_hint.code()
                 && code.top_line_listened.get()
             {
