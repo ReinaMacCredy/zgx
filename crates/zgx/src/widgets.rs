@@ -1060,8 +1060,13 @@ impl EditorHandle {
         }
         let metrics_changed = wrap_changed || previous.1 != next.1 || previous.2 != next.2;
         *self.typography.borrow_mut() = next;
-        // A placeholder showing keeps its own colour: draw it again.
-        if metrics_changed || self.hint.placeholder.borrow().is_some() {
+        // A placeholder showing keeps its own colour, and a long text's lines
+        // are nodes of their own: draw it again.
+        let lines_shown = self
+            .hint
+            .code()
+            .is_some_and(|code| !code.line_nodes.borrow().is_empty());
+        if metrics_changed || self.hint.placeholder.borrow().is_some() || lines_shown {
             self.preferred_x.set(None);
             // A mount drawing this editor later draws it in this style.
             if !input_draw_pending(self.node, &self.scene) {

@@ -55,6 +55,63 @@ fn a_highlight_token_colour_follows_a_theme_switch() {
     assert_eq!(h.error(), None);
 }
 
+#[test]
+fn an_unfocused_text_area_s_text_follows_a_theme_switch() {
+    let mut h = Harness::inline(
+        r##"return ui.column {
+            ui.textarea { id = "plain", value = ui.state("a", "hello world"), w = 300, h = 60 },
+            ui.textarea { id = "lines", value = ui.state("b", "one\ntwo"), w = 300, h = 60 },
+            ui.textarea { id = "chips", value = ui.state("c", "hello world"), w = 300, h = 60,
+                chips = ui.state("chips", { { from = 1, to = 5, bg = "#ff0010" } }) },
+            ui.textarea { id = "chip_lines", value = ui.state("d", "one\ntwo"), w = 300, h = 60,
+                chips = ui.state("chips2", { { from = 1, to = 3, bg = "#ff0010" } }) },
+        }"##,
+    );
+    let shown = |h: &mut Harness, id: &str| {
+        h.ui.prepare_frame();
+        let root = h.find(id).unwrap();
+        let scene = h.ui.scene.borrow();
+        let mut pending = vec![root];
+        let mut found = Vec::new();
+        while let Some(node) = pending.pop() {
+            match scene.kind(node) {
+                NodeKind::Text { text, color, .. } if !text.trim().is_empty() => {
+                    found.push((text.to_string(), *color))
+                }
+                NodeKind::RichText { text } => {
+                    for run in text.runs() {
+                        found.push((text.text()[run.range.clone()].to_string(), run.color));
+                    }
+                }
+                _ => {}
+            }
+            pending.extend(scene.children(node).iter().copied());
+        }
+        found
+    };
+    let primary = |h: &Harness| {
+        zgx::theme::Themes::of(&h.ui.runtime)
+            .root()
+            .color(zgx::theme::tok::TEXT_PRIMARY)
+    };
+    let mut before = None;
+    for theme in [zgx::theme::DARK, zgx::theme::LIGHT, zgx::theme::DARK] {
+        h.ui.theme().set(theme).unwrap();
+        h.frames(2);
+        let primary = primary(&h);
+        assert_ne!(before, Some(primary), "the themes' text colours differ");
+        before = Some(primary);
+        for id in ["plain", "lines", "chips", "chip_lines"] {
+            let shown = shown(&mut h, id);
+            assert!(!shown.is_empty(), "{id} shows its text");
+            for (text, color) in shown {
+                assert_eq!(color, primary, "{id}'s {text:?} in {theme}");
+            }
+        }
+    }
+    assert_eq!(h.error(), None);
+}
+
 /// Lines inside `/* … */` grey, the highlighter carrying whether a line
 /// starts inside one as `state`, in the form `carry` gives.
 fn comments(carry: &str) -> String {
