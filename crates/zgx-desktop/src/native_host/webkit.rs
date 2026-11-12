@@ -1683,6 +1683,33 @@ mod tests {
     }
 
     #[test]
+    fn a_scrolling_page_keeps_a_gesture_that_drifts_sideways() {
+        let at_top = ScrollChain {
+            up: true,
+            left: true,
+            right: true,
+            down: false,
+        };
+        let mut latch = Latch::Idle;
+        let mut went = Vec::new();
+        for (phase, dx, dy) in [
+            (Phase::Begin, 0., 0.),
+            (Phase::Move, 2., 1.),
+            (Phase::Move, 1., 1.),
+            (Phase::Move, 0., 6.),
+        ] {
+            let (next, on) = latch.next(Wheel { phase, dx, dy }, at_top);
+            latch = next;
+            went.push(on);
+        }
+        assert_eq!(
+            went,
+            vec![false; 4],
+            "down with a drift across: the page's, every step"
+        );
+    }
+
+    #[test]
     fn a_gesture_begun_elsewhere_goes_on_over_the_page() {
         use Phase::*;
         let none = |_| ScrollChain::default();

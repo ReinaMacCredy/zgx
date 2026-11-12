@@ -8,7 +8,8 @@ Builds the scroll_chain_probe example and runs it. Over a page that fits,
 with no chain, the page keeps a gesture and the view under it stays; chaining
 every way, the view scrolls. Over a page taller than its box, chaining as its
 edges say, the page scrolls and the view stays until the page is at its
-bottom, and then the view scrolls on.
+bottom, and then the view scrolls on; a gesture back up then scrolls the
+page.
 
 The scrolls go to the probe's own window (`-[NSWindow sendEvent:]`): the
 user's trackpad and other apps hear nothing. It is launched as a direct
@@ -60,6 +61,8 @@ def main():
         'chaining every way, the view scrolls': (view('fits') or 0) > 100,
         'a taller page scrolls itself first': (page('inside') or 0) > 100 and view('inside') == 0,
         'at its bottom the view scrolls on': (page('edge') or 0) >= 700 and (view('edge') or 0) > 50,
+        'the page left mid-gesture scrolls back up': page('back') is not None
+        and page('back') < (page('edge') or 0) - 100 and view('back') == 0,
         'done': 'CHAIN_DONE' in out,
     }
     print('\n'.join(line for line in out.splitlines() if re.match(r'(STEP|VIEW|PAGE) ', line)))

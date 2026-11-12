@@ -1204,7 +1204,8 @@ over a page in a zgx scroll view (`WebView::set_scroll_chain`): a page that
 fits, with no chain, keeps the gesture and the view stays; chaining every
 way, the view scrolls; a page four times its box, chaining as its edges say
 (it posts them as it scrolls), scrolls itself and the view stays, and a
-longer gesture scrolls it to its bottom and then the view on. Passed on
+longer gesture scrolls it to its bottom and then the view on, and then one back
+up scrolls the page (left mid-gesture by the last). Passed on
 macOS 26 (M5), 2026-11-13.
 
 ## macOS window deactivation and return

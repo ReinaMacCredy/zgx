@@ -11,7 +11,9 @@
 //! - `inside`: a page four times its box, chaining as its edges say (it
 //!   posts them as it scrolls): the page scrolls, the view stays;
 //! - `edge`: a longer gesture: the page scrolls to its bottom, then the
-//!   view scrolls on.
+//!   view scrolls on;
+//! - `back`: the view back at its top, a gesture toward the top: the page
+//!   (left mid-gesture by the last one) scrolls back up.
 //!
 //! It prints `STEP <name>` as each gesture starts, `VIEW <offset>` and
 //! `PAGE <scrollY>` after each, and `CHAIN_DONE` at the end.
@@ -70,15 +72,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _edges = edges;
                 let pause = |ms| zgx::timer::sleep(Duration::from_millis(ms));
                 pause(2500).await;
-                let steps: [(&str, f64, usize); 4] = [
+                let steps: [(&str, f64, usize); 5] = [
                     ("kept", -14., 15),
                     ("fits", -14., 15),
                     ("inside", -14., 12),
                     ("edge", -40., 30),
+                    ("back", 14., 12),
                 ];
                 for (name, delta, count) in steps {
                     match name {
                         "fits" => web.set_scroll_chain(ScrollChain::ALL),
+                        "back" => {
+                            offset.set(0.);
+                            pause(300).await;
+                        }
                         "inside" => {
                             web.set_scroll_chain(ScrollChain::default());
                             offset.set(0.);

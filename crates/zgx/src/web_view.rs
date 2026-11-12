@@ -547,13 +547,15 @@ impl ScrollChain {
         right: true,
     };
     /// Whether a scroll by `(dx, dy)` (toward the page's right and bottom,
-    /// as zgx's wheel deltas) goes on, by the axis it moves along most;
+    /// as zgx's wheel deltas) goes on: by its vertical part when it has one
+    /// (a trackpad's vertical scroll drifts sideways, and a page at its top
+    /// with nothing to scroll across must keep it), else its horizontal;
     /// `None` for one that moves nothing.
     pub fn passes(&self, dx: f64, dy: f64) -> Option<bool> {
-        if dx.abs() >= dy.abs() && dx != 0. {
-            Some(if dx > 0. { self.right } else { self.left })
-        } else if dy != 0. {
+        if dy != 0. {
             Some(if dy > 0. { self.down } else { self.up })
+        } else if dx != 0. {
+            Some(if dx > 0. { self.right } else { self.left })
         } else {
             None
         }
@@ -1294,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scroll_goes_on_along_the_axis_it_moves_most_where_the_page_hands_it_on() {
+    fn a_scroll_goes_on_by_its_vertical_part_where_the_page_hands_it_on() {
         let runtime = crate::reactive::Runtime::new();
         let web = WebView::new(&runtime, WebViewOptions::default());
         assert_eq!(
@@ -1313,7 +1315,12 @@ mod tests {
         assert_eq!(chain.passes(0., -12.), Some(true), "up, past the top");
         assert_eq!(chain.passes(0., 12.), Some(false), "down, into the page");
         assert_eq!(chain.passes(3., 12.), Some(false), "mostly down");
-        assert_eq!(chain.passes(-12., 3.), Some(true), "mostly left");
+        assert_eq!(
+            chain.passes(-12., 3.),
+            Some(false),
+            "mostly left, a little down: the page's"
+        );
+        assert_eq!(chain.passes(-12., 0.), Some(true), "left alone");
         assert_eq!(chain.passes(0., 0.), None, "nothing moved");
         assert_eq!(ScrollChain::default().passes(0., -12.), Some(false));
         assert_eq!(ScrollChain::ALL.passes(0., 12.), Some(true));
