@@ -775,3 +775,52 @@ fn an_anchored_preview_hangs_below_the_pointer_centred() {
     up(&ui, 150., 100.);
     view.unmount();
 }
+#[test]
+fn a_preview_kept_in_the_window_moves_to_its_own_past_it() {
+    for in_window in [false, true] {
+        let mut ui = Ui::new(400., 300.);
+        ui.set_popup_screens(vec![zgx::scene::Rect::new(0., 0., 1000., 800.)]);
+        ui.set_popup_previews(true);
+        let source = div()
+            .size(100., 80.)
+            .on_drag(|| Card(1))
+            .drag_preview(|_: &Card| div().size(100., 80.));
+        let source = if in_window {
+            source.drag_preview_in_window()
+        } else {
+            source
+        };
+        let view = ui.mount(source);
+        ui.prepare_frame();
+        down(&ui, 20., 30.);
+        moved(&ui, 150., 100.);
+        let preview = ui.input.drag_state().and_then(|d| d.preview).unwrap();
+        let popup = |ui: &Ui| ui.scene.borrow().is_popup(preview);
+        let origin = |ui: &Ui| ui.input.drag_state().and_then(|d| d.preview_origin);
+        assert_eq!(popup(&ui), !in_window);
+        if in_window {
+            let at = ui.scene.borrow().bounds(preview);
+            assert_eq!(
+                (at.x, at.y),
+                (130., 70.),
+                "drawn in the window, at the grab point"
+            );
+            assert_eq!(origin(&ui), None);
+        }
+        ui.input.set_drag_away(&ui.scene, true);
+        ui.prepare_frame();
+        assert!(popup(&ui), "past the window, in one of its own");
+        moved(&ui, 500., 120.);
+        assert_eq!(origin(&ui), Some((480., 90.)));
+        ui.input.set_drag_away(&ui.scene, false);
+        ui.prepare_frame();
+        assert_eq!(popup(&ui), !in_window, "back over the window");
+        moved(&ui, 160., 110.);
+        if in_window {
+            let at = ui.scene.borrow().bounds(preview);
+            assert_eq!((at.x, at.y), (140., 80.));
+        }
+        up(&ui, 160., 110.);
+        view.unmount();
+    }
+}

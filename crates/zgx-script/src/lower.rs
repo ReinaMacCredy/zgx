@@ -6145,6 +6145,38 @@ fn with_drag(
                 build,
             ),
         };
+        if events.drag_preview_in_window {
+            view = view.drag_preview_in_window();
+        }
+    }
+    if let Some(moved) = events.drag_move.clone() {
+        let vm = vm.clone();
+        view = view.on_event(move |cx| {
+            if cx.phase != EventPhase::Target {
+                return;
+            }
+            let InputEvent::Drag(event) = &cx.event else {
+                return;
+            };
+            if !matches!(event.phase, DragPhase::Start | DragPhase::Move) {
+                return;
+            }
+            let Some(payload) = event.payload.downcast_ref::<Value>() else {
+                return;
+            };
+            let Ok(at) = vm.lua.create_table() else {
+                return;
+            };
+            for (key, value) in [
+                ("x", event.x),
+                ("y", event.y),
+                ("grab_x", event.grab_x),
+                ("grab_y", event.grab_y),
+            ] {
+                let _ = at.set(key, value);
+            }
+            call(&vm, &moved, (payload.clone(), at));
+        });
     }
     if let Some(end) = events.drag_end.clone() {
         let vm = vm.clone();

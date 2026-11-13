@@ -968,6 +968,12 @@ pub(crate) struct Events {
     /// pointer, rather than the preview at the grab point.
     pub drag_preview_anchor: Option<(f32, f32)>,
     pub drag_preview_offset: Option<(f32, f32)>,
+    /// `drag_preview_in_window = true`: the preview is drawn in the window
+    /// while the pointer is over it (`View::drag_preview_in_window`).
+    pub drag_preview_in_window: bool,
+    /// `on_drag_move(payload, { x, y, grab_x, grab_y })` on the source as
+    /// its drag starts and as the pointer moves.
+    pub drag_move: Option<Function>,
     pub drag_end: Option<Function>,
     /// `drag_export(payload) -> { text, url, files }`: what the drag carries
     /// to other apps as it leaves the window (macOS).
@@ -1069,6 +1075,8 @@ impl Events {
         drag_preview: None,
         drag_preview_anchor: None,
         drag_preview_offset: None,
+        drag_preview_in_window: false,
+        drag_move: None,
         drag_end: None,
         drag_export: None,
         drag_outside: None,
@@ -3889,6 +3897,7 @@ fn set_handler(
                 | "drag_preview"
                 | "drag_preview_anchor"
                 | "drag_preview_offset"
+                | "drag_preview_in_window"
                 | "drop_when"
                 | "drag_export"
                 | "drag_moves_window"
@@ -3900,6 +3909,10 @@ fn set_handler(
     let events = events.get_or_insert_default();
     if key == "zoomable" {
         events.zoomable = Some(expect_state(&value, "`zoomable`")?);
+        return Ok(None);
+    }
+    if key == "drag_preview_in_window" {
+        events.drag_preview_in_window = value.as_boolean().unwrap_or(false);
         return Ok(None);
     }
     if let "drag_preview_anchor" | "drag_preview_offset" = key {
@@ -3980,15 +3993,16 @@ fn set_handler(
             events.context_menu = Some(f);
             return Ok(None);
         }
-        "on_drag" | "drag_preview" | "on_drag_end" | "drag_export" | "on_drag_outside"
-        | "drag_moves_window" | "on_drop" | "drop_when" | "on_drag_over" | "on_drag_leave"
-        | "on_drag_spring" => {
+        "on_drag" | "drag_preview" | "on_drag_move" | "on_drag_end" | "drag_export"
+        | "on_drag_outside" | "drag_moves_window" | "on_drop" | "drop_when" | "on_drag_over"
+        | "on_drag_leave" | "on_drag_spring" => {
             let mlua::Value::Function(f) = value else {
                 return Err(mlua::Error::runtime(format!("{key} takes a function")));
             };
             *match key {
                 "on_drag" => &mut events.drag,
                 "drag_preview" => &mut events.drag_preview,
+                "on_drag_move" => &mut events.drag_move,
                 "on_drag_end" => &mut events.drag_end,
                 "drag_export" => &mut events.drag_export,
                 "on_drag_outside" => &mut events.drag_outside,

@@ -154,7 +154,20 @@ impl View {
         self.rare_mut().drag_preview = Some(PreviewBuilder {
             build: Box::new(move |payload| payload.downcast_ref::<T>().map(&mut build)),
             place,
+            in_window: false,
         });
+        self
+    }
+    /// Keep the preview in the window, drawn with each of its frames, while
+    /// the pointer is over the window: what it shows can ease, change shape
+    /// and move within it as the drag goes, as an app's own drag ghost does.
+    /// Past the window it shows in a window of its own, as other previews
+    /// do (where the host gives previews one), and back over it, in the
+    /// window again. Call it after `drag_preview`.
+    pub fn drag_preview_in_window(mut self) -> Self {
+        if let Some(preview) = &mut self.rare_mut().drag_preview {
+            preview.in_window = true;
+        }
         self
     }
     /// What the drag carries to other apps (text, links, files, images),
@@ -247,6 +260,9 @@ pub(crate) struct PreviewBuilder {
     /// Its anchor (fractions of its size) and that anchor's offset from the
     /// pointer; `None`: its top-left at the pointer minus the grab point.
     place: Option<((f32, f32), (f32, f32))>,
+    /// Shown in the window while the pointer is over it
+    /// (`View::drag_preview_in_window`).
+    in_window: bool,
 }
 struct Preview(Option<ViewHandle>);
 impl Drop for Preview {
@@ -302,6 +318,19 @@ pub(crate) fn mount(ui: &mut Ui, source: NodeId, mut builder: PreviewBuilder) {
                 ui.input.set_drag_preview(None);
             }
             _ => {}
+        }
+        if let Some(view) = &preview.0
+            && builder.in_window
+            && ui.popup_previews()
+        {
+            let away = ui.input.drag_state().is_some_and(|drag| drag.away);
+            let node = view.node();
+            if away != ui.scene.borrow().is_popup(node) {
+                ui.scene.borrow_mut().set_popup(node, away);
+                if !away {
+                    ui.input.set_drag_preview_origin(None);
+                }
+            }
         }
         if let Some(view) = &preview.0 {
             let (x, y) = match builder.place {

@@ -27,6 +27,8 @@ on_drag: (() -> any)?
 drag_preview: ((payload: any) -> Node)?
 drag_preview_anchor: { number }?
 drag_preview_offset: { number }?
+drag_preview_in_window: boolean?
+on_drag_move: ((payload: any, e: { x, y, grab_x, grab_y }) -> ())?
 on_drag_end: ((payload: any, accepted: boolean) -> ())?
 drag_export: ((payload: any) -> DragExport?)?
 on_drag_outside: ((payload: any, e: { x, y, grab_x, grab_y }) -> ())?
@@ -66,6 +68,8 @@ on_drag_spring: ((payload: any) -> boolean?)?
 | `on_drag` | nothing; returns the payload | the pointer moves past the system's drag threshold from a press on it (4 points until the desktop gives its own, GTK's 8 on Linux): a drag starts, carrying what it returns (any plain value). A button or other clickable inside it covering at least three quarters of the node doesn't stop this: moved, the press drags and doesn't click, and let go without moving, it clicks. A smaller one keeps its press, as a tab's close button does |
 | `drag_preview` | the payload; returns a node | what follows the pointer while it drags |
 | `drag_preview_anchor`, `drag_preview_offset` | (values) `{ x, y }` | where the preview goes: its point `anchor` (fractions of its size; `{ 0.5, 0 }` its top middle) `offset` points from the pointer. `{ 0.5, 0 }` with `{ 0, 16 }` hangs it below the pointer, centred, so what the drag is over stays in view; without either, the grab point stays under the pointer |
+| `drag_preview_in_window` | (value) `true` | the preview is drawn in the window, with its frames, while the pointer is over the window: what it shows can ease, change shape and move within it (an app's own drag ghost). Past the window it shows in a window of its own, as other previews do on macOS and Windows |
+| `on_drag_move` | the payload, `{ x, y, grab_x, grab_y }` | the drag starts, and the pointer moves (on the source): where the pointer is in the window, and where the source was held |
 | `on_drag_end` | the payload, whether it was dropped on a destination | the drag ends |
 | `drag_export` | the payload; returns `{ text, url, files }` | the drag leaves the window: other apps take what it returns (macOS) |
 | `on_drag_outside` | the payload, `{ x, y, grab_x, grab_y }` | released outside every window of the app (macOS): a tab torn off its window; its preview goes rather than sliding back |

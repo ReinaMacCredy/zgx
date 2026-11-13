@@ -2717,6 +2717,11 @@ export type NodeProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: { number }?,
 	drag_preview_offset: { number }?,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: boolean?,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: ((payload: any, e: { x: number, y: number, grab_x: number, grab_y: number }) -> ...unknown)?,
 	on_drag_end: ((payload: any, accepted: boolean) -> ...unknown)?,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -3148,6 +3153,11 @@ export type Props = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -3425,6 +3435,8 @@ export type Props_on_drag = (() -> any)?
 export type Props_drag_preview = ((payload: any) -> Node)?
 export type Props_drag_preview_anchor = { number }?
 export type Props_drag_preview_offset = { number }?
+export type Props_drag_preview_in_window = boolean?
+export type Props_on_drag_move = ((payload: any, e: { x: number, y: number, grab_x: number, grab_y: number }) -> ...unknown)?
 export type Props_on_drag_end = ((payload: any, accepted: boolean) -> ...unknown)?
 export type Props_drag_export = ((payload: any) -> DragExport?)?
 export type Props_on_drag_outside = ((payload: any, e: { x: number, y: number, grab_x: number, grab_y: number }) -> ...unknown)?
@@ -3829,6 +3841,11 @@ export type ContainerProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -4274,6 +4291,11 @@ export type GlassProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -4728,6 +4750,11 @@ export type ScrollProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -5199,6 +5226,11 @@ export type TextProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -5629,6 +5661,11 @@ export type MarkdownViewProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -6146,6 +6183,11 @@ export type RichProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -6570,6 +6612,11 @@ export type ImageProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -7011,6 +7058,11 @@ export type SvgProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -7563,6 +7615,11 @@ export type Scene3DProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -8010,6 +8067,11 @@ export type CanvasProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -8466,6 +8528,11 @@ export type CheckboxProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -8900,6 +8967,11 @@ export type InputProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -9440,6 +9512,11 @@ export type ProgressProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -9862,6 +9939,11 @@ export type SliderProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -10305,6 +10387,11 @@ export type SegmentedProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -10741,6 +10828,11 @@ export type StepperProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -11178,6 +11270,11 @@ export type DisclosureProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -11626,6 +11723,11 @@ export type AccordionProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -12048,6 +12150,11 @@ export type SectionProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -12495,6 +12602,11 @@ export type SeparatorProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -12925,6 +13037,11 @@ export type TabsProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -13377,6 +13494,11 @@ export type TreeProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -13825,6 +13947,11 @@ export type DataGridProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -14269,6 +14396,11 @@ export type CalendarProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -14706,6 +14838,11 @@ export type DatePickerProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -15141,6 +15278,11 @@ export type TimeFieldProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -15575,6 +15717,11 @@ export type ComboboxProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -16017,6 +16164,11 @@ export type CommandPaletteProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -16447,6 +16599,11 @@ export type SelectProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -16884,6 +17041,11 @@ export type SplitProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -17377,6 +17539,11 @@ export type ListProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -17901,6 +18068,11 @@ export type LayerProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -18345,6 +18517,11 @@ export type ModalProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -18807,6 +18984,11 @@ export type PopoverProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -19277,6 +19459,11 @@ export type MenuItemProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -19710,6 +19897,11 @@ export type SubmenuProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -20157,6 +20349,11 @@ export type WebViewProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -20616,6 +20813,11 @@ export type TerminalProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -21041,6 +21243,11 @@ export type GpuViewProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -21467,6 +21674,11 @@ export type SlotProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -21943,6 +22155,11 @@ export type EachOptions = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.
@@ -22383,6 +22600,11 @@ export type PresenceOptions = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: Props_drag_preview_anchor,
 	drag_preview_offset: Props_drag_preview_offset,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: Props_drag_preview_in_window,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: Props_on_drag_move,
 	on_drag_end: Props_on_drag_end,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.

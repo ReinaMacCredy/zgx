@@ -327,6 +327,8 @@ impl InputDispatcher {
         if away && let Some(id) = drag.destination.filter(|id| scene.borrow().contains(*id)) {
             self.route(scene, id, drag.event(DragPhase::Leave, false));
         }
+        // A preview kept in the window goes to one of its own past it.
+        self.to_source(scene, drag.source, drag.event(DragPhase::Move, false));
     }
     /// Another window's drag carrying `payload` is at window point `(x, y)`
     /// here: destinations here hear it over them (`DragEvent::visiting`).

@@ -2510,6 +2510,11 @@ export type NodeProps = {
 	-- it keeps the grab point under the pointer.
 	drag_preview_anchor: { number }?,
 	drag_preview_offset: { number }?,
+	-- The preview drawn in the window while the pointer is over it, so
+	-- what it shows can ease and move; past the window, in one of its own.
+	drag_preview_in_window: boolean?,
+	-- On the source as its drag starts and as the pointer moves.
+	on_drag_move: ((payload: any, e: { x: number, y: number, grab_x: number, grab_y: number }) -> ...unknown)?,
 	on_drag_end: ((payload: any, accepted: boolean) -> ...unknown)?,
 	-- What the drag carries to other apps as it leaves the window (macOS):
 	-- Finder takes files, Mail text, a browser links.

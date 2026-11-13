@@ -1288,3 +1288,49 @@ fn a_host_gpu_view_shows_where_a_script_names_it_and_goes_when_cleared() {
     assert_eq!(frame(&mut h), None);
     assert_eq!(h.host.error().get(), None);
 }
+
+#[test]
+fn a_drag_source_hears_where_the_pointer_goes() {
+    use zgx::input::{InputEvent, PointerButton};
+    let mut h = Harness::inline(
+        r##"local log = ui.state("log", "")
+        return ui.column {
+            ui.div {
+                id = "source", w = 80, h = 40,
+                on_drag = function() return "card" end,
+                drag_preview = function() return ui.div { w = 80, h = 40 } end,
+                drag_preview_in_window = true,
+                on_drag_move = function(payload, e)
+                    log:set(`{payload} {e.x},{e.y} {e.grab_x},{e.grab_y}`)
+                end,
+            },
+            ui.text { "{log}", id = "log" },
+        }"##,
+    );
+    let b = h.bounds("source");
+    let (sx, sy) = (b.x + 10., b.y + 5.);
+    h.ui.dispatch(InputEvent::PointerMove { x: sx, y: sy });
+    h.ui.dispatch(InputEvent::PointerDown {
+        x: sx,
+        y: sy,
+        button: PointerButton::Primary,
+    });
+    h.ui.dispatch(InputEvent::PointerMove {
+        x: sx + 30.,
+        y: sy + 40.,
+    });
+    h.ui.dispatch(InputEvent::PointerMove {
+        x: sx + 50.,
+        y: sy + 60.,
+    });
+    h.settle();
+    assert_eq!(
+        h.text("log"),
+        format!("card {},{} 10,5", sx + 50., sy + 60.)
+    );
+    h.ui.dispatch(InputEvent::PointerUp {
+        x: sx + 50.,
+        y: sy + 60.,
+        button: PointerButton::Primary,
+    });
+}
