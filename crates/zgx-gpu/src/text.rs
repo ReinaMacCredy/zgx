@@ -426,7 +426,10 @@ impl ShapedText {
             for glyph in run.glyphs {
                 let start = offset + glyph.start;
                 let end = offset + glyph.end;
-                if cursor.byte_index < start || cursor.byte_index > end {
+                if glyph.metadata == usize::MAX
+                    || cursor.byte_index < start
+                    || cursor.byte_index > end
+                {
                     continue;
                 }
                 let cluster = &self.text[start..end];
@@ -658,10 +661,12 @@ impl zgx::text_layout::TextLayout for ShapedText {
         let mut lines = Vec::new();
         for run in self.buffer.layout_runs() {
             let offset = self.line_offsets[run.line_i];
-            // (start, end, x, width, right to left), by start.
+            // (start, end, x, width, right to left), by start; not a
+            // truncation's ellipsis, whose bytes aren't the source's.
             let mut clusters: Vec<(usize, usize, f32, f32, bool)> = run
                 .glyphs
                 .iter()
+                .filter(|g| g.metadata != usize::MAX)
                 .map(|g| (offset + g.start, offset + g.end, g.x, g.w, g.level.is_rtl()))
                 .collect();
             #[cfg(test)]
@@ -724,7 +729,7 @@ impl zgx::text_layout::TextLayout for ShapedText {
         let mut clusters: Vec<(usize, usize, f32, f32, bool)> = Vec::new();
         for run in self.buffer.layout_runs() {
             let offset = self.line_offsets[run.line_i];
-            for glyph in run.glyphs {
+            for glyph in run.glyphs.iter().filter(|g| g.metadata != usize::MAX) {
                 clusters.push((
                     offset + glyph.start,
                     offset + glyph.end,
@@ -2170,6 +2175,43 @@ mod rich_tests {
                 .count()
                 > 2
         );
+    }
+    /// An ellipsized text's carets come from its source, never its `…`:
+    /// cut short, the ellipsis's three bytes run past a short source's end
+    /// or into one of its characters, and slicing the source by them
+    /// panicked (accessibility reads every text's carets each frame).
+    #[test]
+    fn an_ellipsized_texts_carets_skip_its_ellipsis() {
+        use zgx::text_layout::{TextLayout, TextOptions, TextOverflow};
+        let mut fonts = FontSystem::new();
+        for text in ["ab", "日a", "Tạo ちゃん｜PSD", "a\u{301}b"] {
+            let rich = RichText::new(
+                text,
+                vec![TextRun {
+                    range: 0..text.len(),
+                    font_size: 20.,
+                    ..Default::default()
+                }],
+            )
+            .unwrap()
+            .with_options(TextOptions {
+                overflow: TextOverflow::Ellipsis,
+                line_clamp: None,
+            });
+            for width in 1..60 {
+                let layout = ShapedText::with_runs(&mut fonts, &rich, Some(width as f32));
+                for line in layout.line_carets(text).expect("its own text") {
+                    assert!(line.range.end <= text.len(), "{text:?} at {width}");
+                }
+                let bounds: Vec<usize> = (0..=text.len())
+                    .filter(|i| text.is_char_boundary(*i))
+                    .collect();
+                assert_eq!(layout.carets_x(&bounds).len(), bounds.len());
+                for at in bounds {
+                    TextLayout::caret(&layout, at);
+                }
+            }
+        }
     }
     /// A clamped text is cut where halving its last row from the start
     /// cut it: the same glyphs, in the same places, whatever its width,
