@@ -276,10 +276,11 @@ pub(super) fn browsers(key: &Key, modifiers: Modifiers) -> bool {
     }
     let ctrl_only = control && !alt;
     match key {
-        Key::Character(c) if ctrl_only => matches!(
-            c.to_ascii_lowercase().as_str(),
-            "c" | "x" | "v" | "a" | "z" | "y"
-        ),
+        Key::Character(c) if ctrl_only => match c.to_ascii_lowercase().as_str() {
+            "v" | "z" => true,
+            "c" | "x" | "a" | "y" => !shift,
+            _ => false,
+        },
         Key::Insert => (ctrl_only && !shift) || (shift && !control && !alt),
         Key::Delete => shift && !control && !alt,
         _ => false,
@@ -415,6 +416,7 @@ mod tests {
             (c("c"), ctrl()),
             (c("V"), ctrl()),
             (c("z"), shift(ctrl())),
+            (c("V"), shift(ctrl())),
             (Key::Insert, shift(Modifiers::default())),
         ] {
             assert!(browsers(&key, modifiers), "{key:?} {modifiers:?}");
@@ -424,6 +426,8 @@ mod tests {
             (c("p"), ctrl()),
             (c("r"), ctrl()),
             (c("i"), shift(ctrl())),
+            (c("C"), shift(ctrl())),
+            (c("a"), shift(ctrl())),
             (c("="), ctrl()),
             (c("0"), ctrl()),
             (Key::Function(3), Modifiers::default()),
