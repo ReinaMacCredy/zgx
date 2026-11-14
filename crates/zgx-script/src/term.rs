@@ -444,6 +444,8 @@ impl UserData for TermUd {
         });
         // Whether closing would end something other than an idle shell.
         methods.add_method("needs_confirm", |_, t, ()| Ok(t.term.needs_confirm_close()));
+        // Whether a paste reaches the program as one block; nil when unknown.
+        methods.add_method("bracketed_paste", |_, t, ()| Ok(t.term.bracketed_paste()));
         methods.add_method("close", |_, t, ()| {
             match t.terms.upgrade() {
                 Some(terms) => terms.remove(&t.id),

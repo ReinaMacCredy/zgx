@@ -1555,6 +1555,10 @@ declare extern type Term with
 	function binding(self, action: string): ()
 	-- Whether closing would end something other than an idle shell.
 	function needs_confirm(self): boolean
+	-- Whether the program turned bracketed paste on (shells do at their
+	-- prompt), so a paste reaches it as one block rather than as typed
+	-- lines; nil before it shows, or where the platform can't tell.
+	function bracketed_paste(self): boolean?
 	-- A picture of what it shows now, at most `max_width` pixels wide (480
 	-- if not given): the `src` of a `ui.image` showing it, replaced on each
 	-- call; nil before it shows, or where the platform takes none.

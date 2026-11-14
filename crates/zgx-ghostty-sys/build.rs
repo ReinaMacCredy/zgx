@@ -8,7 +8,8 @@
 //! starts without login(1)'s "Last login" banner. And it cuts, rather than
 //! wraps, the background-only cells at the end of a row that narrows (the
 //! spaces TUIs fill their rows with), so resizing leaves no stub rows of
-//! background. Builds are cached across targets and checkouts in
+//! background. And `ghostty_surface_bracketed_paste` tells whether the
+//! program turned bracketed paste on. Builds are cached across targets and checkouts in
 //! `~/Library/Caches/zgx-ghostty` (or `$ZGX_GHOSTTY_CACHE`).
 //!
 //! `ZIG` picks the Zig executable (default: Homebrew's `zig@0.16`, then

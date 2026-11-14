@@ -1788,6 +1788,9 @@ unsafe extern "C" {
     pub fn ghostty_surface_needs_confirm_quit(arg1: ghostty_surface_t) -> bool;
 }
 unsafe extern "C" {
+    pub fn ghostty_surface_bracketed_paste(arg1: ghostty_surface_t) -> bool;
+}
+unsafe extern "C" {
     pub fn ghostty_surface_process_exited(arg1: ghostty_surface_t) -> bool;
 }
 unsafe extern "C" {

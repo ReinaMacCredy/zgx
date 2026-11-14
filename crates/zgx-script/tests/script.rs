@@ -848,4 +848,41 @@ fn editing_an_image_file_reloads_it() {
         "read again, not the cached copy"
     );
     assert!(!h.host.reload_if_changed(), "and seen once");
+    std::fs::remove_file(&icon).unwrap();
+    assert!(!h.host.reload_if_changed(), "a file gone leaves what was read");
+    assert!(std::sync::Arc::ptr_eq(&blue, &svg(&mut h)));
+    rewrite(&icon, &square("green"));
+    assert!(h.host.reload_if_changed(), "and one come back is seen");
+}
+
+#[test]
+fn a_picture_no_node_shows_changing_reloads_nothing() {
+    let path = temp_script(
+        "asset_idle",
+        r#"local shown = ui.state("shown", true)
+        return ui.column {
+            ui.button { id = "toggle", w = 80, h = 30, on_click = ui.toggle(shown) },
+            ui.show(shown, ui.svg { id = "icon", src = "icon.svg", w = 20, h = 20 }),
+        }"#,
+    );
+    let icon = path.with_file_name("icon.svg");
+    let square = |fill: &str| {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="{fill}"/></svg>"#
+        )
+    };
+    rewrite(&icon, &square("red"));
+    let mut h = Harness::new(|runtime| ScriptHost::new(runtime, &path));
+    assert!(h.find("icon").is_some());
+    h.click("toggle");
+    h.settle();
+    assert!(h.find("icon").is_none());
+    rewrite(&icon, &square("blue"));
+    assert!(!h.host.reload_if_changed(), "no node shows it");
+    std::fs::remove_file(&icon).unwrap();
+    assert!(!h.host.reload_if_changed());
+    rewrite(&icon, &square("green"));
+    h.click("toggle");
+    h.settle();
+    assert!(h.find("icon").is_some(), "shown again, read again");
 }

@@ -2336,6 +2336,14 @@ impl TerminalBackend for MacTerminal {
         }
         unsafe { g::ghostty_surface_needs_confirm_quit(surface) }
     }
+    fn bracketed_paste(&self) -> Option<bool> {
+        let surface = self.view.ivars().surface.get();
+        if surface.is_null() {
+            return None;
+        }
+        // SAFETY: non-null so live (`free` nulls it first); main thread.
+        Some(unsafe { g::ghostty_surface_bracketed_paste(surface) })
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }

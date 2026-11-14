@@ -271,10 +271,14 @@ impl Assets {
         }
         idle.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         let (mut kept, mut freed) = (0, 0);
+        let mut files = self.files.try_borrow_mut().ok();
         for (_, bytes, image, src) in idle {
             if kept + bytes <= budget {
                 kept += bytes;
                 continue;
+            }
+            if let Some(files) = files.as_mut() {
+                files.remove(&src);
             }
             match image {
                 true => drop(images.remove(&src)),
@@ -423,22 +427,43 @@ impl Assets {
             .collect()
     }
     /// Forgets the files edited since they were read, so the next build
-    /// reads them again; whether there were any. Only stats files.
+    /// reads them again; whether a reload must. A picture no node shows is
+    /// only forgotten, and a file gone leaves what was read showing until
+    /// one comes back (a cache clearing its own files): neither reloads.
+    /// Only stats files.
     pub fn changed(&self) -> bool {
-        let stale: Vec<String> = self
-            .files
-            .borrow()
-            .iter()
-            .filter(|(_, (path, modified))| {
-                std::fs::metadata(path).and_then(|m| m.modified()).ok() != *modified
-            })
-            .map(|(src, _)| src.clone())
-            .collect();
+        let mut reload = false;
+        let mut stale = Vec::new();
+        self.files.borrow_mut().retain(|src, (path, modified)| {
+            let now = std::fs::metadata(&*path).and_then(|m| m.modified()).ok();
+            if now == *modified {
+                return true;
+            }
+            let idle = self.idle(src);
+            if now.is_none() && !idle {
+                *modified = None;
+                return true;
+            }
+            reload |= !idle;
+            stale.push(src.clone());
+            false
+        });
         for src in &stale {
-            self.files.borrow_mut().remove(src);
             self.forget(src);
         }
-        !stale.is_empty()
+        reload
+    }
+    /// Whether `src` is a picture cached that no node shows.
+    fn idle(&self, src: &str) -> bool {
+        let image = self.images.try_borrow().ok().and_then(|images| {
+            images.get(src).map(|c| Arc::strong_count(&c.value) == 1)
+        });
+        let svg = self
+            .svgs
+            .try_borrow()
+            .ok()
+            .and_then(|svgs| svgs.get(src).map(|c| Arc::strong_count(&c.value) == 1));
+        image.or(svg).unwrap_or(false)
     }
 }
 

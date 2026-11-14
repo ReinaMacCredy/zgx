@@ -1588,6 +1588,10 @@ impl TerminalBackend for EngineTerminal {
     fn snapshot(&self, max_width: u32) -> Option<std::sync::Arc<zgx::image::ImageData>> {
         self.0.root.borrow().as_ref()?.snapshot(max_width)
     }
+    fn bracketed_paste(&self) -> Option<bool> {
+        self.0
+            .with_session(|session| session.term().mode().contains(TermMode::BRACKETED_PASTE))
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }

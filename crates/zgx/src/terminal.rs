@@ -286,6 +286,11 @@ pub trait TerminalBackend {
     fn needs_confirm_close(&self) -> bool {
         false
     }
+    /// Whether the program turned bracketed paste on, so a paste reaches it
+    /// as one block; `None` where the platform can't tell.
+    fn bracketed_paste(&self) -> Option<bool> {
+        None
+    }
     /// Draw with `colors` from now on: what it shows already (scrollback
     /// too) repaints in them, and each `None` goes back to its own colour.
     fn set_colors(&self, _colors: &TerminalColors) {}
@@ -526,6 +531,14 @@ impl Terminal {
     /// Paste `text`, bracketed when the program asked for bracketed paste.
     pub fn paste(&self, text: impl Into<String>) {
         self.run(TerminalCommand::Paste(text.into()));
+    }
+    /// Whether a paste now reaches the program as one block (it turned
+    /// bracketed paste on, as shells do at their prompt); `None` before a
+    /// platform terminal shows it, or where the platform can't tell. Asked
+    /// when needed, not reactive.
+    pub fn bracketed_paste(&self) -> Option<bool> {
+        let backend = self.0.backend.borrow().clone();
+        backend.and_then(|backend| backend.bracketed_paste())
     }
     /// Run a Ghostty binding action, e.g. `copy_to_clipboard`.
     pub fn binding(&self, action: impl Into<String>) {

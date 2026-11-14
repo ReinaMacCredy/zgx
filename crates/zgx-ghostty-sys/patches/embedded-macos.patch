@@ -32,6 +32,38 @@ index 41ac5f0..274a29d 100644
          }
      }
  
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 5523654..a70196c 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1134,6 +1134,7 @@ GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
+ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+ GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
++GHOSTTY_API bool ghostty_surface_bracketed_paste(ghostty_surface_t);
+ GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index a380dc5..fd01d7d 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1606,6 +1606,15 @@ pub const CAPI = struct {
+         return surface.core_surface.needsConfirmQuit();
+     }
+ 
++    /// Returns true if the program in the terminal turned bracketed paste
++    /// on (mode 2004): a paste then reaches it as one block, not typed lines.
++    export fn ghostty_surface_bracketed_paste(surface: *Surface) bool {
++        const core_surface = &surface.core_surface;
++        core_surface.renderer_state.mutex.lockUncancelable(global.io());
++        defer core_surface.renderer_state.mutex.unlock(global.io());
++        return core_surface.io.terminal.modes.get(.bracketed_paste);
++    }
++
+     /// Returns true if the surface process has exited.
+     export fn ghostty_surface_process_exited(surface: *Surface) bool {
+         return surface.core_surface.child_exited;
 diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
 index 86cfecc..29ee06b 100644
 --- a/src/build/SharedDeps.zig
@@ -229,7 +261,7 @@ index 6ae3210..7af9f90 100644
  
      log.debug("shader library loaded time={}us", .{start.untilNow(global.io(), .awake).toMicroseconds()});
 diff --git a/src/terminal/PageList.zig b/src/terminal/PageList.zig
-index f380bd4..0fbe313 100644
+index f380bd4..77458c4 100644
 --- a/src/terminal/PageList.zig
 +++ b/src/terminal/PageList.zig
 @@ -1658,6 +1658,24 @@ const ReflowCursor = struct {
