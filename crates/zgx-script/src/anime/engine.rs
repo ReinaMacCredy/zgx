@@ -356,6 +356,21 @@ const MOST_BAKED: usize = 300;
 /// have scrolled out of a fade's band).
 #[cfg(target_os = "macos")]
 const OFFER_AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a loop plays frame by frame before it is first offered. One
+/// that comes in comes in with what brought it (a page moving in, a row
+/// sliding), and its sheet drawn then holds one of that move's frames; one
+/// gone before this is never drawn.
+#[cfg(target_os = "macos")]
+const OFFER_FIRST: std::time::Duration = std::time::Duration::from_millis(600);
+/// The least time between two loops offered: two sheets drawn in one frame
+/// hold it twice as long.
+#[cfg(target_os = "macos")]
+const OFFER_APART: std::time::Duration = std::time::Duration::from_millis(150);
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// When a loop was last offered, on this thread.
+    static OFFERED: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
 /// What `consider_baking` knows of a clip.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, PartialEq)]
@@ -477,14 +492,18 @@ impl Clip {
     fn consider_baking(self: &Rc<Self>) {
         if self.baking.get() == Baking::Unknown {
             self.baking.set(match self.can_bake() {
-                true => Baking::From(std::time::Instant::now()),
+                true => Baking::From(std::time::Instant::now() + OFFER_FIRST),
                 false => Baking::Never,
             });
         }
         let Baking::From(from) = self.baking.get() else {
             return;
         };
-        if std::time::Instant::now() < from || !zgx::switches::BAKED_LOOPS.on() || !self.can_bake()
+        let now = std::time::Instant::now();
+        if now < from
+            || OFFERED.get().is_some_and(|at| now < at + OFFER_APART)
+            || !zgx::switches::BAKED_LOOPS.on()
+            || !self.can_bake()
         {
             return;
         }
@@ -492,6 +511,7 @@ impl Clip {
         if let Some(Target::Element(element)) = first
             && element.read(|scene, _| scene.plays_loops()) == Some(true)
         {
+            OFFERED.set(Some(now));
             self.bake(&element);
         }
     }

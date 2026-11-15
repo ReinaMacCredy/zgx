@@ -1425,6 +1425,9 @@ mod baked {
             let h = Harness::inline(&script(code));
             h.ui.scene.borrow().set_plays_loops(true);
             h.frame();
+            // (Offered once it has played a while: `OFFER_FIRST`.)
+            std::thread::sleep(std::time::Duration::from_millis(650));
+            h.frame();
             h.frame();
             h
         }
@@ -1450,6 +1453,19 @@ mod baked {
         let still = h.opacity("box");
         h.run_ms(500.);
         assert_eq!(h.opacity("box"), still, "the engine leaves it alone");
+    }
+
+    #[test]
+    fn a_loop_is_offered_once_it_has_played_a_while() {
+        let h = Harness::inline(&script(&format!(
+            r##"anime.animate("#box", {{ {PULSE} }})"##
+        )));
+        h.ui.scene.borrow().set_plays_loops(true);
+        h.frames(3);
+        assert!(h.baked().is_none(), "ticking as it comes in");
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        h.frames(2);
+        assert!(h.baked().is_some(), "baked once it has played a while");
     }
 
     #[test]
@@ -1553,11 +1569,10 @@ mod baked {
         ] {
             let h = Harness::playing(&format!(
                 r##"local a = anime.animate("#box", {{ {PULSE} }})
-                ui.after(40, function() {stop} end)"##
+                ui.command {{ id = "stop", run = function() {stop} end }}"##
             ));
             assert!(h.baked().is_some(), "{name}: baked first");
-            // (`ui.after` runs in real time.)
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            assert!(h.host.run_command("stop"));
             h.frames(10);
             assert!(h.baked().is_none(), "{name}");
         }
