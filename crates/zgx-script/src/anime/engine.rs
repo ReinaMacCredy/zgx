@@ -24,13 +24,13 @@ pub(crate) fn set_still_skips(skip: bool) {
 pub(crate) fn still_skipped() -> u64 {
     STILL_SKIPPED.with(Cell::get)
 }
+use crate::time::Instant;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     future::{Future, poll_fn},
     rc::{Rc, Weak},
     task::{Poll, Waker},
-    time::Instant,
 };
 use zgx::{frame::FrameClock, reactive::Runtime};
 
@@ -369,7 +369,7 @@ const OFFER_APART: std::time::Duration = std::time::Duration::from_millis(150);
 #[cfg(target_os = "macos")]
 thread_local! {
     /// When a loop was last offered, on this thread.
-    static OFFERED: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    static OFFERED: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 /// What `consider_baking` knows of a clip.
 #[cfg(target_os = "macos")]
@@ -378,7 +378,7 @@ enum Baking {
     /// Not looked at yet.
     Unknown,
     /// A loop that can bake, from this moment.
-    From(std::time::Instant),
+    From(crate::time::Instant),
     Never,
 }
 
@@ -492,14 +492,14 @@ impl Clip {
     fn consider_baking(self: &Rc<Self>) {
         if self.baking.get() == Baking::Unknown {
             self.baking.set(match self.can_bake() {
-                true => Baking::From(std::time::Instant::now() + OFFER_FIRST),
+                true => Baking::From(Instant::now() + OFFER_FIRST),
                 false => Baking::Never,
             });
         }
         let Baking::From(from) = self.baking.get() else {
             return;
         };
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if now < from
             || OFFERED.get().is_some_and(|at| now < at + OFFER_APART)
             || !zgx::switches::BAKED_LOOPS.on()
@@ -624,7 +624,7 @@ impl Clip {
             return;
         };
         self.baking.set(match again {
-            Some(after) => Baking::From(std::time::Instant::now() + after),
+            Some(after) => Baking::From(crate::time::Instant::now() + after),
             None => Baking::Never,
         });
         {

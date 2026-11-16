@@ -331,13 +331,25 @@ pub(crate) struct Estimator {
     /// The list last seen, each row's scan by the row.
     seen: Cell<usize>,
     scanned: RefCell<FxHashMap<usize, Rc<Scanned>>>,
+    /// Folded rows opened for their scans, let go at the next idle: freed
+    /// in a pass, a long list's first would cost a free a row.
+    spent: Rc<RefCell<Vec<Value>>>,
+    _trim: zgx::idle::IdleTrim,
 }
 impl Estimator {
     pub(crate) fn new(
+        runtime: &zgx::reactive::Runtime,
         rule: Rc<Rule>,
         items: Rc<dyn Fn() -> Value>,
         heights: VariableHeights,
     ) -> Self {
+        let spent: Rc<RefCell<Vec<Value>>> = Rc::default();
+        let trim = {
+            let spent = spent.clone();
+            zgx::idle::on_idle(runtime, move || {
+                drop(std::mem::take(&mut *spent.borrow_mut()))
+            })
+        };
         Self {
             rule,
             items,
@@ -345,6 +357,56 @@ impl Estimator {
             width: Cell::new(0.),
             seen: Cell::new(0),
             scanned: RefCell::default(),
+            spent,
+            _trim: trim,
+        }
+    }
+}
+impl Estimator {
+    /// A pass over a list of folded rows (a long transcript's): each row's
+    /// scan kept by the row itself, so it opens once, and opened for that
+    /// scan alone (read through `field`, every row would stay open). Apart,
+    /// so a plain list's pass is what it was; written through `entry`, so
+    /// its `insert` is the plain pass's alone and stays inlined there.
+    #[cold]
+    #[inline(never)]
+    fn folded_rows(
+        &self,
+        rows: &[Value],
+        widened: bool,
+        per_em: &[f32],
+        scanned: &FxHashMap<usize, Rc<Scanned>>,
+        next: &mut FxHashMap<usize, Rc<Scanned>>,
+        updates: &mut Vec<(usize, f32)>,
+    ) {
+        for (index, row) in rows.iter().enumerate() {
+            let at = match row {
+                Value::Folded(folded) => Rc::as_ptr(folded) as usize,
+                _ => crate::value::identity(row),
+            };
+            let known = scanned.get(&at).filter(|_| at != 0).cloned();
+            let new = known.is_none();
+            let scan = known.unwrap_or_else(|| {
+                let opened = row.opened();
+                let scan = Rc::new(Scanned::of(&self.rule, &opened));
+                // Let go at the next idle: freed here, a long list's first
+                // pass would cost a free a row.
+                if let std::borrow::Cow::Owned(opened) = opened {
+                    self.spent.borrow_mut().push(opened);
+                }
+                scan
+            });
+            if new || widened {
+                updates.push((index, scan.height(&self.rule, per_em)));
+            }
+            match next.entry(at) {
+                std::collections::hash_map::Entry::Occupied(mut kept) => {
+                    kept.insert(scan);
+                }
+                std::collections::hash_map::Entry::Vacant(room) => {
+                    room.insert(scan);
+                }
+            }
         }
     }
 }
@@ -374,15 +436,21 @@ impl RowsWatch for Estimator {
             .map(|t| t.size / t.column(width))
             .collect();
         let mut updates = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
-            let at = crate::value::identity(row);
-            let known = scanned.get(&at).filter(|_| at != 0).cloned();
-            let new = known.is_none();
-            let scan = known.unwrap_or_else(|| Rc::new(Scanned::of(&self.rule, row)));
-            if new || widened {
-                updates.push((index, scan.height(&self.rule, &per_em)));
+        // A host's long list of folded rows (its first tells): a pass of
+        // its own. Any other, as it was.
+        if let Some(Value::Folded(_)) = rows.first() {
+            self.folded_rows(rows, widened, &per_em, &scanned, &mut next, &mut updates);
+        } else {
+            for (index, row) in rows.iter().enumerate() {
+                let at = crate::value::identity(row);
+                let known = scanned.get(&at).filter(|_| at != 0).cloned();
+                let new = known.is_none();
+                let scan = known.unwrap_or_else(|| Rc::new(Scanned::of(&self.rule, row)));
+                if new || widened {
+                    updates.push((index, scan.height(&self.rule, &per_em)));
+                }
+                next.insert(at, scan);
             }
-            next.insert(at, scan);
         }
         *scanned = next;
         drop(scanned);

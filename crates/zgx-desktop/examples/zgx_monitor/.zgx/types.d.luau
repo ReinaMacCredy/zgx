@@ -833,7 +833,8 @@ end
 -- `ui.set`, `ui.toggle`, `ui.add`, `ui.action`: a handler Rust runs.
 declare extern type Action with
 end
--- `ui.tween`, `ui.spring`, `ui.loop`: a property eased in Rust.
+-- `ui.tween`, `ui.spring`, `ui.loop`: a property eased in Rust; `ui.map`: one
+-- mapped from a state in Rust.
 declare extern type Binding with
 end
 -- Variants chosen from a `ui.variants` recipe: give it to an element as
@@ -1216,6 +1217,20 @@ declare extern type Element with
 	-- The selection replaced by `text`, as typing it would (one step of
 	-- undo): a search's Replace.
 	function replace_selection(self, text: string): boolean
+	-- An editor's text measured at `width` points, whatever its own size,
+	-- without insets or placeholder: its widest hard line, its height
+	-- wrapped at `width`. Read in an effect, it follows the text, an IME
+	-- composition and typography (`revision`), not focus, selection,
+	-- scrolling or size. Nil for other elements, a password field, one
+	-- not mounted and a width that is not positive and finite.
+	function text_metrics(self, width: number): {
+		width: number,
+		unwrapped_width: number,
+		wrapped_height: number,
+		line_height: number,
+		revision: number,
+		exact: boolean,
+	}?
 	-- A picture of it as the window last showed it, at most `max_width`
 	-- pixels wide (480 if not given): the `src` of an image showing it,
 	-- replaced on each call (each `name`'s on its own, for pictures of it
@@ -22505,6 +22520,12 @@ export type CaseKey = string | number | boolean
 -- Durations are milliseconds, as in `anime`.
 export type TweenEnd = number | string | { number }
 export type TweenOptions = { duration: number?, ease: Easing?, from: TweenEnd?, to: TweenEnd?, [number]: never }
+-- One end of a `ui.map` range: a number, a state, or a function kept
+-- current as what it reads changes.
+export type MapEnd = number | Readable<number> | (() -> number)
+-- `ui.map`: the state's value at `from[1]` gives `to[1]`, at `from[2]`
+-- gives `to[2]`, in a line between; with `clamp`, held within `to`.
+export type MapOptions = { from: { MapEnd }, to: { MapEnd }, clamp: boolean? }
 export type SpringOptions = { stiffness: number?, damping: number?, from: TweenEnd?, to: TweenEnd?, [number]: never }
 export type SpringToOptions = {
 	response: number?,
@@ -22933,6 +22954,10 @@ declare ui: {
 	add: (state: State<number>, by: number?) -> Action,
 	-- The state's truthiness (or number) drives a 0-to-1 scalar, or
 	-- `from` to `to`. Durations are milliseconds, as in `anime`.
+	-- A number mapped from a state in Rust, for a style that follows it
+	-- with no script run as it changes: a scrollbar thumb's `top` from a
+	-- list's offset. A range of no width gives `to[1]`.
+	map: (state: Readable<number>, opts: MapOptions) -> Binding,
 	tween: (state: State<any>, opts: TweenOptions?) -> Binding,
 	spring: (state: State<any>, opts: SpringOptions?) -> Binding,
 	loop: (opts: LoopOptions?) -> Binding,

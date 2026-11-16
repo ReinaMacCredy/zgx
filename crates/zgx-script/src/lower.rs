@@ -27,7 +27,7 @@ use zgx::{
 };
 
 /// A remote source's failures in a row: when the last was, how many, why.
-type Failure = (std::time::Instant, u32, Rc<str>);
+type Failure = (crate::time::Instant, u32, Rc<str>);
 
 /// Decoded images and SVGs by source. What a mounted node shows stays;
 /// of the rest, the most recently shown stay while they fit `budget`, so a
@@ -48,7 +48,7 @@ pub(crate) struct Assets {
     /// watching host sees an edited image (see `changed`).
     files: std::cell::RefCell<HashMap<String, (std::path::PathBuf, Option<std::time::SystemTime>)>>,
     /// Where they are read from: the disk, or the app's bundle.
-    source: std::cell::Cell<Option<crate::Files>>,
+    source: std::cell::RefCell<Option<crate::Files>>,
     /// Remote sources (`https://…`) by `remote_key`: fetched once by each
     /// asking (the app, or a plugin), so each request is its own to allow, and
     /// what comes is shared (`images`, `svgs`). What shows one follows its
@@ -399,17 +399,18 @@ impl Assets {
         *self.links.borrow_mut() = Some((timers, fetcher, policy));
     }
     pub(crate) fn set_files(&self, files: crate::Files) {
-        self.source.set(Some(files));
+        *self.source.borrow_mut() = Some(files);
     }
     /// Where its files come from: the disk, or the app's bundle.
     #[cfg(feature = "gltf")]
     pub(crate) fn source(&self) -> crate::Files {
-        self.source.get().unwrap_or(crate::Files::Disk)
+        self.source.borrow().clone().unwrap_or(crate::Files::Disk)
     }
     /// `src`'s bytes from `path`, the file kept to watch for changes.
     pub(crate) fn read(&self, src: &str, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
         let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        let bytes = match self.source.get() {
+        let source = self.source.borrow().clone();
+        let bytes = match source {
             Some(files) => files.read(path)?,
             None => std::fs::read(path)?,
         };
@@ -1699,7 +1700,7 @@ fn bound_text(cx: &mut Context, value: &Signal<Value>, editor: &LoadedEditor) ->
     }
     let typed = cx.state(value.with_untracked(text_of));
     let runtime = cx.runtime();
-    let edited: Rc<std::cell::Cell<Option<std::time::Instant>>> = Rc::default();
+    let edited: Rc<std::cell::Cell<Option<crate::time::Instant>>> = Rc::default();
     let (v, t, e, loaded) = (value.clone(), typed.clone(), edited.clone(), editor.clone());
     cx.retain(runtime.effect(move || {
         let next = v.with(text_of);
@@ -1721,7 +1722,7 @@ fn bound_text(cx: &mut Context, value: &Signal<Value>, editor: &LoadedEditor) ->
     cx.retain(runtime.effect(move || {
         let next = t.get();
         if !std::mem::take(&mut first) && v.with_untracked(text_of) != next {
-            edited.set(Some(std::time::Instant::now()));
+            edited.set(Some(crate::time::Instant::now()));
             v.set(match next {
                 TextValue::Flat(s) => Value::Str(s.into()),
                 TextValue::Long(t) => Value::Text(t),
@@ -2817,7 +2818,10 @@ fn glass_of(spec: &crate::node::GlassSpec, vm: &Rc<Vm>) -> View {
 fn drive_of(
     shaders: &crate::node::Shaders,
     vm: &Rc<Vm>,
-) -> Option<Box<dyn FnMut() -> zgx::shader_drive::ShaderDrive>> {
+) -> Option<(
+    zgx::shader_drive::ShaderTokens,
+    Box<dyn FnMut() -> zgx::shader_drive::ShaderDrive>,
+)> {
     let vm = vm.clone();
     let props = shaders.drive.as_ref()?;
     let fill = shaders.layer.is_none();
@@ -2827,9 +2831,9 @@ fn drive_of(
     } else {
         props.layer_clock
     };
-    let literal = match fill {
-        true => shaders.params,
-        false => shaders.layer_params,
+    let (literal, tokens) = match fill {
+        true => (shaders.params, shaders.tokens),
+        false => (shaders.layer_params, shaders.layer_tokens),
     };
     let params_of = props.layer_params_of.clone();
     let on = props.layer_on.as_ref().map(resolve_owned);
@@ -2838,7 +2842,7 @@ fn drive_of(
         shaders.layer_reach.unwrap_or(0.),
     );
     let mut last = literal.unwrap_or_default();
-    Some(Box::new(move || {
+    let make: Box<dyn FnMut() -> zgx::shader_drive::ShaderDrive> = Box::new(move || {
         if let Some(f) = &params_of {
             let read = vm.call::<mlua::Value>(f, ()).and_then(|value| {
                 crate::node::shader_params(&vm.lua, &value, "layer_params", None)
@@ -2861,7 +2865,8 @@ fn drive_of(
             frost: 0.,
             running: clock,
         }
-    }))
+    });
+    Some((tokens, make))
 }
 fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
     use zgx::web_view::{WebViewEvent, web_view, web_view_src};
@@ -3956,15 +3961,20 @@ fn build(node: &Rc<Node>, vm: &Rc<Vm>, low: &Rc<Lowering>, mut cx: Option<&mut C
             .then(|| flow(node));
         match &low.hooks {
             None => {
-                view = view.children(node.children.iter().map(|child| {
-                    let mut view = lower(child, low);
+                // Each pushed as `lower` returns it and the vector kept as the
+                // view's (`children_vec`): a view is hundreds of bytes, moved
+                // once more for each through a local, and again by `children`.
+                let mut children: Vec<View> = Vec::with_capacity(node.children.len());
+                for child in &node.children {
+                    children.push(lower(child, low));
                     if let Some(flow) = &flow
                         && child.kind.flows()
+                        && let Some(view) = children.last_mut()
                     {
                         apply_in(view.styles_mut(), flow);
                     }
-                    view
-                }));
+                }
+                view = view.children_vec(children);
             }
             // What plugins add at an element is its sibling, or in its place.
             Some(hooks) => view = hooked_children(view, node, low, hooks, flow.as_deref()),
@@ -4223,10 +4233,14 @@ fn styled(
                         params: *params,
                     });
                     // Theme colours bind to their slots: resolved where the
-                    // node is styled, and again when the theme changes.
+                    // node is styled, and again when the theme changes. A
+                    // driven fill's are the drive's (`shader_drive::attach_themed`):
+                    // in the style they'd put its time back.
                     let mut styles = styles;
                     for (slot, token) in tokens.iter().enumerate() {
-                        if let Some(token) = token {
+                        if let Some(token) = token
+                            && !driven
+                        {
                             styles =
                                 styles.token(zgx::theme::Field::ShaderParam(slot as u8), *token);
                         }
@@ -4284,9 +4298,9 @@ fn styled(
     }
     // Its shader kept up by the engine, once it has its style.
     if let Some(s) = shaders.filter(|s| s.drive.is_some())
-        && let Some(make) = drive_of(s, vm)
+        && let Some((tokens, make)) = drive_of(s, vm)
     {
-        view = zgx::shader_drive::attach(need(&mut cx), view, make);
+        view = zgx::shader_drive::attach_themed(need(&mut cx), view, tokens, make);
     }
     if let Some(disabled) = &node.disabled {
         let (disabled, vm) = (resolve_owned(disabled), vm.clone());
@@ -5363,6 +5377,19 @@ fn remote_status_in(
             Ok(bytes) => {
                 // Decoding a large image takes long enough to drop frames.
                 let (tell, mut heard) = zgx::task::latest::<Result<Decoded, String>>();
+                // No threads in the browser (wasm32): decoded here (there,
+                // only SVGs decode; images show their labels).
+                #[cfg(target_arch = "wasm32")]
+                tell.send(if svg {
+                    SvgData::new(bytes)
+                        .map(|svg| Decoded::Svg(Arc::new(svg)))
+                        .map_err(|e| e.to_string())
+                } else {
+                    crate::gpu::decode_image_kept(Arc::from(bytes))
+                        .map(Decoded::Image)
+                        .map_err(|e| e.to_string())
+                });
+                #[cfg(not(target_arch = "wasm32"))]
                 std::thread::spawn(move || {
                     tell.send(if svg {
                         SvgData::new(bytes)
@@ -5370,7 +5397,7 @@ fn remote_status_in(
                             .map_err(|e| e.to_string())
                     } else {
                         // Its file kept, its pixels decoded as it is drawn.
-                        zgx_gpu::assets::decode_image_kept(Arc::from(bytes))
+                        crate::gpu::decode_image_kept(Arc::from(bytes))
                             .map(Decoded::Image)
                             .map_err(|e| e.to_string())
                     });
@@ -5396,7 +5423,7 @@ fn remote_status_in(
                 // the script's: logged, and `fallback` shows in its place.
                 let _ = vm;
                 eprintln!("zgx: {src} didn't load: {error}");
-                let now = std::time::Instant::now();
+                let now = crate::time::Instant::now();
                 let why: Rc<str> = Rc::from(error.as_str());
                 let times = assets
                     .failed
@@ -5495,7 +5522,7 @@ pub(crate) fn try_load_image_in(
     let decoded = (assets.read(src, &path))
         .map_err(|e| e.to_string())
         .and_then(|bytes| {
-            zgx_gpu::assets::decode_image_kept(Arc::from(bytes)).map_err(|e| e.to_string())
+            crate::gpu::decode_image_kept(Arc::from(bytes)).map_err(|e| e.to_string())
         })
         .map_err(|e| format!("{}: {e}", path.display()));
     match decoded {
@@ -6388,6 +6415,8 @@ enum Owned {
     Computed(mlua::Function, std::cell::Cell<Option<CachedHex>>),
     Anim(Option<Value>, Option<Value>),
     Variant(Rc<crate::variants::Selection>, Prop),
+    /// `ui.map`: computed in Rust from the states it reads, no script run.
+    Map(Rc<crate::node::MapSpec>),
 }
 fn resolve_owned(source: &Source) -> Owned {
     match source {
@@ -6396,6 +6425,7 @@ fn resolve_owned(source: &Source) -> Owned {
         Source::Computed(f) => Owned::Computed(f.clone(), std::cell::Cell::default()),
         Source::Anim(a) => Owned::Anim(a.from.clone(), a.to.clone()),
         Source::Variant(selection, prop) => Owned::Variant(selection.clone(), *prop),
+        Source::Map(spec) => Owned::Map(spec.clone()),
     }
 }
 /// A style's value now. What a function returns is checked by the design
@@ -6488,7 +6518,11 @@ impl LineStates {
             mlua::Value::Number(n) if (0. ..KEPT as f64).contains(n) && *n as u32 as f64 == *n => {
                 Some(*n as u32)
             }
+            #[cfg(not(target_arch = "wasm32"))]
             mlua::Value::Integer(n) if (0..KEPT as i64).contains(n) => Some(*n as u32),
+            // Luau's integer is an `i32` in the browser (wasm32).
+            #[cfg(target_arch = "wasm32")]
+            mlua::Value::Integer(n) if (0..KEPT as i64).contains(&i64::from(*n)) => Some(*n as u32),
             _ => None,
         }
     }
@@ -6520,7 +6554,7 @@ impl LineStates {
     }
     fn value(&self, number: u32) -> mlua::Value {
         if number & KEPT == 0 {
-            return mlua::Value::Integer(number as i64);
+            return mlua::Value::Integer(number as mlua::Integer);
         }
         (self.values.get((number & !KEPT) as usize).cloned()).unwrap_or(mlua::Value::Nil)
     }
@@ -7005,6 +7039,13 @@ fn gradient_of(gradient: &crate::node::GradientLit) -> zgx::decoration::Gradient
         },
     }
 }
+/// `resolve` for a `ui.map`: out of line, as few styles have one, to keep
+/// `resolve` the size it was.
+#[cold]
+#[inline(never)]
+fn mapped(spec: &crate::node::MapSpec, ty: Ty) -> Option<Lit> {
+    lit(&Value::Num(spec.value() as f64), ty)
+}
 fn resolve(source: &Owned, ty: Ty, scalar: Option<&Signal<f32>>, vm: &Vm) -> Option<Lit> {
     match source {
         Owned::Lit(l) => Some(l.clone()),
@@ -7014,6 +7055,8 @@ fn resolve(source: &Owned, ty: Ty, scalar: Option<&Signal<f32>>, vm: &Vm) -> Opt
             .iter()
             .find_map(|(p, l)| (p == prop).then(|| l.clone())),
         Owned::State(s) => s.with(|v| lit(v, ty).or_else(|| refused(v, ty, vm))),
+        // Mapped in Rust from the states it reads: no script runs.
+        Owned::Map(spec) => mapped(spec, ty),
         // A colour or a number (most computed styles): read from what the
         // function returned as it is, without making a `Value` of it first.
         Owned::Computed(f, cache) if matches!(ty, Ty::Color | Ty::Num) => {
@@ -8463,8 +8506,12 @@ fn lower_item_list(
             .map(|rule| {
                 let (rows, items) = (rows.clone(), items.clone());
                 let now = Rc::new(move || items.with_untracked(Clone::clone));
-                Rc::new(crate::estimate::Estimator::new(rule, now, rows))
-                    as Rc<dyn zgx::compose::RowsWatch>
+                Rc::new(crate::estimate::Estimator::new(
+                    &cx.runtime(),
+                    rule,
+                    now,
+                    rows,
+                )) as Rc<dyn zgx::compose::RowsWatch>
             });
         let list = match key {
             // Heights by key, kept as rows move, each read here: no item is

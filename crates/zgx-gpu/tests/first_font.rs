@@ -142,3 +142,38 @@ fn a_kept_first_font_is_the_font_a_fallback_search_finds() {
         shared.shape_run_cache = Default::default();
     }
 }
+
+/// Monospaced text its family's face covers parses that face alone: no
+/// other fixed-width face is loaded to be weighed against it (a Mac has 13,
+/// each parsed for the first code block a window showed).
+#[test]
+fn a_word_the_monospace_face_covers_parses_that_face_alone() {
+    let mut fonts = fonts();
+    shape(&mut fonts, ("monospace", 400, 13., "let x = 42;"));
+    assert_eq!(fonts.loaded_fonts(), 1);
+    // A character only another fixed-width face has still finds it.
+    let glyphs = shape(&mut fonts, ("monospace", 400, 13., "ok ✓"));
+    assert!(
+        glyphs
+            .iter()
+            .any(|glyph| glyph.6.starts_with("FixedHebrew")),
+        "{glyphs:?}"
+    );
+}
+
+/// What shaping keeps between runs, its buffers and its searches' caches,
+/// is counted for a memory report (`FontSystem::cache_bytes`): shaping
+/// fills it.
+#[test]
+fn shaping_counts_the_buffers_and_caches_it_keeps() {
+    let mut fonts = fonts();
+    let before = fonts.cache_bytes();
+    for run in RUNS {
+        shape(&mut fonts, run);
+    }
+    assert!(
+        fonts.cache_bytes() > before,
+        "{before} then {}",
+        fonts.cache_bytes()
+    );
+}

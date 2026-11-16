@@ -31,6 +31,8 @@ mod fxc_child;
 #[doc(hidden)]
 pub mod iosurface;
 mod passes;
+#[cfg(d3d11)]
+mod view_host;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use core_text_glyphs::core_text_glyph;
@@ -51,6 +53,32 @@ mod native_surface;
 mod surfaces;
 #[cfg(target_os = "macos")]
 pub use surfaces::{PixelBuffer, SurfaceReadback, blank_surface};
+/// The direct Metal path's first-frame libraries built ahead (build.rs):
+/// whether each still has its source's hash, or none built (no Metal
+/// toolchain where zgx was built): for tests.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn debug_built_metal_libraries() -> Option<[bool; 2]> {
+    metal_frame::built_libraries()
+}
+/// The first-frame libraries loaded from those built ahead, and those
+/// compiled at start, so far in this process: for tests.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn debug_metal_library_counts() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        metal_frame::LOADED.load(Relaxed),
+        metal_frame::COMPILED.load(Relaxed),
+    )
+}
+/// Compile the first-frame libraries at start even when built ahead (for
+/// a test comparing the two).
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn debug_compile_metal_libraries_at_start(on: bool) {
+    metal_frame::COMPILE_AT_START.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod phase_watch;
 mod planes;
@@ -108,6 +136,9 @@ fn premultiply_into_cell(cell: &mut [u8], pixels: &[u8], width: u32) {
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 /// The backdrop blur atlas's format (see `atlas_texture`).
 const BLUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// A factor-8 reduce's halves (blur.wgsl's `fs_reduce4`): sums of four taps,
+/// in the atlas's format (rgba32f opens a driver block of its own on Metal).
+const HALVES_FORMAT: wgpu::TextureFormat = BLUR_FORMAT;
 /// Why rendering failed, in words.
 #[derive(Debug)]
 pub struct GpuError(pub String);
@@ -170,6 +201,9 @@ pub struct GpuStats {
     /// Layer effect passes (content blurs and masks drawn anew; at most two
     /// a frame however many), included in render_passes.
     pub effect_passes: usize,
+    /// Damage regions the window's frame drew, once nearby damage is joined
+    /// (`merge_damage`): each drawn over by every batch it touches.
+    pub regions: usize,
 }
 /// Retained allocation counters for diagnostics; excludes driver/font database allocations.
 #[derive(Debug, Clone, Copy)]
@@ -941,6 +975,45 @@ impl Within {
         }
     }
 }
+/// For a renderer that keeps its pixels (zgx-desktop's software `Raster`):
+/// what to repaint, beside the scene's damage, after moving `scroll`'s
+/// pixels already drawn by its `dx`, `dy` at `scale` (what the copy carried
+/// of what paints above or shows beneath the content, and the rounded clips
+/// around the view, where they are and where the copy took their pixels), or
+/// none when a copy can't reproduce the frame and the view repaints whole.
+/// The same rules as this renderer's own scroll copies (`copy_blocker`); a
+/// fade around the content is left to a repaint.
+#[doc(hidden)]
+pub fn scroll_copy_repaints(
+    scene: &Scene,
+    scroll: &zgx::scene::ScrollMove,
+    damage: &[Rect],
+    scale: f32,
+) -> Option<Vec<Rect>> {
+    let (mut repaint, mut fade) = (Vec::new(), None);
+    if copy_blocker(scene, scroll, damage, scale, &mut repaint, &mut fade).is_some()
+        || fade.is_some()
+    {
+        return None;
+    }
+    for corner in scene.scroll_corners(scroll.node)? {
+        let moved = Rect::new(
+            corner.x + scroll.dx,
+            corner.y + scroll.dy,
+            corner.width,
+            corner.height,
+        );
+        repaint.extend(
+            [
+                corner.intersection(scroll.clip),
+                moved.intersection(scroll.clip),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    }
+    Some(repaint)
+}
 /// Whether moving `scroll`'s pixels reproduces the frame (`None`), and what
 /// keeps it from it otherwise: its content is one contiguous run of paint
 /// items none of which reads what lies under it; beneath it the clip shows a
@@ -961,19 +1034,79 @@ fn copy_blocker(
     fade: &mut Option<zgx::scene::FadeMask>,
 ) -> Option<CopyBlocker> {
     let clip = scroll.clip;
+    // What lies around the content alone, where its own items need no look
+    // (`Scene::layer_items_around`: they paint as plain items do, in the
+    // tree's order, so none of them blocks the copy or is carried): a
+    // transcript's 300 content items go unmade each frame it scrolls.
+    if let Some(items) = scene.layer_items_around(scroll.node, clip) {
+        let from = carried.len();
+        if let Some(blocker) =
+            copy_blocker_of(scene, scroll, damage, scale, carried, fade, &items, true)
+        {
+            #[cfg(debug_assertions)]
+            {
+                let (mut whole, mut whole_fade) = (Vec::new(), None);
+                let walked = scene.layer_items_within(None, Some(&[clip]));
+                let decided = copy_blocker_of(
+                    scene,
+                    scroll,
+                    damage,
+                    scale,
+                    &mut whole,
+                    &mut whole_fade,
+                    &walked,
+                    false,
+                );
+                assert_eq!(
+                    decided,
+                    Some(blocker),
+                    "the walk around the content decides as the whole walk"
+                );
+                assert_eq!(whole_fade, *fade);
+                // (Content covering the clip copies with less to carry.)
+                assert!(
+                    carried[from..].starts_with(&whole),
+                    "carried around {:?}, whole {whole:?}",
+                    &carried[from..]
+                );
+            }
+            return blocker;
+        }
+        carried.truncate(from);
+        *fade = None;
+    }
     let items = scene.layer_items_within(None, Some(&[clip]));
+    copy_blocker_of(scene, scroll, damage, scale, carried, fade, &items, false)
+        .expect("the whole walk decides")
+}
+/// `copy_blocker` from the window's paint `items` within the scroll's clip:
+/// all of them, or with `around_only` all but those the content holds (its
+/// own kept). `None` where those can't say what lies under the content: the
+/// content's own may cover it.
+#[allow(clippy::too_many_arguments)]
+fn copy_blocker_of(
+    scene: &Scene,
+    scroll: &zgx::scene::ScrollMove,
+    damage: &[Rect],
+    scale: f32,
+    carried: &mut Vec<Rect>,
+    fade: &mut Option<zgx::scene::FadeMask>,
+    items: &[zgx::scene::PaintItem<'_>],
+    around_only: bool,
+) -> Option<Option<CopyBlocker>> {
+    let clip = scroll.clip;
     let content = |item: &zgx::scene::PaintItem<'_>| scene.is_within(item.id, scroll.node);
     let Some(first) = items.iter().position(content) else {
-        return Some(CopyBlocker::NoContent);
+        return Some(Some(CopyBlocker::NoContent));
     };
     let last = items.iter().rposition(content).expect("found above");
     // What the content has from around it, which holds still as it moves:
     // the extras its own node was given. Any other an item has is its own.
     let Some(around) = items[first..=last].iter().find(|i| i.id == scroll.node) else {
-        return Some(CopyBlocker::NoContent);
+        return Some(Some(CopyBlocker::NoContent));
     };
     if around.outer_mask().is_some() {
-        return Some(CopyBlocker::TwoFades);
+        return Some(Some(CopyBlocker::TwoFades));
     }
     *fade = around.mask();
     let paints = |item: &zgx::scene::PaintItem<'_>| -> Option<Rect> {
@@ -1013,23 +1146,23 @@ fn copy_blocker(
     let mut within = Within::default();
     for item in &items[first..=last] {
         if !within.holds(scene, item.id, scroll.node) {
-            return Some(CopyBlocker::Between(item.id));
+            return Some(Some(CopyBlocker::Between(item.id)));
         }
         // What reads the pixels under it reads the view's, which hold still
         // where the content moves over them.
         if item.effects.blur_radius > 0. || (item.isolated && reads_under(scene, item.id)) {
-            return Some(CopyBlocker::Reads(item.id));
+            return Some(Some(CopyBlocker::Reads(item.id)));
         }
         // Dots on the screen's grid stay put as the picture slides under them.
         if let NodeKind::Image(image) = item.kind
             && image.effect() != zgx::image::ImageEffect::Plain
         {
-            return Some(CopyBlocker::Dots(item.id));
+            return Some(Some(CopyBlocker::Dots(item.id)));
         }
         // Under a fade, such a layer has its whole run fade item by item
         // where it paints whole, and a copy's bands are walked without it.
         if item.mask().is_some() && !bands::fades_apart(scene, item) {
-            return Some(CopyBlocker::FilteredUnderFade(item.id));
+            return Some(Some(CopyBlocker::FilteredUnderFade(item.id)));
         }
         // A loop a layer plays isn't in the frames, and its layer goes where
         // its node is whatever a frame walks (`sync_loops`): nothing of it
@@ -1079,10 +1212,16 @@ fn copy_blocker(
             // Something that stays put over the view (a composer floating
             // on a transcript): the copy moves the view's pixels, its among
             // them, so it repaints where it is, as the copy left what was
-            // under it, and where the copy put it. Only a blur reads past
-            // its own box, so a blurred one still repaints the whole view.
-            if item.isolated || item.effects.blur_radius > 0. {
-                return Some(CopyBlocker::Over(item.id));
+            // under it, and where the copy put it. A backdrop blur reads
+            // within its own box (its area is its bounds in its clip:
+            // `plan_blur`), which its ink holds: repainting there draws what
+            // moved under it first, which it blurs afresh. So does a layer
+            // (its ink its subtree's, a shader's bleed with it). Only one
+            // reading what lies under it (a blend, a shader reading the
+            // backdrop as far as its reach) may read past that: it still
+            // repaints the whole view.
+            if item.isolated && reads_under(scene, item.id) {
+                return Some(Some(CopyBlocker::Over(item.id)));
             }
             carried.push(ink);
         }
@@ -1105,7 +1244,7 @@ fn copy_blocker(
         items[first..=last].iter().filter(opaque).filter_map(paints),
         scale,
     ) {
-        return None;
+        return Some(None);
     }
     for item in items[..first].iter().rev() {
         let Some(rect) = paints(item) else {
@@ -1123,7 +1262,7 @@ fn copy_blocker(
             && !item.isolated
             && rect == clip
         {
-            return None;
+            return Some(None);
         }
         // One colour across the whole clip, however see-through (a card's
         // tint on the window's glass): the same under every pixel before
@@ -1136,11 +1275,13 @@ fn copy_blocker(
             continue;
         }
         if !repainted(rect) {
-            return Some(CopyBlocker::Under(item.id));
+            // Under it, beyond the view's own items, may lie content that
+            // covers the clip (`spans_cover`): the whole walk decides.
+            return (!around_only).then_some(Some(CopyBlocker::Under(item.id)));
         }
         carried.extend(carry(rect));
     }
-    None
+    Some(None)
 }
 /// Whether layer `id` draws from outside itself: a blend, or anywhere in it a
 /// backdrop filter or a shader reading the backdrop or the window, or whose
@@ -2506,54 +2647,6 @@ fn plain_box(item: &zgx::scene::PaintItem<'_>) -> bool {
         && item.rounded().iter().all(Option::is_none)
         && item.color().is_none()
 }
-/// Whether node `id` reads what lies behind it: a backdrop blur, or a layer
-/// shader reading the backdrop (glass). Direct3D 11 reads none
-/// (`GpuRenderer::d3d11_leave_out`).
-#[cfg(d3d11)]
-fn d3d11_reads_backdrop(scene: &Scene, id: NodeId) -> bool {
-    scene.effects(id).blur_radius > 0.
-        || scene
-            .layer_shader(id)
-            .and_then(|layer| layer.shader.as_ref())
-            .is_some_and(|shader| shader.reads_backdrop())
-}
-/// A box's own colour drawn opaque, as the system's Reduce transparency
-/// draws glass: its translucent, untextured quads inside its box (`fade`;
-/// not its shadows), made opaque. Built so, a kept frame keeps them so.
-#[cfg(d3d11)]
-fn d3d11_opaque(quads: &mut [Quad], fade: [f32; 4]) {
-    let [x, y, width, height] = fade;
-    for quad in quads {
-        let [qx, qy, qw, qh] = quad.rect;
-        let inside = qx >= x && qy >= y && qx + qw <= x + width && qy + qh <= y + height;
-        if inside && quad.options[1] <= 0.5 && quad.shape[2] <= 0. && quad.color[3] > 0. {
-            quad.color[3] = 1.;
-        }
-    }
-}
-/// Whether a draw whose backdrop Direct3D 11 doesn't read has a colour of
-/// its own drawn opaque under what it holds (`d3d11_opaque`): a layer's
-/// node's fill, or a plain box's own opaque quad over its backdrop's bounds.
-#[cfg(d3d11)]
-fn d3d11_has_colour(scene: &Scene, quads: &[Quad], draw: &Draw) -> bool {
-    match draw.source {
-        TextureSource::Layer(id) => match scene.kind(id) {
-            NodeKind::Panel { quad, .. } | NodeKind::Quad(quad) => quad.fill.3 > 0,
-            NodeKind::Rect(color) => color.3 > 0,
-            _ => false,
-        },
-        _ => draw.blur.as_deref().is_some_and(|&(bounds, ..)| {
-            let rect = [bounds.x, bounds.y, bounds.width, bounds.height];
-            quads
-                .get(draw.start as usize..draw.end as usize)
-                .is_some_and(|drawn| {
-                    drawn.iter().any(|quad| {
-                        quad.rect == rect && quad.options[1] <= 0.5 && quad.color[3] >= 1.
-                    })
-                })
-        }),
-    }
-}
 /// A flat colour's quad over `fade` (a box's place), as it shows.
 #[inline(always)]
 fn rect_quad(color: Color, fade: [f32; 4], effects: zgx::scene::Effects) -> Quad {
@@ -2843,6 +2936,8 @@ struct Deferred {
 /// `GpuRenderer::blur`).
 struct VerticalBlur {
     bind: wgpu::BindGroup,
+    /// Where its records lie in the frame's buffer (`bind`'s offsets).
+    offsets: [u32; 2],
     /// The filter (its index in the batch) and output of each draw.
     draws: Vec<(u32, Scissor)>,
     /// Drawn with `BlurPipelines::mix` (else over a copy of each area).
@@ -2906,6 +3001,8 @@ struct BlurPipelines {
     layout: wgpu::BindGroupLayout,
     linear: wgpu::Sampler,
     reduce: wgpu::RenderPipeline,
+    /// A factor-8 reduce's first half (`fs_reduce4`), into `HALVES_FORMAT`.
+    halves: wgpu::RenderPipeline,
     across: wgpu::RenderPipeline,
     down: wgpu::RenderPipeline,
     vertical: wgpu::RenderPipeline,
@@ -2941,12 +3038,15 @@ impl BlurPipelines {
             },
             count: None,
         };
+        // The frame's records, in its vertex buffer at offsets that move
+        // from frame to frame: given as each pass binds its group, so the
+        // groups last (`BlurScratch::groups`).
         let records = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
+                has_dynamic_offset: true,
                 min_binding_size: None,
             },
             count: None,
@@ -2974,8 +3074,9 @@ impl BlurPipelines {
             });
             Self::pipeline(device, &shader, Some(&layout), entry, &[target])
         };
-        let (reduce, across, down, vertical) = (
+        let (reduce, halves, across, down, vertical) = (
             pipeline("fs_reduce", BLUR_FORMAT),
+            pipeline("fs_reduce4", HALVES_FORMAT),
             pipeline("fs_across", BLUR_FORMAT),
             pipeline("fs_down", BLUR_FORMAT),
             pipeline("fs", FORMAT),
@@ -3009,6 +3110,7 @@ impl BlurPipelines {
             layout,
             linear,
             reduce,
+            halves,
             across,
             down,
             vertical,
@@ -3089,6 +3191,47 @@ impl BlurPipelines {
 /// need, the blur passes rendering from one into the other.
 struct BlurScratch {
     atlas: [wgpu::Texture; 2],
+    /// Its atlas's views, made with it.
+    views: [wgpu::TextureView; 2],
+    /// The halves' view (`GpuRenderer::blur_halves`), made once for each.
+    halves: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// The passes' bind groups, by what they bind: made once, not each
+    /// frame (each a trip through wgpu's validation).
+    groups: Vec<BlurGroups>,
+}
+impl BlurScratch {
+    fn new(atlas: [wgpu::Texture; 2]) -> Self {
+        let views = atlas
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+        Self {
+            atlas,
+            views,
+            halves: None,
+            groups: Vec::new(),
+        }
+    }
+}
+/// A batch's blur bind groups for records in `records` (at most
+/// `capacity` bytes of each part, at the offsets a pass binds them with),
+/// reading `source` (the frame, or a popup's backdrop) and the halves'
+/// `halves` view.
+struct BlurGroups {
+    records: wgpu::Buffer,
+    capacity: [u64; 2],
+    source: wgpu::TextureView,
+    halves: Option<wgpu::TextureView>,
+    /// The frame (`source`) read, the second atlas beside it.
+    from_source: wgpu::BindGroup,
+    /// The frame read, the halves beside it (binding 1: what a factor-8
+    /// reduce adds its second half from).
+    from_halves: Option<wgpu::BindGroup>,
+    /// The first atlas read (across, and the blur drawn back).
+    from_first: wgpu::BindGroup,
+    /// The second atlas read (down).
+    from_second: wgpu::BindGroup,
+    /// The window's own frame read (a popup's originals), made if needed.
+    from_frame: Option<wgpu::BindGroup>,
 }
 /// The spare retained target with the views and bind groups it needs.
 struct Retained {
@@ -3844,6 +3987,62 @@ const POWER: wgpu::PowerPreference = wgpu::PowerPreference::LowPower;
 pub(crate) fn fallback_adapter_forced() -> bool {
     std::env::var_os("WGPU_FORCE_FALLBACK_ADAPTER").is_some_and(|value| value == "1")
 }
+/// Whether the only adapter the GPU renderer could draw with is a software
+/// one, found without opening a device (whose driver keeps its memory once
+/// made): `WGPU_FORCE_FALLBACK_ADAPTER=1`; on Linux no render node
+/// (`/dev/dri/renderD*`), so Mesa draws with llvmpipe or lavapipe; on
+/// Windows no DXGI adapter but software ones (WARP, the Basic Render
+/// Driver). macOS always has a GPU. Read once.
+#[doc(hidden)]
+pub fn software_only() -> bool {
+    static ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONLY.get_or_init(|| fallback_adapter_forced() || no_hardware_adapter())
+}
+#[cfg(target_os = "linux")]
+fn no_hardware_adapter() -> bool {
+    !std::fs::read_dir("/dev/dri").is_ok_and(|nodes| {
+        nodes
+            .flatten()
+            .any(|node| node.file_name().to_string_lossy().starts_with("renderD"))
+    })
+}
+#[cfg(windows)]
+fn no_hardware_adapter() -> bool {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIFactory1,
+    };
+    // SAFETY: a factory made and its adapters' descriptions read; nothing
+    // opened on them.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory1>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let adapters = (0..)
+            .map_while(|index| factory.EnumAdapters1(index).ok())
+            .filter_map(|adapter| adapter.GetDesc1().ok())
+            .map(|desc| (desc.VendorId, desc.DeviceId, desc.Flags));
+        only_software(adapters)
+    }
+}
+/// Whether DXGI's adapters, each its vendor id, device id and flags, are
+/// all software ones (`DXGI_ADAPTER_FLAG_SOFTWARE`, or the Basic Render
+/// Driver: Microsoft's vendor id and WARP's device id), and there is one.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn only_software(adapters: impl IntoIterator<Item = (u32, u32, u32)>) -> bool {
+    const SOFTWARE: u32 = 2;
+    let mut any = false;
+    for (vendor, device, flags) in adapters {
+        any = true;
+        if flags & SOFTWARE == 0 && !(vendor == 0x1414 && device == 0x8c) {
+            return false;
+        }
+    }
+    any
+}
+#[cfg(not(any(target_os = "linux", windows)))]
+fn no_hardware_adapter() -> bool {
+    false
+}
 /// The adapter DXGI ranks first for `POWER`, a GPU before software, with a
 /// device opened on it alone (none when Direct3D 12 isn't the instance's
 /// backend). wgpu's
@@ -4108,6 +4307,9 @@ struct GpuContextInner {
     fonts: Rc<RefCell<FontSystem>>,
     /// Shaped text shared by layout measurement and every renderer.
     text_cache: Rc<RefCell<prepared::TextCache>>,
+    /// `fonts` and `text_cache` as text services a scene with none takes
+    /// (`default_text_services`): one for every renderer on this context.
+    text_default: Rc<zgx::scene::DefaultTextServices>,
     quads: QuadPipelines,
     /// Bind group layouts of the quad pipelines: texture and sampler, viewport.
     texture_layout: wgpu::BindGroupLayout,
@@ -4126,6 +4328,11 @@ struct GpuContextInner {
     d3d11: Option<Rc<d3d11_frame::Device>>,
 }
 impl GpuContext {
+    /// Whether `other` is this context (a clone of it), not another.
+    #[doc(hidden)]
+    pub fn same_as(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
     /// A context on the system's GPU, found without a window.
     pub fn new() -> Result<Self, GpuError> {
         Self::create(None)
@@ -4450,24 +4657,29 @@ impl GpuContext {
             areas,
         };
         Self {
-            inner: Rc::new(GpuContextInner {
-                shared,
-                lost,
-                instance,
-                adapter,
-                device,
-                queue,
-                info,
-                fonts: Rc::new(RefCell::new(fonts)),
-                text_cache: Default::default(),
-                quads,
-                texture_layout,
-                viewport_layout,
-                quad_layout,
-                mapped_uploads,
-                vertex_ring,
-                #[cfg(d3d11)]
-                d3d11: d3d11.map(|made| Rc::new(made.0)),
+            inner: Rc::new({
+                let fonts = Rc::new(RefCell::new(fonts));
+                let text_cache = Rc::default();
+                GpuContextInner {
+                    text_default: default_text_services(&fonts, &text_cache),
+                    shared,
+                    lost,
+                    instance,
+                    adapter,
+                    device,
+                    queue,
+                    info,
+                    fonts,
+                    text_cache,
+                    quads,
+                    texture_layout,
+                    viewport_layout,
+                    quad_layout,
+                    mapped_uploads,
+                    vertex_ring,
+                    #[cfg(d3d11)]
+                    d3d11: d3d11.map(|made| Rc::new(made.0)),
+                }
             }),
         }
     }
@@ -4572,6 +4784,9 @@ pub struct GpuRenderer {
     /// resized or restyled node gets a new raster; the old texture goes at
     /// once instead of waiting for a structural prune.
     node_images: FxHashMap<NodeId, u64>,
+    /// The images the scene's nodes show, counted (`prune_images`).
+    /// Boxed: the renderer's own fields stay where they were.
+    scene_images: Option<Box<SceneImages>>,
     /// Gradient ramps (see `axis_gradient`) by their stops, and the ramp
     /// each node draws, so a ramp lives while a node shows it.
     ramps: FxHashMap<RampKey, Arc<zgx::image::ImageData>>,
@@ -4580,6 +4795,12 @@ pub struct GpuRenderer {
     failed_svgs: rustc_hash::FxHashSet<u64>,
     /// The viewport of the target currently being rendered.
     viewport_bind: Option<wgpu::BindGroup>,
+    /// Viewport groups binding the frame's regions (`regions_group`), by
+    /// uniform, buffer and the regions' place in it, the latest last.
+    regions_groups: Vec<(wgpu::Buffer, wgpu::Buffer, (u64, u64), wgpu::BindGroup)>,
+    /// The device's `min_storage_buffer_offset_alignment`, read once: the
+    /// limits come whole, through wgpu, each time they are asked.
+    storage_align: usize,
     /// Reused upload memory for per-frame vertices; `write_buffer` would
     /// allocate and free a staging buffer every frame.
     belt: RefCell<wgpu::util::StagingBelt>,
@@ -4913,6 +5134,10 @@ pub struct GpuRenderer {
     /// renderer's buffers, atlas and offscreen target there.
     #[cfg(d3d11)]
     d3d11: Option<d3d11_frame::State>,
+    /// Under Direct3D 11, the Direct3D 12 device GPU views draw with, made
+    /// the first time one shows (`None` inside: it couldn't be).
+    #[cfg(d3d11)]
+    view_host: std::cell::OnceCell<Option<view_host::ViewHost>>,
     /// Shifted texel copies drawn in a render pass (copy_offset.wgsl).
     #[cfg(own_surfaces)]
     copy_offset: Option<wgpu::RenderPipeline>,
@@ -4934,6 +5159,9 @@ pub struct GpuRenderer {
     blur_pipelines: Option<BlurPipelines>,
     /// Backdrop blur scratch, shared by the window and every isolated layer.
     blur_scratch: Option<BlurScratch>,
+    /// Twice the blur atlas's extent, where a batch has a factor-8 slot: its
+    /// reduce's first half (`plan_halves`, `halves_pass`).
+    blur_halves: Option<wgpu::Texture>,
     /// Blurred and masked layers' slots (effects.rs), made with the first.
     effects: Option<effects::EffectAtlas>,
     effect_pipelines: Option<effects::EffectPipelines>,
@@ -4979,6 +5207,9 @@ pub struct GpuRenderer {
     /// A window with backdrop readers: its walk's damage grown over what
     /// they can read (`render_once`). Boxed: most renderers have none.
     backdrop_walk: Option<Box<BackdropWalk>>,
+    /// The last window frame's damage regions, kept only once a test asks
+    /// (`debug_keep_regions`).
+    debug_regions: Option<Vec<Rect>>,
 }
 /// What a window frame's walk grows its damage through (kept for the next),
 /// and that damage grown, for its `render_flat` (readers alone, no blur), with
@@ -5025,6 +5256,17 @@ impl GpuRenderer {
 impl GpuRenderer {
     /// An offscreen renderer `width` by `height` physical pixels, on a context
     /// of its own.
+    ///
+    /// Its context's text services become its thread's default: a scene on
+    /// this thread laid out with none installed (`install_text` not called)
+    /// takes them at its next layout, so its text is measured as it is
+    /// drawn from its first frame, not by zgx's estimate. Renderers sharing
+    /// a context share its text services. Made after another renderer on a
+    /// context of its own, its default replaces that one's for scenes laid
+    /// out from then; a scene keeps the services it took, whichever renderer
+    /// draws it (the first other one to says so, once: `take_issues`). A host
+    /// that calls `install_text` keeps what it installed, and chooses.
+    /// Every renderer constructor does the same.
     pub fn new(width: u32, height: u32) -> Result<Self, GpuError> {
         let context = GpuContext::new()?;
         Self::create(None, width, height, &context)
@@ -5404,6 +5646,8 @@ impl GpuRenderer {
                 | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        // A scene laid out without `install_text` is measured by its text.
+        Scene::set_default_text_services(Some(context.inner.text_default.clone()));
         Ok(Self {
             context: context.clone(),
             #[cfg(windows)]
@@ -5425,10 +5669,13 @@ impl GpuRenderer {
                 mapped_at_creation: false,
             }),
             node_images: FxHashMap::default(),
+            scene_images: None,
             ramps: FxHashMap::default(),
             node_ramps: FxHashMap::default(),
             failed_svgs: Default::default(),
             viewport_bind: None,
+            regions_groups: Vec::new(),
+            storage_align: device.limits().min_storage_buffer_offset_alignment as usize,
             belt: RefCell::new(wgpu::util::StagingBelt::new(device.clone(), 256 * 1024)),
             mapped: context
                 .inner
@@ -5492,6 +5739,8 @@ impl GpuRenderer {
             viewport_values: [0.; 4],
             #[cfg(d3d11)]
             d3d11,
+            #[cfg(d3d11)]
+            view_host: Default::default(),
             #[cfg(own_surfaces)]
             copy_offset: None,
             in_layer: false,
@@ -5602,6 +5851,7 @@ impl GpuRenderer {
             // As if last recycled long ago: the first fill recycles.
             atlas_recycled_at: 0_u64.wrapping_sub(ATLAS_THRASH_FRAMES),
             blur_scratch: None,
+            blur_halves: None,
             effects: None,
             effect_pipelines: None,
             effect_jobs: Vec::new(),
@@ -5622,6 +5872,7 @@ impl GpuRenderer {
             filter_shaders: FxHashMap::default(),
             plane: None,
             backdrop_walk: None,
+            debug_regions: None,
         })
     }
     /// Bytes the native device reports as allocated (Metal only), including
@@ -5706,6 +5957,12 @@ impl GpuRenderer {
         report.add("text", "prepared lines", None, Some(lines));
         report.add("text", "measures", None, Some(measures));
         report.add("text", "shaped runs", Some(runs.len()), Some(runs.bytes()));
+        report.add(
+            "text",
+            "shaping buffers and caches",
+            None,
+            Some(self.fonts.borrow().cache_bytes()),
+        );
         let images: usize = (self.swash.image_cache.values().flatten())
             .map(|image| image.data.capacity())
             .sum();
@@ -5814,10 +6071,6 @@ impl GpuRenderer {
     /// `trim_atlas`'s copy into a smaller atlas: false where it can't copy,
     /// true when done or when no smaller atlas holds what is live.
     fn shrink_atlas(&mut self) -> bool {
-        #[cfg(d3d11)]
-        if self.d3d11.is_some() {
-            return false;
-        }
         if !self.texture_uploads.is_empty() {
             return false;
         }
@@ -5865,6 +6118,23 @@ impl GpuRenderer {
             .map(|(((x, y), (w, h)), (to_x, to_y))| {
                 (x - 1, y - 1, w + 2, h + 2, to_x - 1, to_y - 1)
             });
+        // Direct3D 11: its own atlas's cells copied into one the new size.
+        #[cfg(d3d11)]
+        if let Some(state) = &mut self.d3d11 {
+            let Some(old) = state.atlas.take() else {
+                return false;
+            };
+            let new = match state.device.surface(size, size, false) {
+                Ok(new) => new,
+                Err(_) => {
+                    state.atlas = Some(old);
+                    return false;
+                }
+            };
+            state.device.copy_cells(&old, &new, cells);
+            state.atlas = Some(new);
+            return self.atlas_shrunk(atlas, size, cursor, live, glyphs, icons, origins);
+        }
         #[cfg(target_os = "macos")]
         let copied_on_cpu = self.unified;
         #[cfg(not(target_os = "macos"))]
@@ -5908,6 +6178,21 @@ impl GpuRenderer {
             }
             self.queue.submit([encoder.finish()]);
         }
+        self.atlas_shrunk(atlas, size, cursor, live, glyphs, icons, origins)
+    }
+    /// The atlas `shrink_atlas` copied into, `size` square, taken: the live
+    /// glyphs and icons at their `origins` there.
+    #[allow(clippy::too_many_arguments)]
+    fn atlas_shrunk(
+        &mut self,
+        atlas: wgpu::Texture,
+        size: u32,
+        cursor: (u32, u32, u32),
+        live: FxHashMap<AtlasKey, Option<AtlasEntry>>,
+        glyphs: Vec<(AtlasKey, AtlasEntry)>,
+        icons: Vec<(u64, (u32, u32, u32, u32))>,
+        origins: Vec<(u32, u32)>,
+    ) -> bool {
         let mut entries: FxHashMap<AtlasKey, Option<AtlasEntry>> =
             live.into_iter().filter(|(_, e)| e.is_none()).collect();
         let mut origins = origins.into_iter();
@@ -6053,6 +6338,11 @@ impl GpuRenderer {
     pub fn shows_carets(&self) -> bool {
         self.layer_present.is_some()
     }
+    /// How many items its kept frame holds, if it keeps one. For tests.
+    #[doc(hidden)]
+    pub fn debug_kept_items(&self) -> Option<usize> {
+        self.kept.as_ref().map(|kept| kept.items.len())
+    }
     /// Test hook: keep no frame to patch, drawing each afresh (a reference
     /// for frames patched into a kept one).
     #[doc(hidden)]
@@ -6082,7 +6372,9 @@ impl GpuRenderer {
     /// Install this renderer's text services on `scene`: native shaping,
     /// and measurement from the prepared text it draws from, so layout and
     /// drawing break lines identically. Call `Ui::refresh_text_geometry`
-    /// afterwards for a scene with mounted text.
+    /// afterwards for a scene with mounted text. Without it a scene takes a
+    /// renderer's text services by itself (`GpuRenderer::new`); installing
+    /// says which, and keeps them.
     pub fn install_text(&self, scene: &mut Scene) {
         install_text(scene, &self.text_system(), &self.text_cache());
     }
@@ -6155,11 +6447,16 @@ impl GpuRenderer {
                 .any(|texture| texture.width() > width * 2 || texture.height() > height * 2)
         }) {
             self.blur_scratch = None;
+            self.blur_halves = None;
         }
         self.width = width;
         self.height = height;
         self.spare = None;
         self.target_copy_bind = None;
+        // Its blur groups read the target's view, made again for the size.
+        if let Some(scratch) = &mut self.blur_scratch {
+            scratch.groups.clear();
+        }
         // A surface of the renderer's own becomes the target
         // (`begin_layer_frame`), resized there on Windows.
         #[cfg(own_surfaces)]
@@ -6282,6 +6579,15 @@ impl GpuRenderer {
     /// Draw `scene`'s `damage` (logical rectangles) to the target, and report
     /// what it did.
     pub fn render(&mut self, scene: &Scene, damage: &[Rect]) -> Result<GpuStats, GpuError> {
+        // Drawn first by this renderer, a scene that took another context's
+        // text services (the thread's last made) keeps them: said, once
+        // (`take_issues`).
+        if scene.drawn_with_other_text_services(&self.context.inner.text_default) {
+            self.warn(
+                "a scene measured with another renderer's text services is drawn by this one: \
+                 install_text chooses",
+            );
+        }
         #[cfg(target_os = "macos")]
         {
             self.loop_watch.set_damage(damage.len());
@@ -6471,11 +6777,12 @@ impl GpuRenderer {
             self.shaped_bytes = 0;
             self.fresh = true;
             self.pruned_revision = None;
+            self.scene_images = None;
         }
         // Caches only go stale when nodes are added, removed or change kind.
         if self.pruned_revision != Some(scene.content_revision()) {
             self.pruned_revision = Some(scene.content_revision());
-            self.prune(scene);
+            self.prune_moved(scene);
         }
         let frame = self.layer_frame;
         self.layers.retain(|id, cache| {
@@ -6770,18 +7077,11 @@ impl GpuRenderer {
         stats.vertex_buffer_allocations += layer_stats.vertex_buffer_allocations;
         Ok(stats)
     }
-    /// Drop cached shapes, canvases, SVGs and textures of nodes that are gone.
+    /// Drop cached shapes, canvases, SVGs and textures of nodes that are gone,
+    /// looking over all it keeps.
     fn prune(&mut self, scene: &Scene) {
         self.node_images.retain(|id, _| scene.contains(*id));
         self.node_ramps.retain(|id, _| scene.contains(*id));
-        let shown: std::collections::HashSet<&RampKey> = self.node_ramps.values().collect();
-        // A ramp no box shows stays while its texture does (kept with the
-        // images no node shows, until the window goes idle): the same
-        // gradient shown again, as a page pushed again shows its edge, takes
-        // that texture rather than a new one each time.
-        let images = &self.images;
-        self.ramps
-            .retain(|key, ramp| shown.contains(key) || images.contains_key(&ramp.id()));
         self.shapes.retain(|id, _| {
             scene.contains(*id)
                 && matches!(
@@ -6798,6 +7098,105 @@ impl GpuRenderer {
             }
         }
         self.canvases.retain(scene);
+        self.svgs.retain(scene);
+        // The images nodes show, counted from here on as they change; with
+        // none uploaded, not looked for (`SceneImages::counted`).
+        let images = self.scene_images.get_or_insert_default();
+        images.counted = false;
+        if !self.images.is_empty() {
+            images.walk(scene);
+        }
+        self.prune_rest(scene);
+    }
+    /// What `prune` does when the content revision moved: for the nodes the
+    /// scene names as changed since the last (`Scene::resource_changes`),
+    /// or with images no longer shown (`SceneImages::dropped`); past a gap,
+    /// for all. With neither (a canvas drawn again, a node appended), none.
+    /// Out of line: the frame runs as before.
+    #[inline(never)]
+    fn prune_moved(&mut self, scene: &Scene) {
+        let (covered, changed) = scene.resource_changes();
+        match &mut self.scene_images {
+            Some(images) if *covered.start() <= images.through + 1 => {
+                // Counted from the first move with textures to keep; after
+                // that, the few counted are looked at again (a node given
+                // another kind isn't named: an image node made a box lets
+                // go of its image, as it did when all nodes were walked for).
+                let uncounted = !images.counted && !self.images.is_empty();
+                if images.counted {
+                    images.recheck(scene);
+                }
+                let dropped = images.dropped || uncounted;
+                // Rasters of nodes no longer drawing one (a box's detailed
+                // decoration taken off) go as they did: they are few, and
+                // the scene doesn't name a node given another kind.
+                if !self.canvases.is_empty() {
+                    self.canvases.retain(scene);
+                }
+                if !changed.is_empty() || dropped {
+                    self.prune_changed(scene, changed);
+                } else {
+                    #[cfg(target_os = "macos")]
+                    self.retain_lone_surfaces(scene);
+                }
+            }
+            _ => self.prune(scene),
+        }
+        if let Some(images) = &mut self.scene_images {
+            images.through = *covered.end();
+        }
+    }
+    /// `prune` for the nodes `changed` alone (`Scene::resource_changes`):
+    /// those gone, or showing something else.
+    fn prune_changed(&mut self, scene: &Scene, changed: &[NodeId]) {
+        let images = self.scene_images.get_or_insert_default();
+        if images.counted {
+            for &id in changed {
+                let kind = scene.contains(id).then(|| scene.kind(id));
+                images.show(id, kind.and_then(shown_image));
+            }
+        } else if !self.images.is_empty() {
+            images.walk(scene);
+        }
+        for &id in changed {
+            let kind = scene.contains(id).then(|| scene.kind(id));
+            if kind.is_none() {
+                self.node_images.remove(&id);
+                self.node_ramps.remove(&id);
+            }
+            if !matches!(
+                kind,
+                Some(NodeKind::Text { .. } | NodeKind::RichText { .. })
+            ) && let Some(shaped) = self.shapes.remove(&id)
+            {
+                self.shaped_bytes -= shaped.bytes();
+                if let Some(blurred) = &mut self.blurred {
+                    blurred.texts.remove(&id);
+                }
+            }
+        }
+        if self
+            .blurred
+            .as_ref()
+            .is_some_and(|blurred| blurred.texts.is_empty())
+        {
+            self.blurred = None;
+        }
+        self.canvases.retain_changed(scene, changed);
+        self.svgs.retain_changed(scene, changed);
+        self.prune_rest(scene);
+    }
+    /// What `prune` and `prune_changed` share: ramps, outlines and textures
+    /// none shows.
+    fn prune_rest(&mut self, scene: &Scene) {
+        let shown: std::collections::HashSet<&RampKey> = self.node_ramps.values().collect();
+        // A ramp no box shows stays while its texture does (kept with the
+        // images no node shows, until the window goes idle): the same
+        // gradient shown again, as a page pushed again shows its edge, takes
+        // that texture rather than a new one each time.
+        let images = &self.images;
+        self.ramps
+            .retain(|key, ramp| shown.contains(key) || images.contains_key(&ramp.id()));
         // Pixelated images' bind groups go with their textures; with the last, all.
         if let Some(nearest) = &mut self.nearest {
             nearest.binds.retain(|id, _| self.images.contains_key(id));
@@ -6816,83 +7215,76 @@ impl GpuRenderer {
                 self.outlines = None;
             }
         }
-        self.svgs.retain(scene);
-        // Surfaces with no picture beside them (a video player alone): let
-        // go of those no longer shown as frames are drawn, as below does with
-        // pictures. Else a playing window kept each frame's until it rested.
         #[cfg(target_os = "macos")]
-        if self.images.is_empty()
-            && let Some(cache) = &mut self.native_surfaces
-        {
-            let live = (scene.paint_items())
-                .filter_map(|item| match item.kind {
-                    NodeKind::NativeSurface(frame) => Some(frame.id()),
-                    _ => None,
-                })
-                .collect();
-            cache.retain(&live);
-        }
+        self.retain_lone_surfaces(scene);
         if !self.images.is_empty() {
-            let mut live_images: std::collections::HashSet<u64> = scene
-                .paint_items()
-                .filter_map(|item| match item.kind {
-                    NodeKind::Image(image) => Some(image.id()),
-                    #[cfg(target_os = "macos")]
-                    NodeKind::NativeSurface(frame) => Some(frame.id()),
-                    _ => None,
-                })
-                .collect();
-            live_images.extend(self.canvases.image_ids());
-            // Only the ramps boxes show: the rest go as other unshown images do.
-            live_images.extend(
-                (self.node_ramps.values())
-                    .filter_map(|key| self.ramps.get(key))
-                    .map(|ramp| ramp.id()),
-            );
-            live_images.extend(self.svgs.image_ids());
-            // Boxes' background images.
-            live_images.extend(scene.paint_items().filter_map(|item| match item.kind {
-                NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } => {
-                    match quad.decoration.as_deref()?.background.as_ref()? {
-                        zgx::decoration::Background::Image { image, .. } => Some(image.id()),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }));
-            // Effect layers' atlas and masks.
-            live_images.insert(effects::EFFECT_ATLAS);
-            live_images.extend(
-                self.layers
-                    .keys()
-                    .filter(|id| scene.contains(**id))
-                    .filter_map(|id| scene.mask(*id).map(|mask| mask.image.id())),
-            );
-            #[cfg(target_os = "macos")]
-            if let Some(cache) = &mut self.native_surfaces {
-                cache.retain(&live_images);
-            }
-            // A picture whose row went (a list scrolled past) may come back
-            // with its pixels long given up, to decode blank again: its
-            // texture stays, within a bound, until the window goes idle.
-            // Others' are gone with their nodes; they have no `image_drawn`.
-            // Nor one nothing holds any more (a video's frame, replaced by
-            // the next): no node can show it again.
-            let (drawn, holders) = (&self.image_drawn, &self.image_holders);
-            self.images.retain(|id, _| {
-                live_images.contains(id)
-                    || drawn.contains_key(id) && holders.get(id).is_none_or(|h| h.any())
-            });
-            let images = &self.images;
-            self.image_holders.retain(|id, _| images.contains_key(id));
-            self.images_gone.clear();
-            self.images_gone
-                .extend(self.images.keys().filter(|id| !live_images.contains(id)));
-            self.bound_images_gone();
-            let images = &self.images;
-            self.image_drawn.retain(|id, _| images.contains_key(id));
+            self.prune_images(scene);
         }
         self.retain_views();
+    }
+    /// `prune` for image textures: those no node, canvas, ramp, picture or
+    /// layer shows go, within the bound kept for pictures that may come back.
+    /// Those nodes show are counted (`SceneImages`), not walked for. Out of
+    /// line: `prune` stays as it was.
+    #[inline(never)]
+    fn prune_images(&mut self, scene: &Scene) {
+        let images = self.scene_images.get_or_insert_default();
+        if !images.counted {
+            images.walk(scene);
+        }
+        images.dropped = false;
+        #[cfg(debug_assertions)]
+        {
+            let shown = scene_image_ids(scene);
+            assert!(
+                images.users.keys().all(|id| shown.contains(id)),
+                "an image counted that no node shows"
+            );
+        }
+        // Those nodes show, and the rest: canvases', boxes' ramps (the rest
+        // go as other unshown images do), pictures', effect layers' atlas and
+        // masks.
+        let mut others = FxHashSet::default();
+        others.extend(self.canvases.image_ids());
+        others.extend(
+            (self.node_ramps.values())
+                .filter_map(|key| self.ramps.get(key))
+                .map(|ramp| ramp.id()),
+        );
+        others.extend(self.svgs.image_ids());
+        others.insert(effects::EFFECT_ATLAS);
+        others.extend(
+            self.layers
+                .keys()
+                .filter(|id| scene.contains(**id))
+                .filter_map(|id| scene.mask(*id).map(|mask| mask.image.id())),
+        );
+        let walked = &self.scene_images.as_deref().expect("counted above").users;
+        let live = |id: &u64| walked.contains_key(id) || others.contains(id);
+        #[cfg(target_os = "macos")]
+        if let Some(cache) = &mut self.native_surfaces {
+            let mut live_images: FxHashSet<u64> = walked.keys().copied().collect();
+            live_images.extend(others.iter().copied());
+            cache.retain(&live_images);
+        }
+        // A picture whose row went (a list scrolled past) may come back
+        // with its pixels long given up, to decode blank again: its
+        // texture stays, within a bound, until the window goes idle.
+        // Others' are gone with their nodes; they have no `image_drawn`.
+        // Nor one nothing holds any more (a video's frame, replaced by
+        // the next): no node can show it again.
+        let (drawn, holders) = (&self.image_drawn, &self.image_holders);
+        self.images.retain(|id, _| {
+            live(id) || drawn.contains_key(id) && holders.get(id).is_none_or(|h| h.any())
+        });
+        let images = &self.images;
+        self.image_holders.retain(|id, _| images.contains_key(id));
+        self.images_gone.clear();
+        self.images_gone
+            .extend(self.images.keys().filter(|id| !live(id)));
+        self.bound_images_gone();
+        let images = &self.images;
+        self.image_drawn.retain(|id, _| images.contains_key(id));
     }
     /// Textures of `images_gone` past their bound, least recently drawn first.
     fn bound_images_gone(&mut self) {
@@ -6917,6 +7309,24 @@ impl GpuRenderer {
             }
             self.images_gone.remove(&id);
             count -= 1;
+        }
+    }
+    /// Surfaces with no picture beside them (a video player alone): let go
+    /// of those no longer shown as frames are drawn, as `prune_images` does
+    /// with pictures. Else a playing window kept each frame's until it
+    /// rested.
+    #[cfg(target_os = "macos")]
+    fn retain_lone_surfaces(&mut self, scene: &Scene) {
+        if self.images.is_empty()
+            && let Some(cache) = &mut self.native_surfaces
+        {
+            let live = (scene.paint_items())
+                .filter_map(|item| match item.kind {
+                    NodeKind::NativeSurface(frame) => Some(frame.id()),
+                    _ => None,
+                })
+                .collect();
+            cache.retain(&live);
         }
     }
     /// Forget GPU views whose frames' textures are gone.
@@ -7839,6 +8249,17 @@ impl GpuRenderer {
     pub fn debug_d3d11_left_out() -> Vec<&'static str> {
         d3d11_frame::left_out_so_far()
     }
+    /// Keep each window frame's damage regions from now on, for
+    /// `debug_regions`: a test placing what a frame reads across them.
+    #[doc(hidden)]
+    pub fn debug_keep_regions(&mut self) {
+        self.debug_regions.get_or_insert_default();
+    }
+    /// The last window frame's damage regions, once `debug_keep_regions`.
+    #[doc(hidden)]
+    pub fn debug_regions(&self) -> &[Rect] {
+        self.debug_regions.as_deref().unwrap_or_default()
+    }
     /// Have this renderer's frames wait for shaders compiling, though it
     /// presents: a test comparing its pixels with an offscreen one's.
     #[doc(hidden)]
@@ -8103,6 +8524,44 @@ impl GpuRenderer {
         }
         &self.backdrops[&size]
     }
+    /// The viewport group binding `uniform` and the regions at `place`
+    /// (offset and size) in `vertices`: one made for them before (a frame
+    /// whose quads kept their size puts its regions where the last did), or
+    /// made now, the oldest of a few let go (and those for a buffer no
+    /// longer drawn from). Bound plainly, not at a dynamic offset: wgpu
+    /// keeps a pass's dynamic offsets in a list it allocates each pass.
+    #[inline(never)]
+    pub(crate) fn regions_group(
+        &mut self,
+        uniform: &wgpu::Buffer,
+        vertices: &wgpu::Buffer,
+        place: (u64, u64),
+    ) -> wgpu::BindGroup {
+        if let Some((.., group)) = self
+            .regions_groups
+            .iter()
+            .find(|(u, v, at, _)| u == uniform && v == vertices && *at == place)
+        {
+            return group.clone();
+        }
+        let (current, mapped) = (&self.vertices, &self.mapped);
+        self.regions_groups.retain(|(_, v, ..)| {
+            v == current || mapped.as_ref().is_some_and(|ring| ring.borrow().holds(v))
+        });
+        if self.regions_groups.len() >= 8 {
+            self.regions_groups.remove(0);
+        }
+        let group = self.viewport_group(
+            uniform,
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: vertices,
+                offset: place.0,
+                size: wgpu::BufferSize::new(place.1),
+            }),
+        );
+        (self.regions_groups).push((uniform.clone(), vertices.clone(), place, group.clone()));
+        group
+    }
     /// Group 1 of the quad pipelines: the viewport `uniform` and `regions`.
     fn viewport_group(
         &self,
@@ -8352,7 +8811,12 @@ impl GpuRenderer {
                 continue;
             }
             let Some(first) = first else {
-                entering.push(id);
+                // Not kept: mounted since, or left out by the kept frame's
+                // walk, which records only what can show. One that still
+                // can't paints nothing here; any other comes in a splice.
+                if scene.ink_may_show(id) {
+                    entering.push(id);
+                }
                 continue;
             };
             if flags & (zgx::scene::repaint::COMPOSITE | zgx::scene::repaint::CHILDREN) != 0
@@ -9732,7 +10196,8 @@ impl GpuRenderer {
                                     && let Some(quad) = background_quad(
                                         image, *fit, style, bounds, opacity, edge_fade,
                                     )
-                                    && self.ensure_image(
+                                    && self.ensure_shown_image(
+                                        item.id,
                                         image,
                                         Some((
                                             quad.rect[2] * self.scale,
@@ -10014,6 +10479,7 @@ impl GpuRenderer {
                             let bind = self.texture_bind(&view, "native CoreVideo frame");
                             self.images.insert(frame.id(), (bind, bytes, None, (0, 0)));
                         }
+                        self.drew_surface(item.id, frame.id());
                         canvas_image = Some(frame.id());
                         quads.push(Quad {
                             rect: fade,
@@ -10050,7 +10516,7 @@ impl GpuRenderer {
                             bounds.width * self.scale * stretch,
                             bounds.height * self.scale * stretch,
                         );
-                        if !self.ensure_image(image, Some(drawn), &mut stats)? {
+                        if !self.ensure_shown_image(item.id, image, Some(drawn), &mut stats)? {
                             continue;
                         }
                         let transform = image.paint_transform(bounds);
@@ -10762,12 +11228,6 @@ impl GpuRenderer {
                     true => cull_on_cpu(&mut quads, start as usize, clip, viewport, self.scale),
                     false => (clip, None),
                 };
-                // Direct3D 11 reads no backdrop: a box reading it draws its
-                // own colour opaque instead (`d3d11_leave_out`).
-                #[cfg(d3d11)]
-                if self.d3d11.is_some() && d3d11_reads_backdrop(scene, item.id) {
-                    d3d11_opaque(&mut quads[start as usize..], fade);
-                }
                 if quads.len() as u32 > start || item.effects.blur_radius > 0. {
                     let drawn =
                         culled_bounds.unwrap_or_else(|| quad_bounds(&quads[start as usize..]));
@@ -10877,6 +11337,13 @@ impl GpuRenderer {
             .collect();
         for (_, (_, _, w, h)) in &regions {
             stats.damaged_pixels += u64::from(*w) * u64::from(*h);
+        }
+        if !self.in_layer {
+            stats.regions = regions.len();
+            if let Some(kept) = &mut self.debug_regions {
+                kept.clear();
+                kept.extend(regions.iter().map(|(region, _)| *region));
+            }
         }
         // What this frame changes in the retained target, for surfaces that
         // must catch up later (`begin_layer_frame`).
@@ -11004,10 +11471,17 @@ impl GpuRenderer {
         // from the same data `render_direct` takes.
         #[cfg(d3d11)]
         if self.d3d11.is_some() {
-            let (mut draws, mut batches) = (draws, batches);
+            let mut draws = draws;
             self.d3d11_app_shaders(&mut draws);
-            self.d3d11_leave_out(scene, &quads, &mut draws, &mut batches);
-            if let Some(lacks) = self.d3d11_lacks(&draws, &batches) {
+            self.d3d11_leave_out(&mut draws);
+            for band in &mut bands {
+                self.d3d11_app_shaders(&mut band.draws);
+                self.d3d11_leave_out(&mut band.draws);
+            }
+            let lacks = (bands.iter().map(|band| band.draws.as_slice()))
+                .chain(std::iter::once(draws.as_slice()))
+                .find_map(|draws| self.d3d11_lacks(draws));
+            if let Some(lacks) = lacks {
                 let message = format!(
                     "ZGX_D3D11 draws no {lacks} yet, and leaving it out could mislead \
                      (docs/windows.md, Direct3D 11)"
@@ -11029,6 +11503,9 @@ impl GpuRenderer {
                 &clips,
                 &points,
                 (&effect_jobs, effect_first),
+                &reads,
+                &batches,
+                &bands,
                 stats,
             )?;
             self.frame_points = points;
@@ -11159,7 +11636,7 @@ impl GpuRenderer {
             .map(|(_, members)| self.plan_blur(&batch_filters(&draws, &regions, members)))
             .collect();
         let bytes: &[u8] = bytemuck::cast_slice(&quads);
-        let align = self.device.limits().min_storage_buffer_offset_alignment as usize;
+        let align = self.storage_align;
         // Each part at an aligned offset in the buffer.
         let mut records = Vec::new();
         let mut record = |part: &[u8]| {
@@ -11172,7 +11649,7 @@ impl GpuRenderer {
         let region_range = (!clips.is_empty()).then(|| record(bytemuck::cast_slice(&clips)));
         // The polyline strokes' points too, bound as group 2 where drawn.
         let points_range = polylines.then(|| record(bytemuck::cast_slice(&points)));
-        let ranges: Vec<Option<[(u64, u64); 2]>> = plans
+        let mut ranges: Vec<Option<[(u64, u64); 2]>> = plans
             .iter()
             .map(|plan| {
                 let plan = plan.as_ref()?;
@@ -11183,6 +11660,9 @@ impl GpuRenderer {
                 ])
             })
             .collect();
+        if ranges.iter().any(Option::is_some) {
+            pad_blur_records(bytes.len(), &mut records, &mut ranges);
+        }
         let needed = bytes.len() + records.len();
         let vertices = if let Some(mapped) = &mut self.mapped {
             let mapped = mapped.get_mut();
@@ -11232,12 +11712,7 @@ impl GpuRenderer {
                 ))
                 .map(|(uniform, _)| uniform.clone())
                 .expect("selected above");
-            let regions = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &vertices,
-                offset,
-                size: wgpu::BufferSize::new(size),
-            });
-            self.viewport_bind = Some(self.viewport_group(&uniform, regions));
+            self.viewport_bind = Some(self.regions_group(&uniform, &vertices, (offset, size)));
         }
         let points_bind = points_range.map(|(offset, size)| {
             let polylines = self.context.inner.quads.polylines();
@@ -11576,7 +12051,8 @@ impl GpuRenderer {
                         (record.atlas[0] as u32, record.atlas[1] as u32, *w, *h)
                     })
                     .collect();
-                Some((plan, slots, rects))
+                let halved = halved(&plan.slots);
+                Some((plan, slots, rects, halved))
             })
             .collect();
         let committed = {
@@ -11603,6 +12079,14 @@ impl GpuRenderer {
                 .as_ref()
                 .filter(|_| plans.iter().any(Option::is_some))
                 .map(|scratch| scratch.atlas.each_ref().map(raw));
+            let blur_halves = (self.blur_halves.as_ref())
+                .filter(|_| {
+                    plans
+                        .iter()
+                        .flatten()
+                        .any(|plan| plan.3.iter().any(Option::is_some))
+                })
+                .map(raw);
             // Effect slots drawn first, each pass of them into its atlas.
             let effect_passes = self.metal_effect_passes(effect_jobs, effect_first, &raw);
             let band_targets: Vec<_> = bands.iter().map(|band| raw(&band.texture)).collect();
@@ -11691,7 +12175,7 @@ impl GpuRenderer {
             // The batch drawn back at the start of the pass after its blur.
             let mut blurred = None;
             for (segment, end) in splits.chain([draws.len()]).enumerate() {
-                if let Some((plan, slots, _)) = blurred.take() {
+                if let Some((plan, slots, _, _)) = blurred.take() {
                     let plan: &BlurPlan = plan;
                     let records = metal_frame::BlurRecords {
                         blurs: bytemuck::cast_slice(&plan.blurs),
@@ -11736,7 +12220,7 @@ impl GpuRenderer {
                         stats.instances += (batch.end - batch.start) as usize;
                     });
                 }
-                let Some(Some((plan, slots, rects))) = plans.get(segment) else {
+                let Some(Some((plan, slots, rects, halved))) = plans.get(segment) else {
                     from = end;
                     continue;
                 };
@@ -11745,14 +12229,25 @@ impl GpuRenderer {
                     slots: bytemuck::cast_slice(slots),
                 };
                 let blur = blur_atlas.as_ref().expect("planned");
-                pass.blur(frame, &target, [&blur[0], &blur[1]], &records, rects);
+                let halves = (blur_halves.as_ref())
+                    .filter(|_| halved.iter().any(Option::is_some))
+                    .map(|halves| (&**halves, &halved[..]));
+                pass.blur(
+                    frame,
+                    &target,
+                    [&blur[0], &blur[1]],
+                    halves,
+                    &records,
+                    rects,
+                );
                 pass.resume(&target);
                 pass.texture(&atlas);
                 sampled = TextureSource::Atlas;
                 stats.draw_calls += 3 * rects.iter().filter(|r| r.2 > 0 && r.3 > 0).count();
-                stats.render_passes += 4;
+                stats.render_passes += 4 + usize::from(halves.is_some());
+                stats.draw_calls += halved.iter().flatten().count();
                 stats.blur_passes += 3;
-                blurred = Some((plan, slots, rects));
+                blurred = Some((plan, slots, rects, halved));
                 from = end;
             }
             let _span = zgx::profile::span(zgx::profile::Phase::Submit);
@@ -11812,17 +12307,25 @@ impl GpuRenderer {
             let (id, shaders, kind) = match draw.shading {
                 Shading::Fill(id) => (id, &self.fill_shaders, AppShader::Fill),
                 Shading::Filter(id) => (id, &self.filter_shaders, AppShader::Filter),
+                Shading::FilterBlend(id) => (id, &self.filter_shaders, AppShader::FilterBlend),
                 _ => continue,
             };
             let ready = shaders
                 .get(&id)
                 .map(|shader| state.device.app_shader(shader, kind, wait));
+            // Glass not compiled yet isn't drawn, as Direct3D 12's blended
+            // draw waits for its pipeline; anything else draws as painted.
+            let glass = kind == AppShader::FilterBlend;
             match ready {
                 Some(Some(true)) => {}
                 Some(None) => {
                     awaited = true;
-                    draw.shading = Shading::Full;
+                    match glass {
+                        true => draw.end = draw.start,
+                        false => draw.shading = Shading::Full,
+                    }
                 }
+                _ if glass => draw.end = draw.start,
                 _ => draw.shading = Shading::Full,
             }
         }
@@ -11831,22 +12334,14 @@ impl GpuRenderer {
     /// What Direct3D 11 leaves out of a frame rather than fail it, where
     /// what's left can't show a picture a user would wrongly trust; each kind
     /// named once (`d3d11_frame::left_out`):
-    /// - images a GPU view draws: left empty, visibly missing;
-    /// - backdrop blurs and layer shaders reading the backdrop (glass): the
-    ///   box drawn opaque in its own colour under its content (built so,
-    ///   `d3d11_opaque`), as the system's Reduce transparency draws glass,
-    ///   so what's over it stays legible. A box with no colour of its own
-    ///   keeps the frame's error.
+    /// - images a GPU view draws, where the views' device couldn't be made
+    ///   (`view_host`): left empty, visibly missing.
     ///
-    /// Content blurs, masks and drop shadows draw (`d3d11_effects`).
+    /// Content blurs, masks and drop shadows draw (`d3d11_effects`), and
+    /// backdrop blurs and layer shaders reading the backdrop (glass, frosted
+    /// or not) over a copy of it (`render_d3d11`).
     #[cfg(d3d11)]
-    fn d3d11_leave_out(
-        &self,
-        scene: &Scene,
-        quads: &[Quad],
-        draws: &mut [Draw],
-        batches: &mut Vec<(usize, Vec<usize>)>,
-    ) {
+    fn d3d11_leave_out(&self, draws: &mut [Draw]) {
         for draw in draws.iter_mut() {
             if let TextureSource::Image(id) | TextureSource::Pixelated(id) = draw.source
                 && id != effects::EFFECT_ATLAS
@@ -11857,33 +12352,12 @@ impl GpuRenderer {
                 draw.end = draw.start;
             }
         }
-        for draw in draws.iter_mut() {
-            let glass = matches!(draw.shading, Shading::FilterBlend(_));
-            if !(draw.blur.is_some() || glass) || !d3d11_has_colour(scene, quads, draw) {
-                continue;
-            }
-            d3d11_frame::left_out(match glass {
-                true => "backdrop reads (glass drawn opaque)",
-                false => "backdrop blurs (drawn opaque)",
-            });
-            draw.blur = None;
-            if glass {
-                draw.shading = Shading::Full;
-            }
-        }
-        // The backdrop batches index draws: none is left to read them.
-        if draws.iter().all(|draw| draw.blur.is_none()) {
-            batches.clear();
-        }
     }
     /// What a frame needs that Direct3D 11 neither draws nor leaves out
     /// (`d3d11_leave_out`), if anything: it draws what the Windows suite's
     /// scenes do, shader fills and layer shaders not reading the backdrop.
     #[cfg(d3d11)]
-    fn d3d11_lacks(&self, draws: &[Draw], batches: &[(usize, Vec<usize>)]) -> Option<&'static str> {
-        if !batches.is_empty() {
-            return Some("backdrop blur over a box with no colour of its own");
-        }
+    fn d3d11_lacks(&self, draws: &[Draw]) -> Option<&'static str> {
         draws
             .iter()
             .filter(|draw| draw.end > draw.start)
@@ -11906,9 +12380,9 @@ impl GpuRenderer {
                     | Shading::Fill(_)
                     | Shading::Filter(_),
                 ) => None,
-                (_, Shading::FilterBlend(_)) => {
-                    Some("layer shader reading the backdrop over a box with no colour of its own")
-                }
+                // Compiled (`d3d11_app_shaders`), over a copy of the backdrop
+                // (taken after a blur under it has drawn, `render_d3d11`).
+                (_, Shading::FilterBlend(_)) => None,
                 // Its pixel stage made when first drawn (`d3d11_frame::Frame::quads`).
                 (_, Shading::ImageEffect) => None,
                 // Over a copy of the target under it (`d3d11_frame::Frame::blended`).
@@ -11956,9 +12430,83 @@ impl GpuRenderer {
             *sampled = batch.source;
         }
         frame.scissor(rect);
+        if self
+            .d3d11
+            .as_ref()
+            .is_some_and(|state| !state.chains.is_empty())
+        {
+            self.d3d11_inputs(frame, batch.shading);
+        }
         frame.quads(batch.shading, false, batch.start..batch.end);
         stats.draw_calls += 1;
         stats.instances += (batch.end - batch.start) as usize;
+    }
+    /// Bind what the layer shader `shading` draws with at its inputs'
+    /// registers, if it has inputs (`d3d11_frame::Frame::inputs`), as
+    /// `bind_inputs` binds them for wgpu. Out of line: only frames with such
+    /// a shader call it.
+    #[cfg(d3d11)]
+    #[cold]
+    #[inline(never)]
+    fn d3d11_inputs(&self, frame: &mut d3d11_frame::Frame<'_>, shading: Shading) {
+        let (Shading::Filter(id) | Shading::FilterBlend(id)) = shading else {
+            return;
+        };
+        if let Some(chain) = (self.d3d11.as_ref()).and_then(|state| state.chains.get(&id)) {
+            frame.inputs(chain);
+        }
+    }
+    /// Fade bands' passes with Direct3D 11 (`render_d3d11`): each band's
+    /// texture (one of Direct3D 11's standing for its wgpu texture, as a
+    /// layer's does) cleared, then its draws in its regions at its viewport.
+    #[cfg(d3d11)]
+    fn d3d11_bands(
+        &mut self,
+        bands: &[bands::BandPhase<'_>],
+        clips: &[Region],
+        vertices: &windows::Win32::Graphics::Direct3D11::ID3D11Buffer,
+        stats: &mut GpuStats,
+    ) -> Result<(), GpuError> {
+        let kept = self.kept_now();
+        let mut unpainted = false;
+        for band in bands {
+            let state = self.d3d11.as_mut().expect("checked by the caller");
+            let device = state.device.clone();
+            let size = (band.texture.width(), band.texture.height());
+            if state
+                .layers
+                .get(&band.texture)
+                .is_none_or(|t| (t.width, t.height) != size)
+            {
+                let surface = device.surface(size.0, size.1, true)?;
+                state.layers.insert(band.texture.clone(), surface);
+            }
+            let viewport = [band.viewport.width, band.viewport.height, self.scale, 0.];
+            state.set_frame(viewport, bytemuck::cast_slice(clips))?;
+            let state = self.d3d11.as_ref().expect("checked by the caller");
+            let target = &state.layers[&band.texture];
+            device.clear(target);
+            let mut frame = device.begin(state, target, vertices);
+            let atlas = state.atlas.as_ref().and_then(|atlas| atlas.srv.as_ref());
+            frame.texture(atlas.expect("made by the caller"));
+            let mut sampled = TextureSource::Atlas;
+            for (region, _) in &band.regions {
+                self.batches(*region, &band.draws, 0, kept, |batch| {
+                    self.d3d11_batch(&mut frame, &mut sampled, &mut unpainted, stats, batch)
+                });
+            }
+            frame.end();
+            stats.render_passes += 1;
+        }
+        // The frame's viewport again.
+        let state = self.d3d11.as_mut().expect("checked by the caller");
+        state.set_frame(self.viewport_values, bytemuck::cast_slice(clips))?;
+        match unpainted {
+            true => Err(GpuError(
+                "Direct3D 11 has no texels for a layer or image a fade band draws".into(),
+            )),
+            false => Ok(()),
+        }
     }
     /// Layer effects' passes with Direct3D 11 (`d3d11_frame::Device::effects`):
     /// `jobs`' quads at instance `first` on, as `effect_quads` lays them out,
@@ -12068,10 +12616,25 @@ impl GpuRenderer {
         clips: &[Region],
         points: &[[f32; 2]],
         (effect_jobs, effect_first): (&[effects::Job], u32),
+        reads: &[(usize, Rect)],
+        batches: &[(usize, Vec<usize>)],
+        bands: &[bands::BandPhase<'_>],
         mut stats: GpuStats,
     ) -> Result<GpuStats, GpuError> {
         let _span = zgx::profile::span(zgx::profile::Phase::Encode);
         let (width, height) = (self.width, self.height);
+        // Backdrop blurs a batch at a time, planned as Direct3D 12 plans them
+        // (`render_flat`): the records and slots, the atlas's size.
+        let plans: Vec<Option<BlurPlan>> = batches
+            .iter()
+            .map(|(_, members)| self.plan_blur(&batch_filters(&draws, regions, members)))
+            .collect();
+        let atlas_size = self.blur_scratch.as_ref().map(|scratch| {
+            let texture = &scratch.atlas[0];
+            (texture.width(), texture.height())
+        });
+        // `plan_halves` fitted Direct3D 12's halves to every batch above.
+        let halves_size = (self.blur_halves.as_ref()).map(|h| (h.width(), h.height()));
         let state = self.d3d11.as_mut().expect("checked by the caller");
         let device = state.device.clone();
         let parts = [bytemuck::cast_slice(&quads)];
@@ -12126,11 +12689,21 @@ impl GpuRenderer {
         if state.atlas.is_none() {
             state.atlas = Some(device.surface(1, 1, false)?);
         }
+        // Fade bands (bands.rs): what reaches each run's bands drawn unfaded
+        // into a texture of its own before the frame composites it through
+        // the mask, as `encode_band` draws it.
+        if !bands.is_empty() {
+            self.d3d11_bands(bands, clips, &vertices, &mut stats)?;
+        }
+        let state = self.d3d11.as_mut().expect("checked by the caller");
         // Blended layers read a copy of the target under them, of its size.
         let blended: Vec<usize> = draws
             .iter()
             .enumerate()
-            .filter(|(_, draw)| draw.shading == Shading::Blend && draw.end > draw.start)
+            .filter(|(_, draw)| {
+                matches!(draw.shading, Shading::Blend | Shading::FilterBlend(_))
+                    && draw.end > draw.start
+            })
             .map(|(index, _)| index)
             .collect();
         if !blended.is_empty()
@@ -12141,8 +12714,45 @@ impl GpuRenderer {
         {
             state.backdrop = Some(device.surface(width, height, false)?);
         }
+        // The blur's atlas pair at the plans' size; each batch's records.
+        if let Some((atlas_width, atlas_height)) =
+            atlas_size.filter(|_| plans.iter().any(Option::is_some))
+            && state
+                .blur_atlas
+                .as_ref()
+                .is_none_or(|a| (a[0].width, a[0].height) != (atlas_width, atlas_height))
+        {
+            state.blur_atlas = Some(device.blur_atlas(atlas_width, atlas_height)?);
+        }
+        // The halves where a batch reduces a slot by 8, of Direct3D 12's size.
+        if let Some((halves_width, halves_height)) = halves_size.filter(|_| {
+            (plans.iter().flatten()).any(|plan| halved(&plan.slots).iter().any(Option::is_some))
+        }) && state
+            .blur_halves
+            .as_ref()
+            .is_none_or(|h| (h.width, h.height) != (halves_width, halves_height))
+        {
+            state.blur_halves = Some(device.blur_halves(halves_width, halves_height)?);
+        }
+        let records = plans
+            .iter()
+            .enumerate()
+            .map(|(batch, plan)| {
+                let Some(plan) = plan else { return Ok(None) };
+                let slots: Vec<SlotRecord> = plan.slots.iter().map(|slot| slot.0).collect();
+                Ok(Some([
+                    state.set_blur_records(batch, 0, bytemuck::cast_slice(&plan.blurs))?,
+                    state.set_blur_records(batch, 1, bytemuck::cast_slice(&slots))?,
+                ]))
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
         self.whole_frames = 0;
-        let first = occluded_from(&quads, &draws, regions, self.scale);
+        // Filters sample what lies beneath them: a frame blurring draws it all
+        // (as `render_flat`'s, whose split passes do).
+        let first = match batches.is_empty() {
+            true => occluded_from(&quads, &draws, regions, self.scale),
+            false => vec![0; regions.len()],
+        };
         let state = self.d3d11.as_ref().expect("checked by the caller");
         let views = self
             .layer_present
@@ -12169,8 +12779,12 @@ impl GpuRenderer {
             frame.copies(instances);
             stats.draw_calls += 1;
         }
-        let atlas = state.atlas.as_ref().and_then(|atlas| atlas.srv.as_ref());
-        frame.texture(atlas.expect("made above"));
+        let atlas_view = state
+            .atlas
+            .as_ref()
+            .and_then(|atlas| atlas.srv.as_ref())
+            .expect("made above");
+        frame.texture(atlas_view);
         // What batches sample: the atlas, a layer's content or an image.
         let mut sampled = TextureSource::Atlas;
         let mut unpainted = false;
@@ -12180,22 +12794,129 @@ impl GpuRenderer {
             Shading::Full
         };
         let kept = self.kept_now();
-        for (index, (region, region_scissor)) in regions.iter().enumerate() {
-            frame.scissor(*region_scissor);
-            if first[index] == 0 {
-                frame.quads(clear, true, 0..1);
-                stats.draw_calls += 1;
-            }
-            // The draws up to each blended one, then it, over what they drew.
-            let mut from = 0;
-            for &at in blended.iter().chain(std::iter::once(&draws.len())) {
+        // As Direct3D 12 splits its pass (`render_flat`): every region's draws
+        // up to each batch of backdrop blurs or blended draw. A batch's blur
+        // passes then draw into its atlas, and it draws back over the target
+        // (its first draw's own quads draw after). A blended draw: the target
+        // under it copied (all it reads, within the regions), then it in every
+        // region. A blur comes first where both start at a draw (frosted
+        // glass reads what its blur drew). A layer shader reading the backdrop
+        // (glass) may read past its own region.
+        // Backdrop readers that needn't see each other share a copy, as
+        // Direct3D 12's do: each still draws at its own cut, those sharing
+        // with none of their own.
+        let sharing = share_backdrops(&draws, reads);
+        let mut cuts: Vec<(usize, Option<usize>)> = (batches.iter().enumerate())
+            .map(|(batch, (start, _))| (*start, Some(batch)))
+            .chain(blended.iter().map(|&at| (at, None)))
+            .collect();
+        cuts.sort_by_key(|&(at, batch)| (at, batch.is_none()));
+        let mut from = 0;
+        // Each region is cleared once, in the first segment: a batch of blurs
+        // at the first draw (a popup's glass) leaves `from` at 0, and its blur
+        // drawn back must not be cleared again.
+        let mut cleared = false;
+        for &(at, batch) in cuts.iter().chain(std::iter::once(&(draws.len(), None))) {
+            for (index, (region, region_scissor)) in regions.iter().enumerate() {
+                frame.scissor(*region_scissor);
+                if !cleared && first[index] == 0 {
+                    frame.quads(clear, true, 0..1);
+                    stats.draw_calls += 1;
+                }
                 self.batches(*region, &draws[from..at], first[index], kept, |batch| {
                     self.d3d11_batch(&mut frame, &mut sampled, &mut unpainted, &mut stats, batch)
                 });
-                from = at + 1;
-                let Some(draw) = draws.get(at) else {
+            }
+            cleared = true;
+            if let Some(batch) = batch {
+                from = at;
+                let (Some(plan), Some(records), Some(atlas)) =
+                    (&plans[batch], &records[batch], &state.blur_atlas)
+                else {
                     continue;
                 };
+                let slots: Vec<d3d11_frame::BlurSlot> = (plan.slots.iter())
+                    .zip(halved(&plan.slots))
+                    .map(
+                        |((record, (w, h), blurred), halves)| d3d11_frame::BlurSlot {
+                            texels: (record.atlas[0] as u32, record.atlas[1] as u32, *w, *h),
+                            blurred: *blurred,
+                            halves,
+                        },
+                    )
+                    .collect();
+                let copies = plan.slots.iter().any(|slot| !slot.2);
+                let records = [&records[0], &records[1]];
+                let backdrop = state.popup_backdrop.as_ref();
+                let halves = state.blur_halves.as_ref();
+                let drawn = frame.blur(target, backdrop, atlas, halves, records, &slots, copies)
+                    && frame.blur_back(target, &atlas[0], records, &plan.draws, plan.mixed);
+                if drawn {
+                    // With the halves pass where a slot reduces by 8.
+                    let halved = (slots.iter()).filter(|slot| slot.halves.is_some()).count()
+                        * usize::from(halves.is_some());
+                    stats.blur_passes += 3;
+                    stats.render_passes += 3 + usize::from(halved > 0);
+                    stats.draw_calls += plan.draws.len()
+                        + slots.iter().filter(|slot| slot.blurred).count() * 2
+                        + slots.len()
+                        + halved;
+                } else {
+                    unpainted = true;
+                }
+                // The frame's bindings again, and the glyph atlas sampled.
+                frame.rebind(state, target, &vertices);
+                frame.texture(atlas_view);
+                sampled = TextureSource::Atlas;
+                continue;
+            }
+            from = at + 1;
+            let Some(draw) = draws.get(at) else {
+                continue;
+            };
+            let backdrop = state.backdrop.as_ref().expect("made above");
+            // A reader sharing an earlier one's copy (`share_backdrops`)
+            // reads it as made: nothing drawn since paints where it reads.
+            if !(sharing.iter()).any(|(_, shared)| shared.contains(&at)) {
+                // What it reads (`backdrop_read`) and what those sharing its
+                // copy read, or what lies under it.
+                let under = (reads.iter())
+                    .filter(|(reader, _)| {
+                        *reader == at
+                            || (sharing.iter())
+                                .any(|(first, shared)| *first == at && shared.contains(reader))
+                    })
+                    .map(|(_, read)| *read)
+                    .reduce(Rect::union)
+                    .or_else(|| draw.bounds.intersection(draw.clip));
+                let copied = regions
+                    .iter()
+                    .filter_map(|(region, _)| region.intersection(under?))
+                    .reduce(Rect::union)
+                    .and_then(|area| scissor(area, self.scale, self.width, self.height));
+                let Some(copied) = copied else {
+                    continue;
+                };
+                frame.copy_backdrop(target, backdrop, copied);
+                stats.backdrop_copies += 1;
+            }
+            if draw.source != sampled {
+                let Some(view) = self.d3d11_texture(draw.source) else {
+                    unpainted = true;
+                    continue;
+                };
+                frame.texture(view);
+                frame.nearest(matches!(draw.source, TextureSource::Pixelated(_)));
+                sampled = draw.source;
+            }
+            let glass = match draw.shading {
+                Shading::FilterBlend(id) => Some(id),
+                _ => None,
+            };
+            if glass.is_some() && !state.chains.is_empty() {
+                self.d3d11_inputs(&mut frame, draw.shading);
+            }
+            for (index, (region, _)) in regions.iter().enumerate() {
                 let Some(rect) = region
                     .intersection(draw.clip)
                     .and_then(|rect| rect.intersection(draw.bounds))
@@ -12204,17 +12925,7 @@ impl GpuRenderer {
                 else {
                     continue;
                 };
-                if draw.source != sampled {
-                    let Some(view) = self.d3d11_texture(draw.source) else {
-                        unpainted = true;
-                        continue;
-                    };
-                    frame.texture(view);
-                    frame.nearest(matches!(draw.source, TextureSource::Pixelated(_)));
-                    sampled = draw.source;
-                }
-                let backdrop = state.backdrop.as_ref().expect("made above");
-                if frame.blended(target, backdrop, rect, draw.start..draw.end) {
+                if frame.blended(glass, backdrop, rect, draw.start..draw.end) {
                     stats.draw_calls += 1;
                     stats.instances += (draw.end - draw.start) as usize;
                 } else {
@@ -13222,6 +13933,41 @@ impl GpuRenderer {
             }
         }
     }
+    /// Fit the halves (`blur_halves`) to a batch whose slots reduce by 8, at
+    /// twice its extent: grown, or kept for batches planned before; false
+    /// where twice the extent passes the device's limit (the batch draws no
+    /// blur). Out of `plan_blur`'s body: a frame without a blur never comes
+    /// here.
+    #[cold]
+    #[inline(never)]
+    fn plan_halves(
+        &mut self,
+        slots: &[(SlotRecord, (u32, u32), bool)],
+        (width, height): (u32, u32),
+        limit: u32,
+    ) -> bool {
+        if !slots
+            .iter()
+            .any(|(record, _, blurred)| *blurred && record.region[2] == 8.)
+        {
+            return true;
+        }
+        if width * 2 > limit || height * 2 > limit {
+            return false;
+        }
+        let fits = |h: &wgpu::Texture| h.width() >= width * 2 && h.height() >= height * 2;
+        if !self.blur_halves.as_ref().is_some_and(fits) {
+            let (current_w, current_h) =
+                (self.blur_halves.as_ref()).map_or((0, 0), |h| (h.width(), h.height()));
+            let grow = |want: u32, have: u32| want.max(have).next_multiple_of(128).min(limit);
+            self.blur_halves = Some(halves_texture(
+                &self.device,
+                grow(width * 2, current_w),
+                grow(height * 2, current_h),
+            ));
+        }
+        true
+    }
     /// Plan a batch of backdrop filters (see blur.wgsl): each one's levels
     /// as slots of the atlas, packed, the atlas grown to hold them.
     fn plan_blur(&mut self, filters: &[Filter]) -> Option<BlurPlan> {
@@ -13387,7 +14133,12 @@ impl GpuRenderer {
         if width > limit || height > limit {
             return None;
         }
-        let atlas = self.blur_scratch.take().map(|scratch| scratch.atlas);
+        // A factor-8 slot's reduce goes through the halves.
+        if !self.plan_halves(&slots, (width, height), limit) {
+            return None;
+        }
+        let kept = self.blur_scratch.take();
+        let atlas = kept.as_ref().map(|scratch| scratch.atlas.clone());
         let atlas = [0, 1].map(|i| match &atlas {
             Some(atlas) if atlas[i].width() >= width && atlas[i].height() >= height => {
                 atlas[i].clone()
@@ -13404,7 +14155,11 @@ impl GpuRenderer {
                 )
             }
         });
-        self.blur_scratch = Some(BlurScratch { atlas });
+        // Its views and groups kept while its atlas is.
+        self.blur_scratch = Some(match kept {
+            Some(kept) if kept.atlas == atlas => kept,
+            _ => BlurScratch::new(atlas),
+        });
         Some(BlurPlan {
             blurs,
             slots,
@@ -13416,6 +14171,60 @@ impl GpuRenderer {
     /// across and down passes, every slot of the batch drawn in each. Its
     /// records lie in `buffer` (offset and size of the filters', then the
     /// slots').
+    /// The blur's bind groups for records in `records` (each part at most
+    /// `capacity` bytes) read from `source`: those made for them before,
+    /// or made now (and those for a buffer no longer drawn from let go).
+    /// Binding 1 goes unread except by the copy mix, but may never be the
+    /// pass's own target.
+    #[inline(never)]
+    fn blur_groups(
+        &mut self,
+        records: &wgpu::Buffer,
+        capacity: [u64; 2],
+        source: &wgpu::TextureView,
+    ) -> usize {
+        let scratch = self.blur_scratch.as_mut().expect("planned");
+        if scratch.halves.as_ref().map(|(texture, _)| texture) != self.blur_halves.as_ref() {
+            scratch.halves = (self.blur_halves.as_ref())
+                .map(|texture| (texture.clone(), texture.create_view(&Default::default())));
+        }
+        let halves = scratch.halves.as_ref().map(|(_, view)| view);
+        if let Some(found) = scratch.groups.iter().position(|groups| {
+            groups.records == *records
+                && groups.capacity == capacity
+                && groups.source == *source
+                && groups.halves.as_ref() == halves
+        }) {
+            return found;
+        }
+        let (vertices, mapped) = (&self.vertices, &self.mapped);
+        scratch.groups.retain(|groups| {
+            groups.records == *vertices
+                || mapped
+                    .as_ref()
+                    .is_some_and(|ring| ring.borrow().holds(&groups.records))
+        });
+        let pipelines = self.blur_pipelines.as_ref().expect("created first");
+        let device = &self.device;
+        let views = &scratch.views;
+        let group = |from: &wgpu::TextureView| {
+            blur_group(device, pipelines, from, &views[1], records, capacity)
+        };
+        let groups = BlurGroups {
+            records: records.clone(),
+            capacity,
+            source: source.clone(),
+            halves: halves.cloned(),
+            from_source: group(source),
+            from_halves: halves
+                .map(|halves| blur_group(device, pipelines, source, halves, records, capacity)),
+            from_first: blur_group(device, pipelines, &views[0], &views[0], records, capacity),
+            from_second: blur_group(device, pipelines, &views[1], &views[1], records, capacity),
+            from_frame: (*source != self.view).then(|| group(&self.view)),
+        };
+        scratch.groups.push(groups);
+        scratch.groups.len() - 1
+    }
     fn blur(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -13434,62 +14243,27 @@ impl GpuRenderer {
         if self.blur_pipelines.is_none() {
             self.blur_pipelines = Some(BlurPipelines::new(&self.device));
         }
-        let atlas = &self.blur_scratch.as_ref().expect("planned").atlas;
-        let views = atlas
-            .each_ref()
-            .map(|texture| texture.create_view(&Default::default()));
-        let records = |(offset, size): (u64, u64)| {
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer,
-                offset,
-                size: wgpu::BufferSize::new(size),
-            })
-        };
+        // A popup blurs its window's frame (`set_backdrop`), but what it mixes
+        // the blur over stays its own: past a rounded box's curve, its target
+        // (its shadow), not the window's pixels.
+        let backdrop = self.backdrop.as_ref().map(|(_, view)| view.clone());
+        let source = backdrop.clone().unwrap_or_else(|| self.view.clone());
+        let offsets = ranges.map(|(offset, _)| offset as u32);
+        let group = self.blur_groups(buffer, ranges.map(|(_, capacity)| capacity), &source);
         let pipelines = self.blur_pipelines.as_ref().expect("created above");
-        // Binding 1 goes unread except by the copy mix, but may never be the
-        // pass's own target.
-        let bind = |source: &wgpu::TextureView, other: &wgpu::TextureView| {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("backdrop blur"),
-                layout: &pipelines.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(source),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(other),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: records(ranges[0]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: records(ranges[1]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::Sampler(&pipelines.linear),
-                    },
-                ],
-            })
-        };
+        let scratch = self.blur_scratch.as_ref().expect("planned");
+        let (views, groups) = (&scratch.views, &scratch.groups[group]);
         // Whole-area passes: what any output draws depends on the area alone,
         // so a partly damaged filter matches a fresh frame. Copies land in
         // the first atlas with the averages and stay there.
         let copies = slots.iter().any(|slot| !slot.2);
-        // A popup blurs its window's frame (`set_backdrop`), but what it mixes
-        // the blur over stays its own: past a rounded box's curve, its target
-        // (its shadow), not the window's pixels.
-        let backdrop = self.backdrop.as_ref().map(|(_, view)| view);
-        let source = backdrop.unwrap_or(&self.view);
+        let halves = scratch.halves.as_ref().map(|(_, view)| view);
         let passes = [
             (
                 "blur reduce",
                 &pipelines.reduce,
-                bind(source, &views[1]),
+                // After a factor-8 batch's halves pass, reading them.
+                halves_pass(encoder, pipelines, halves, slots, groups, &offsets, stats),
                 &views[0],
                 backdrop.is_some(),
                 false,
@@ -13497,7 +14271,7 @@ impl GpuRenderer {
             (
                 "blur across",
                 &pipelines.across,
-                bind(&views[0], &views[0]),
+                &groups.from_first,
                 &views[1],
                 true,
                 false,
@@ -13505,7 +14279,7 @@ impl GpuRenderer {
             (
                 "blur down",
                 &pipelines.down,
-                bind(&views[1], &views[1]),
+                &groups.from_second,
                 &views[0],
                 true,
                 copies,
@@ -13530,7 +14304,7 @@ impl GpuRenderer {
                 ..Default::default()
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, group, &[]);
+            pass.set_bind_group(0, *group, &offsets);
             for (k, (record, (w, h), blurred)) in slots.iter().enumerate() {
                 if *w == 0 || *h == 0 || (*blurred_only && !blurred) {
                     continue;
@@ -13543,7 +14317,7 @@ impl GpuRenderer {
         stats.render_passes += passes.len();
         stats.blur_passes += passes.len();
         if backdrop.is_some() && copies {
-            let group = bind(&self.view, &views[1]);
+            let group = groups.from_frame.as_ref().expect("made with a backdrop");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blur originals"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -13558,7 +14332,7 @@ impl GpuRenderer {
                 ..Default::default()
             });
             pass.set_pipeline(&pipelines.reduce);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, group, &offsets);
             for (k, (record, (w, h), blurred)) in slots.iter().enumerate() {
                 if *w == 0 || *h == 0 || *blurred {
                     continue;
@@ -13572,7 +14346,8 @@ impl GpuRenderer {
             stats.blur_passes += 1;
         }
         Some(VerticalBlur {
-            bind: bind(&views[0], &views[0]),
+            bind: groups.from_first.clone(),
+            offsets,
             draws: draws.clone(),
             mixed,
         })
@@ -13586,7 +14361,7 @@ impl GpuRenderer {
         stats: &mut GpuStats,
     ) {
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &blur.bind, &[]);
+        pass.set_bind_group(0, &blur.bind, &blur.offsets);
         for &(index, (x, y, width, height)) in &blur.draws {
             pass.set_scissor_rect(x, y, width, height);
             pass.draw(0..3, index..index + 1);
@@ -13758,6 +14533,38 @@ impl GpuRenderer {
         }
         self.canvases.uploaded(node);
         Ok(found.id)
+    }
+    /// `ensure_image` for `image` drawn as what `node` shows, counted while
+    /// it shows it (`drew_image`). Out of line: the frame's draw loop calls
+    /// it where it called `ensure_image`, and runs as it did.
+    #[inline(never)]
+    fn ensure_shown_image(
+        &mut self,
+        node: NodeId,
+        image: &zgx::image::ImageData,
+        drawn: Option<(f32, f32)>,
+        stats: &mut GpuStats,
+    ) -> Result<bool, GpuError> {
+        self.drew_image(node, image.id());
+        self.ensure_image(image, drawn, stats)
+    }
+    /// `drew_image` for a native surface's frame. Out of line, as
+    /// `ensure_shown_image`: the draw loop runs as it did.
+    #[cfg(target_os = "macos")]
+    #[inline(never)]
+    fn drew_surface(&mut self, node: NodeId, frame: u64) {
+        self.drew_image(node, frame);
+    }
+    /// `node` drew `image`: counted while it shows it (`SceneImages`), as a
+    /// node appended or given an image isn't named by the scene's changes.
+    #[inline]
+    fn drew_image(&mut self, node: NodeId, image: u64) {
+        if let Some(images) = &mut self.scene_images
+            && images.counted
+            && images.by_node.get(&node) != Some(&image)
+        {
+            images.show(node, Some(image));
+        }
     }
     /// `image`'s texture for this frame: uploaded if it has none, and
     /// marked drawn now, so it is the last to go past the budget. `false`:
@@ -16275,6 +17082,10 @@ impl GpuRenderer {
     /// window has stopped presenting for a while.
     pub fn trim(&mut self) {
         self.backdrop = None;
+        #[cfg(d3d11)]
+        if let Some(state) = &mut self.d3d11 {
+            state.popup_backdrop = None;
+        }
         present_log::log(|| {
             #[cfg(target_os = "macos")]
             let plane = self.layer_present.as_ref().map_or("none", |p| p.plane());
@@ -16288,6 +17099,13 @@ impl GpuRenderer {
         // The font cache read at launch, checked as the host first goes idle.
         font_cache_check();
         self.blur_scratch = None;
+        self.blur_halves = None;
+        // The bind groups kept for the frame's regions, made again as needed.
+        self.regions_groups = Vec::new();
+        #[cfg(d3d11)]
+        if let Some(state) = &mut self.d3d11 {
+            state.blur_records = Vec::new();
+        }
         // A frame's quads and draws: the next frame makes them again.
         self.frame_quads = Vec::new();
         self.frame_points = Vec::new();
@@ -16442,10 +17260,11 @@ impl GpuRenderer {
             frame.retain_fills(|id| fills.contains_key(&id));
         }
         #[cfg(d3d11)]
-        if let Some(state) = &self.d3d11 {
+        if let Some(state) = &mut self.d3d11 {
             state
                 .device
                 .retain_app_shaders(|id| fills.contains_key(&id) || filters.contains_key(&id));
+            state.chains.retain(|id, _| filters.contains_key(id));
         }
     }
     /// Input arrived: if the window idled (`trim`) and has drawn nothing
@@ -16685,13 +17504,12 @@ impl GpuRenderer {
     /// bytes in RGBA order. Single-pass renderers draw the pending frame
     /// through a non-sRGB view; others use the present blit, as on screen.
     pub fn debug_present_offscreen(&mut self) -> Result<Vec<u8>, GpuError> {
-        // Direct3D 11 presents through its own swap chain alone: the no-op
-        // shell would read back nothing.
+        // Direct3D 11 draws into what it presents (its swap chain's buffer,
+        // or offscreen its own target), with no blit between: what it would
+        // present is its frame as read back.
         #[cfg(d3d11)]
         if self.d3d11.is_some() {
-            return Err(GpuError(
-                "ZGX_D3D11 presents through no wgpu surface, offscreen either".into(),
-            ));
+            return self.readback();
         }
         let srgb = wgpu::TextureFormat::Bgra8UnormSrgb;
         let drawable = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -16984,6 +17802,100 @@ pub(crate) fn bgra_to_rgba(word: u32) -> u32 {
     (word & 0xFF00_FF00) | ((word >> 16) & 0xFF) | ((word & 0xFF) << 16)
 }
 
+/// The images a scene's nodes show, by node and counted
+/// (`GpuRenderer::prune_images`): walked for once (`counted`), then kept as
+/// they are drawn (`GpuRenderer::drew_image`), as nodes go
+/// (`Scene::resource_changes`), and as the counted ones are looked at again
+/// when content changes (`recheck`): a node appended, or given an image,
+/// is counted once drawn, and only then has a texture to keep. With
+/// the last flush whose changes it holds (`through`), and whether an image
+/// went uncounted since textures were last looked over (`dropped`).
+#[derive(Default)]
+struct SceneImages {
+    counted: bool,
+    dropped: bool,
+    through: u64,
+    by_node: FxHashMap<NodeId, u64>,
+    users: FxHashMap<u64, u32>,
+}
+impl SceneImages {
+    /// Count the images `scene`'s nodes show, all over again.
+    fn walk(&mut self, scene: &Scene) {
+        self.by_node.clear();
+        self.users.clear();
+        for item in scene.paint_items() {
+            if let Some(image) = shown_image(item.kind) {
+                self.show(item.id, Some(image));
+            }
+        }
+        self.counted = true;
+    }
+    /// The nodes counted showing an image show it still, or what they show
+    /// now is counted instead: one lookup for each, not a walk of the scene.
+    fn recheck(&mut self, scene: &Scene) {
+        let stale: Vec<(NodeId, Option<u64>)> = (self.by_node.iter())
+            .filter_map(|(node, image)| {
+                let now = (scene.contains(*node))
+                    .then(|| scene.kind(*node))
+                    .and_then(shown_image);
+                (now != Some(*image)).then_some((*node, now))
+            })
+            .collect();
+        for (node, now) in stale {
+            self.show(node, now);
+        }
+    }
+    /// `node` shows `image` now, or none.
+    fn show(&mut self, node: NodeId, image: Option<u64>) {
+        let old = match image {
+            Some(image) => self.by_node.insert(node, image),
+            None => self.by_node.remove(&node),
+        };
+        if old == image {
+            return;
+        }
+        if let Some(old) = old
+            && let Some(users) = self.users.get_mut(&old)
+        {
+            *users -= 1;
+            if *users == 0 {
+                self.users.remove(&old);
+                self.dropped = true;
+            }
+        }
+        if let Some(image) = image {
+            *self.users.entry(image).or_default() += 1;
+        }
+    }
+}
+/// The image a node of `kind` shows: an image (a native surface's frame
+/// too) or a box's background image.
+fn shown_image(kind: &NodeKind) -> Option<u64> {
+    match kind {
+        NodeKind::Image(image) => Some(image.id()),
+        #[cfg(target_os = "macos")]
+        NodeKind::NativeSurface(frame) => Some(frame.id()),
+        NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } => {
+            match quad.decoration.as_deref()?.background.as_ref()? {
+                zgx::decoration::Background::Image { image, .. } => Some(image.id()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The images `scene`'s nodes show: images (native surfaces' frames too)
+/// and boxes' background images, each id once. Debug builds alone check the
+/// counts against it (`prune_images`).
+#[cfg(debug_assertions)]
+fn scene_image_ids(scene: &Scene) -> FxHashSet<u64> {
+    scene
+        .paint_items()
+        .filter_map(|item| shown_image(item.kind))
+        .collect()
+}
+
 /// What [`GpuRenderer::readback_into`] reads through, kept by whoever reads
 /// every frame (a video's stage) and made at its first read: a staging
 /// buffer, and the RGBA texture and pass the target is copied to. An app
@@ -17266,6 +18178,149 @@ fn written(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView)
 }
 /// A backdrop blur atlas: half floats, so averaging down and blurring in
 /// steps adds no 8-bit banding to smooth frost.
+/// Encode a batch's halves pass where any of its slots reduces by 8 (its
+/// factor-8 slots' first halves into `halves`, cleared: `fs_reduce4`), and
+/// give the reduce's bind group: reading them, or the source where there's
+/// no such pass. Out of `blur`'s body.
+#[inline(never)]
+fn halves_pass<'a>(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &BlurPipelines,
+    halves: Option<&wgpu::TextureView>,
+    slots: &[(SlotRecord, (u32, u32), bool)],
+    groups: &'a BlurGroups,
+    offsets: &[u32; 2],
+    stats: &mut GpuStats,
+) -> &'a wgpu::BindGroup {
+    let halved = halved(slots);
+    let (Some(view), Some(reading)) = (
+        halves.filter(|_| halved.iter().any(Option::is_some)),
+        groups.from_halves.as_ref(),
+    ) else {
+        return &groups.from_source;
+    };
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("blur reduce halves"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(&pipelines.halves);
+    pass.set_bind_group(0, &groups.from_source, offsets);
+    for (k, rect) in halved.iter().enumerate() {
+        let Some((x, y, w, h)) = *rect else { continue };
+        pass.set_scissor_rect(x, y, w, h);
+        pass.draw(0..3, k as u32..k as u32 + 1);
+        stats.draw_calls += 1;
+    }
+    drop(pass);
+    stats.render_passes += 1;
+    reading
+}
+/// The filters' records are bound at their offsets as passes bind their
+/// groups (`GpuRenderer::blur_groups`): each group binds a part's capacity,
+/// a power of two, so the groups last while parts stay within it. Each of
+/// `ranges` (offsets in the frame's buffer, after `quad_bytes` of quads)
+/// becomes its offset and capacity, and `records` grows to hold that much
+/// past each. Out of the frame's body: frames without a blur never come here.
+#[cold]
+#[inline(never)]
+fn pad_blur_records(
+    quad_bytes: usize,
+    records: &mut Vec<u8>,
+    ranges: &mut [Option<[(u64, u64); 2]>],
+) {
+    let mut reach = 0;
+    for (offset, size) in ranges.iter_mut().flatten().flatten() {
+        *size = size.next_power_of_two().max(256);
+        reach = reach.max((*offset + *size) as usize);
+    }
+    if reach > quad_bytes + records.len() {
+        records.resize(reach - quad_bytes, 0);
+    }
+}
+/// A blur pass's bind group (`BlurPipelines::layout`): `source` and
+/// `other` read, the records' two parts in `records` up to `capacity`
+/// bytes each, at the offsets the pass binds it with.
+fn blur_group(
+    device: &wgpu::Device,
+    pipelines: &BlurPipelines,
+    source: &wgpu::TextureView,
+    other: &wgpu::TextureView,
+    records: &wgpu::Buffer,
+    capacity: [u64; 2],
+) -> wgpu::BindGroup {
+    let part = |size: u64| {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: records,
+            offset: 0,
+            size: wgpu::BufferSize::new(size),
+        })
+    };
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("backdrop blur"),
+        layout: &pipelines.layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(other),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: part(capacity[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: part(capacity[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&pipelines.linear),
+            },
+        ],
+    })
+}
+/// Each slot's place in the halves (`GpuRenderer::blur_halves`), twice its own,
+/// where it is blurred at factor 8.
+fn halved(slots: &[(SlotRecord, (u32, u32), bool)]) -> Vec<Option<Scissor>> {
+    slots
+        .iter()
+        .map(|(record, (w, h), blurred)| {
+            (*blurred && record.region[2] == 8. && *w > 0 && *h > 0).then(|| {
+                let (x, y) = (record.atlas[0] as u32, record.atlas[1] as u32);
+                (x * 2, y * 2, w * 2, h * 2)
+            })
+        })
+        .collect()
+}
+/// A factor-8 reduce's halves (`GpuRenderer::blur_halves`).
+fn halves_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("backdrop blur halves"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HALVES_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
 fn atlas_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("backdrop blur"),
@@ -19552,6 +20607,101 @@ impl TextServices {
     }
 }
 
+/// `plain_glyph_places`: each glyph's key and pen position, the
+/// underlines' boxes, and the prepared text's key (for `trim_text`).
+#[doc(hidden)]
+pub type PlainGlyphs = (Vec<(CacheKey, f32, f32)>, Vec<Rect>, u64);
+/// Plain text's glyphs as a renderer at `scale` places them: each one's key
+/// and its pen position in device pixels from the text's origin (its box's,
+/// snapped to a device pixel), laid out by `cache` as layout measured it;
+/// then its underlines' boxes (`FontStyle::underline`), in points from
+/// there. For the software raster, to draw the glyphs the GPU draws where
+/// it does. `None` for text the prepared cache doesn't lay out
+/// (`handles_plain`).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn plain_glyph_places(
+    fonts: &mut FontSystem,
+    cache: &mut prepared::TextCache,
+    text: &Arc<str>,
+    font_size: f32,
+    font: &zgx::text_layout::FontStyle,
+    wrap: f32,
+    height: f32,
+    scale: f32,
+) -> Option<PlainGlyphs> {
+    if !prepared::TextCache::handles_plain(text, font_size) {
+        return None;
+    }
+    let laid = cache.layout_plain(fonts, text, font_size, font, Some(wrap));
+    let glyphs = styled_glyphs(Vec::new(), laid.runs(Some(height)), scale, |_, _| 0);
+    let underlines = font.underline.map_or_else(Vec::new, |line| {
+        text::plain_underlines(laid.runs(Some(height)), font_size, line)
+            .into_iter()
+            .map(|d| d.bounds)
+            .collect()
+    });
+    Some((
+        glyphs.into_iter().map(|g| (g.key, g.x, g.y)).collect(),
+        underlines,
+        laid.key(),
+    ))
+}
+/// After a frame that laid text out from `fonts` and `cache` without a
+/// renderer (the software raster), what a renderer's frame trims: words
+/// unused a few shaping frames, and prepared text past what was `drawn`
+/// and a little of the rest. Without it the words a changing value shapes
+/// pile up, frame after frame.
+#[doc(hidden)]
+pub fn trim_text(
+    fonts: &mut FontSystem,
+    cache: &mut prepared::TextCache,
+    drawn: impl IntoIterator<Item = u64>,
+) {
+    fonts.shape_run_cache.trim(SHAPE_RUN_AGES);
+    if cache.needs_trim() {
+        cache.trim(drawn);
+    }
+}
+/// A glyph's image as a renderer rasterizes it for its atlas.
+#[doc(hidden)]
+pub fn glyph_image(
+    swash: &mut SwashCache,
+    fonts: &mut FontSystem,
+    key: CacheKey,
+) -> Option<cosmic_text::SwashImage> {
+    text::glyph_image(swash, fonts, key)
+}
+/// A mask glyph's coverage `a` as `draw.wgsl` draws it in `color` at
+/// `scale`: firmed below `SHARP_TEXT_BELOW` (`firm`, `firmness`).
+#[doc(hidden)]
+pub fn glyph_coverage(a: f32, color: Color, scale: f32) -> f32 {
+    if scale >= SHARP_TEXT_BELOW {
+        return a;
+    }
+    let luma = (0.2126 * color.0 as f32 + 0.7152 * color.1 as f32 + 0.0722 * color.2 as f32) / 255.;
+    let k = (luma * 2.).clamp(0., 1.);
+    a + k * 0.67 * a * (1. - a)
+}
+
+/// `fonts` and `cache` as text services a scene whose host installed none
+/// takes (`Scene::set_default_text_services`): a renderer's, so a scene it
+/// draws without `install_text` is measured as it is drawn, not by zgx's
+/// estimate (a row's label narrower than its glyphs, its last one cut).
+/// Held weakly: once they go, scenes keep what they have.
+fn default_text_services(
+    fonts: &Rc<RefCell<FontSystem>>,
+    cache: &Rc<RefCell<prepared::TextCache>>,
+) -> Rc<zgx::scene::DefaultTextServices> {
+    let (fonts, cache) = (Rc::downgrade(fonts), Rc::downgrade(cache));
+    Rc::new(move |scene: &mut Scene| {
+        let (Some(fonts), Some(cache)) = (fonts.upgrade(), cache.upgrade()) else {
+            return false;
+        };
+        install_text(scene, &fonts, &cache);
+        true
+    })
+}
 /// Install text services sharing `shared_fonts` and `shared_cache` on `scene`.
 fn install_text(
     scene: &mut Scene,
@@ -21643,13 +22793,25 @@ mod shader_compile_tests {
         let at = (20 * 64 + 20) * 4;
         (pixels[at..at + 4].try_into().unwrap(), gpu.images_awaited)
     }
+    /// Whether `shader`'s fill compiled, within a while: wgpu's pipeline,
+    /// and under Direct3D 11 its own pixel stage (wgpu's then is the no-op
+    /// device's, ready at once).
     fn compiled(gpu: &GpuRenderer, shader: &FillShader) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let d3d11 = || {
+            #[cfg(d3d11)]
+            if let Some(state) = &gpu.d3d11 {
+                let fill = d3d11_frame::AppShader::Fill;
+                return state.device.app_shader(shader, fill, false).is_some();
+            }
+            true
+        };
         while std::time::Instant::now() < deadline {
             if gpu
                 .fill_pipelines
                 .get(&shader.id())
                 .is_some_and(|c| c.get().is_some())
+                && d3d11()
             {
                 return true;
             }
@@ -22333,6 +23495,14 @@ mod copy_refusal_tests {
         around: impl FnOnce(View) -> View,
         prepare: impl FnOnce(&mut Scene, NodeId),
     ) -> Option<(CopyBlocker, String)> {
+        refusal_around(around, prepare).0
+    }
+    /// `refusal`, and whether the walk around the content alone was taken
+    /// (`Scene::layer_items_around`).
+    fn refusal_around(
+        around: impl FnOnce(View) -> View,
+        prepare: impl FnOnce(&mut Scene, NodeId),
+    ) -> (Option<(CopyBlocker, String)>, bool) {
         let mut ui = Ui::new(240., 180.);
         let offset = ui.signal(0_f32);
         let page = column()
@@ -22354,19 +23524,27 @@ mod copy_refusal_tests {
         step(&mut ui);
         let content = ui.scene.borrow().scroll_moves()[0].node;
         prepare(&mut ui.scene.borrow_mut(), content);
+        // (A frame with what `prepare` made, then the move looked at.)
+        offset.set(12.);
+        step(&mut ui);
         offset.set(16.);
         let damage = step(&mut ui);
         let scene = ui.scene.borrow();
         let moved = scene.scroll_moves()[0].clone();
-        copy_blocker(&scene, &moved, &damage, 1., &mut Vec::new(), &mut None).map(|blocker| {
-            let note = blocker.describe(&scene);
-            (blocker, note)
-        })
+        let refused =
+            copy_blocker(&scene, &moved, &damage, 1., &mut Vec::new(), &mut None).map(|blocker| {
+                let note = blocker.describe(&scene);
+                (blocker, note)
+            });
+        let around = scene.layer_items_around(moved.node, moved.clip).is_some();
+        (refused, around)
     }
 
     #[test]
     fn a_plain_view_has_no_refusal() {
-        assert_eq!(refusal(|view| view, |_, _| {}), None);
+        let (refused, around) = refusal_around(|view| view, |_, _| {});
+        assert_eq!(refused, None);
+        assert!(around, "the walk around the content alone decides");
     }
 
     #[test]
@@ -22387,11 +23565,242 @@ mod copy_refusal_tests {
         assert!(note.contains("two fades"), "{note}");
     }
 
-    /// A loop in the content is no refusal (`baked_loops.rs` has it scrolling).
+    /// Every blocker `copy_blocker` names, by where it lies: in the content
+    /// (which the walk around the content doesn't look at, so it must not be
+    /// taken) or around it (which both walks see). A blocker added to
+    /// `CopyBlocker` doesn't compile here until it has a case, nor a case
+    /// until `made` has a scene making it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        Between,
+        Reads,
+        Dots,
+        FilteredUnderFade,
+        TwoFades,
+        Over,
+        Under,
+        NoContent,
+    }
+    const CASES: [Case; 8] = [
+        Case::Between,
+        Case::Reads,
+        Case::Dots,
+        Case::FilteredUnderFade,
+        Case::TwoFades,
+        Case::Over,
+        Case::Under,
+        Case::NoContent,
+    ];
+    fn case_of(blocker: CopyBlocker) -> Case {
+        match blocker {
+            CopyBlocker::Between(_) => Case::Between,
+            CopyBlocker::Reads(_) => Case::Reads,
+            CopyBlocker::Dots(_) => Case::Dots,
+            CopyBlocker::FilteredUnderFade(_) => Case::FilteredUnderFade,
+            CopyBlocker::TwoFades => Case::TwoFades,
+            CopyBlocker::Over(_) => Case::Over,
+            CopyBlocker::Under(_) => Case::Under,
+            CopyBlocker::NoContent => Case::NoContent,
+            CopyBlocker::Fade(..) => unreachable!("`scroll_copies` names it, not `copy_blocker`"),
+        }
+    }
+    /// Whether the case's blocker lies in the content.
+    fn inside(case: Case) -> bool {
+        match case {
+            Case::Between | Case::Reads | Case::Dots | Case::FilteredUnderFade => true,
+            Case::TwoFades | Case::Over | Case::Under | Case::NoContent => false,
+        }
+    }
+    /// The case's scene: what the copy makes of it, and whether the walk
+    /// around the content alone was taken.
+    fn made(case: Case) -> (Option<(CopyBlocker, String)>, bool) {
+        let first = |scene: &Scene, content: NodeId| scene.children(content)[0];
+        match case {
+            // A walk paints a subtree's items in one run (raised children
+            // are put in order among their siblings alone), so nothing
+            // paints between the content's: a raised row in it comes
+            // nearest, and the walk around it isn't taken.
+            Case::Between => refusal_around(
+                |view| {
+                    column()
+                        .child(view)
+                        .child(div().w(240.).h(20.).bg(rgb(0x334455)))
+                },
+                |scene, content| {
+                    let row = first(scene, content);
+                    scene.set_z(row, 1);
+                },
+            ),
+            // (A backdrop blur in the content keeps it from moving at all:
+            // `Scene::clear_of_blurs`.)
+            Case::Reads => refusal_around(
+                |view| view,
+                |scene, content| {
+                    let row = first(scene, content);
+                    scene.set_blend(row, zgx::scene::BlendMode::Multiply);
+                },
+            ),
+            Case::Dots => refusal_around(
+                |view| view,
+                |scene, content| {
+                    let row = first(scene, content);
+                    // The row's size, so the content stays as long.
+                    let picture = zgx::image::ImageData::new(240, 400, vec![128; 240 * 400 * 4])
+                        .expect("an image");
+                    let dotted = std::sync::Arc::new(picture.dithered(2.));
+                    scene.set_kind(row, NodeKind::Image(dotted));
+                },
+            ),
+            Case::FilteredUnderFade => refusal_around(
+                |view| view.fade_edges(20., 20.),
+                |scene, content| {
+                    let row = first(scene, content);
+                    scene.set_filter_blur(row, 4.);
+                },
+            ),
+            Case::TwoFades => refusal_around(
+                |view| {
+                    div()
+                        .w(240.)
+                        .h(180.)
+                        .overflow_hidden()
+                        .fade_edges(10., 10.)
+                        .child(view.fade_edges(20., 20.))
+                },
+                |_, _| {},
+            ),
+            // A layer that stays put over the view, mixing with what lies
+            // under it (a blend): what it reads moves under it, and may lie
+            // past its own ink.
+            Case::Over => refusal_around(
+                |view| {
+                    overlay().w(240.).h(180.).child(view).child(
+                        div()
+                            .absolute()
+                            .left(40.)
+                            .top(40.)
+                            .size(30., 30.)
+                            .bg(rgb(0xffffff))
+                            .blend(zgx::scene::BlendMode::Multiply),
+                    )
+                },
+                |_, _| {},
+            ),
+            // A see-through view over a picture: what shows under it holds
+            // still as the content moves.
+            Case::Under => refusal_around(
+                |view| {
+                    overlay()
+                        .w(240.)
+                        .h(180.)
+                        .child(
+                            div()
+                                .absolute()
+                                .left(0.)
+                                .top(0.)
+                                .size(240., 180.)
+                                .bg(rgb(0x101010))
+                                .child(div().size(60., 60.).bg(rgb(0xff0000))),
+                        )
+                        .child(view.bg(zgx::compose::prelude::rgba(0x00000000)))
+                },
+                // Its rows see-through too, so none covers what lies under.
+                |scene, content| {
+                    for row in scene.children(content).to_vec() {
+                        let effects = zgx::scene::Effects {
+                            opacity: 0.5,
+                            ..scene.effects(row)
+                        };
+                        scene.set_effects(row, effects);
+                    }
+                },
+            ),
+            Case::NoContent => refusal_around(
+                |view| view,
+                |scene, content| {
+                    let effects = zgx::scene::Effects {
+                        opacity: 0.,
+                        ..scene.effects(content)
+                    };
+                    scene.set_effects(content, effects);
+                },
+            ),
+        }
+    }
+
+    /// Each blocker, made in a scrolled view: the copy finds it, whichever
+    /// walk decides (a debug build has both decide and compares them), and
+    /// one in the content keeps the walk around it from being taken.
+    #[test]
+    fn every_blocker_is_found_whichever_walk_decides() {
+        for case in CASES {
+            let (refused, around) = made(case);
+            let found = refused.as_ref().map(|(blocker, _)| case_of(*blocker));
+            match case {
+                Case::Between => assert_eq!(found, None, "a raised row copies"),
+                case => assert_eq!(found, Some(case), "{refused:?}"),
+            }
+            match inside(case) {
+                true => assert!(
+                    !around,
+                    "{case:?} in the content: the walk around it was taken"
+                ),
+                // Taken, and compared with the whole walk; `Under` it hands
+                // to the whole walk, the content's rows unlooked at.
+                false => assert!(
+                    around,
+                    "{case:?} around the content: the whole walk alone was taken"
+                ),
+            }
+        }
+    }
+
+    /// A fade of the content's own, which the copy carries rather than
+    /// refuses (`cut_fades` repaints what it cuts): the walk around the
+    /// content isn't taken, and the whole walk copies.
+    #[test]
+    fn a_fade_in_the_content_takes_the_whole_walk() {
+        let (refused, around) = refusal_around(
+            |view| view,
+            |scene, content| {
+                let row = scene.children(content)[0];
+                let mut style = scene.style(row);
+                style.fade_edges = [12., 12.];
+                scene.set_style(row, style);
+            },
+        );
+        assert!(!around, "the walk around the content was taken");
+        assert_eq!(refused, None);
+    }
+
+    /// A `fade_overflow` box in the content whose content doesn't run past
+    /// it fades nothing (its bands are none), as a transcript's columns:
+    /// the walk around the content is taken, and copies.
+    #[test]
+    fn a_fade_with_nothing_past_it_is_no_fade() {
+        let (refused, around) = refusal_around(
+            |view| view,
+            |scene, content| {
+                let row = scene.children(content)[0];
+                let mut style = scene.style(row);
+                style.fade_edges = [12., 12.];
+                style.fade_overflow = true;
+                scene.set_style(row, style);
+            },
+        );
+        assert!(
+            around,
+            "a fade of none kept the walk around the content from deciding"
+        );
+        assert_eq!(refused, None);
+    }
+
+    /// A loop in the content is no refusal (`baked_loops.rs` has it
+    /// scrolling), and keeps the walk around the content from being taken.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_loop_in_the_content_is_no_refusal() {
-        let refused = refusal(
+        let (refused, around) = refusal_around(
             |view| view,
             |scene, content| {
                 let node = scene.children(content)[0];
@@ -22401,5 +23810,28 @@ mod copy_refusal_tests {
             },
         );
         assert_eq!(refused, None);
+        assert!(!around, "the walk around the content was taken");
+    }
+}
+
+#[cfg(test)]
+mod software_only_tests {
+    use super::only_software;
+
+    /// WARP alone (as DXGI lists it on a machine without a GPU, with its
+    /// software flag or, for the Basic Render Driver, by its ids) is
+    /// software only; a GPU beside it, or no adapter at all, is not.
+    #[test]
+    fn only_software_adapters_are_software_only() {
+        let warp = (0x1414, 0x8c, 2);
+        let basic_render = (0x1414, 0x8c, 0);
+        let rtx = (0x10de, 0x2684, 0);
+        assert!(only_software([warp]));
+        assert!(only_software([basic_render]));
+        assert!(!only_software([rtx, warp]));
+        assert!(!only_software([warp, rtx]));
+        assert!(!only_software([]));
+        // A software adapter of another vendor's (flagged).
+        assert!(only_software([(0x1af4, 1, 2)]));
     }
 }

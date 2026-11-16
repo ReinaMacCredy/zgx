@@ -35,7 +35,7 @@ vulkan = ["wgpu/vulkan"]
 # Windows, experimental: frames drawn with Direct3D 11 when `ZGX_D3D11=1`
 # (d3d11_frame.rs), wgpu's no-op backend standing in for its device, so no
 # Direct3D 12 device is opened. Off, nothing of it is built.
-d3d11 = ["wgpu/noop", "windows/Win32_Graphics_Direct3D", "windows/Win32_Graphics_Direct3D11"]
+d3d11 = ["wgpu/noop", "windows/Win32_Graphics_Direct3D", "windows/Win32_Graphics_Direct3D11", "windows/Win32_Security"]
 
 [dependencies]
 hypher = { version = "0.1.8", optional = true }
@@ -96,7 +96,9 @@ wgpu-hal = { version = "29.0.4", default-features = false }
 objc2 = "0.6"
 objc2-core-foundation = "0.3.2"
 objc2-core-video = "0.3.2"
-objc2-metal = { version = "0.3.2", features = ["objc2-io-surface", "block2"] }
+objc2-metal = { version = "0.3.2", features = ["objc2-io-surface", "block2", "dispatch2"] }
+# The shader libraries built ahead, loaded as data (metal_frame.rs, build.rs).
+dispatch2 = "0.3.1"
 # Drawables' presented handlers (layer_present.rs).
 block2 = "0.6"
 # Shader sources and function names for frames encoded directly (metal_frame.rs).
@@ -113,7 +115,7 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 # Tests encode JPEGs, and check ours against `image`'s decode of them.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 # Shaping with and without its kept advances (tests/variable_advances.rs).
-harfrust = { package = "zgx-harfrust", version = "0.5.3", path = "../../vendor/harfrust" }
+harfrust = { package = "zgx-harfrust", version = "0.5.4", path = "../../vendor/harfrust" }
 # wgpu's own counts of what it holds (textures, samplers, bind groups), for
 # tests that what a frame no longer shows is given back.
 wgpu = { version = "29.0.4", default-features = false, features = ["counters"] }
@@ -173,5 +175,15 @@ required-features = ["d3d11"]
 # Sets `ZGX_D3D11=1` (read once a process) before anything draws.
 [[test]]
 name = "d3d11_left_out"
+harness = false
+required-features = ["d3d11"]
+
+[[test]]
+name = "d3d11_atlas"
+harness = false
+required-features = ["d3d11"]
+
+[[test]]
+name = "d3d11_present"
 harness = false
 required-features = ["d3d11"]

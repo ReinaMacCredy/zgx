@@ -176,3 +176,47 @@ every cell, the history's too, and the cursor alike (with the wide
 character case left out, the first setup differs).
 `a_run_is_repeated_by_its_last_character` checks REP after a run. Version
 0.26.4.
+
+## XTGETTCAP answered
+
+`Term::request_termcap` answers each name asked for in a DCS string of its
+own, as kitty and foot do: `DCS 1 + r` and the name and value hex encoded
+(a flag without `=` and a value) for a capability it has, `DCS 0 + r` and
+the name as asked for one it hasn't. It reports what `TERM`
+(xterm-256color) has and what this terminal has beyond it, in terminfo's
+notation: `TN`, `name`, `Co` and `colors`; direct colour, `RGB`, tmux's `Tc`,
+`setrgbf` and `setrgbb`; OSC 52's `Ms`; the cursor's shape, `Ss` and `Se`;
+and underlines styled and coloured, `Smulx`, `Setulc` and kitty's `Su`.
+nvim asks for `Tc`, `RGB`, `setrgbf` and `setrgbb`, where `COLORTERM` isn't
+set, to turn on its own colours. `termcap_tests` check a value,
+a flag, an unknown name and one not hex, and every capability found by its
+name. Version 0.26.5, with `zgx-vte` 0.15.1.
+
+## XTVERSION answered
+
+`Config::version`, empty by default, is the name and version
+`Term::report_version` answers XTVERSION with, as `DCS > | name(version)
+ST`, the way kitty, foot and xterm write theirs; empty, it answers nothing.
+zgx-terminal sets it from the `TERM_PROGRAM` and `TERM_PROGRAM_VERSION` a
+session's command is given. Version 0.26.6, with `zgx-vte` 0.15.2.
+
+## A cell's size answered
+
+`Term::cell_size_pixels` answers `CSI 16 t` with `CSI 6 ; height ; width t`
+through `Event::TextAreaSizeRequest`, from the cell size the embedder gives,
+as `CSI 14 t` answers the text area's. Programs sizing pictures by the cell
+ask for it where the pty's size in pixels doesn't reach them. Version
+0.26.7, with `zgx-vte` 0.15.3.
+
+## DECRQSS answered
+
+`Term::report_setting` answers as xterm does, `DCS 1 $ r`, the setting as a
+program would set it and its final bytes, or `DCS 0 $ r` for one not kept:
+the text's attributes after a reset (`m`, underline styles as `4:2` to
+`4:5`, colours by name, or by index or value in their colon forms, the
+underline's as `58`), the cursor's style (` q`, DECSCUSR's number) and the
+scrolling region (`r`). nvim sets a curly underline and looks for `4:3` in
+the answer before drawing them, and, where `COLORTERM` isn't set, sets
+`48;2;1;2;3` and turns on direct colour only if `48:2:1:2:3` comes back.
+`report_tests::settings_are_reported_as_set` checks each. Version 0.26.8,
+with `zgx-vte` 0.15.4.

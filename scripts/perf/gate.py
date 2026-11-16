@@ -41,6 +41,14 @@ on each side writing what it counted by function, and its difference
 change did, apart from where the heap or the linker put things. The
 counts are the first runs' still.
 
+Beside the instruction table, an allocations table, report only: each
+side's binary runs once more per scene, natively, with `count_allocs.c`
+preloaded after `same_run.c` (`allocations`), and the table gives
+allocations, reallocations, bytes and peak bytes held, base and head, per
+tick, frame or op where the scene names its length. The counted runs never
+load the counter, so their instructions are as they were. A scene whose
+allocator bypasses glibc says so. `ZGX_GATE_ALLOCS=0` leaves the table out.
+
 With ZGX_GATE_BIN_CACHE set, a side's binaries found there, stamped with
 its commit and compiler, are taken rather than built, and the head's are
 left there after: CI keeps main's by commit, so a pull request builds its
@@ -166,6 +174,27 @@ SCENES = [
     # leaves out (`ZGX_ASSISTIVE=0`).
     ('terminal-reader', 'zgx-terminal', 'terminal_bench', {'GLIBC_TUNABLES': 'glibc.malloc.mxfast=0',
                                                            'ZGX_ASSISTIVE': '1'}),
+    # The same log trickling in a line a frame, as `tail -f`, a build or a
+    # reply streaming arrive: each frame scrolls the screen one line, so its
+    # cost is what one new line costs, which the screen's height shouldn't
+    # multiply.
+    # `READS`: a base whose bench doesn't read `PER_FRAME` would count its
+    # 4 KB reads under this name (`runs_scene`), so it shows as new.
+    ('terminal-slow', 'zgx-terminal', 'terminal_bench', {'LINES': '1000', 'PER_FRAME': '1',
+                                                          'READS': 'PER_FRAME',
+                                                          'GLIBC_TUNABLES': 'glibc.malloc.mxfast=0'}),
+    # A search through that log at 100,000 lines of scrollback (Ghostty's
+    # `search:` binding): every match counted, those in view highlighted,
+    # the oldest selected and scrolled to; the log made, fed and freed
+    # uncounted (`gate_marks`). And a search held open while the 10,000
+    # lines arrive, as `terminal` without one: what an open search costs a
+    # flood (each new line searched once, the screen again each read).
+    ('terminal-search', 'zgx-terminal', 'terminal_bench', {'LINES': '100000', 'SCROLLBACK': '100000',
+                                                            'SEARCH': 'error', 'READS': 'SEARCH',
+                                                            'GLIBC_TUNABLES': 'glibc.malloc.mxfast=0'}),
+    ('terminal-search-open', 'zgx-terminal', 'terminal_bench', {'SEARCH': 'error', 'SEARCH_OPEN': '1',
+                                                                 'READS': 'SEARCH',
+                                                                 'GLIBC_TUNABLES': 'glibc.malloc.mxfast=0'}),
     # Pictures in that terminal, drawn by wgpu's no-op backend: placed (RGBA
     # in chunks, a PNG), scrolled, replaced under their ids and deleted;
     # sixel images placed over one another. What `terminal` guards having no
@@ -195,6 +224,11 @@ SCENES = [
     ('fx-layer', 'zgx-3d', 'fx_bench', {'SCENE': 'layer', 'ZGX_GPU_NOOP': '1'}),
     ('fx-reader', 'zgx-3d', 'fx_bench', {'SCENE': 'reader', 'ZGX_GPU_NOOP': '1'}),
     ('fx-passes', 'zgx-3d', 'passes_bench', {'ZGX_GPU_NOOP': '1'}),
+    # A fast scroll through a long transcript of deep rows built as it shows
+    # them, under a frosted composer and an edge fade, rows watching their
+    # size, bounds and visibility: the world geometry those observers and the
+    # lists read, and the paint walk of the strip and band each frame draws.
+    ('scroll-glass', 'zgx-3d', 'scroll_glass_bench', {'ZGX_GPU_NOOP': '1', 'FRAMES': '120'}),
     # A video's frames (zgx-video's `examples/bench`): its script, animations,
     # timers and shader clock stepped on a virtual clock (`zgx::clock`), each
     # frame drawn whole by wgpu's no-op backend. What making video costs;
@@ -299,11 +333,17 @@ def has_example(checkout, package, example):
     return (crate / 'examples' / f'{example}.rs').exists() or f'name = "{example}"' in manifest
 
 
-def runs_scene(checkout, env):
+def runs_scene(checkout, env, package=None, example=None):
     """Whether `checkout`'s binary runs the scene `env` asks for: the app
     scenes (`APP`) are `support/apps.rs`'s, which an older base lacks (its
     binary would count its own bench under their name), and an interaction
-    measured alone that its `apps.rs` lacks."""
+    measured alone that its `apps.rs` lacks. A scene naming a setting new to
+    its bench (`READS`) runs only where the bench's source reads it: an
+    older bench would ignore it and count another workload under the name."""
+    if 'READS' in env and package and example:
+        source = checkout / 'crates' / package_in(checkout, package) / 'examples' / f'{example}.rs'
+        if not source.exists() or f'"{env["READS"]}"' not in source.read_text():
+            return False
     apps = checkout / 'crates' / package_in(checkout, 'zgx-script') / 'examples/support/apps.rs'
     if 'APP' not in env:
         return True
@@ -584,6 +624,155 @@ def same_run():
     return built
 
 
+def count_allocs():
+    """`count_allocs.c` built for preloading, once a run (`allocations`)."""
+    built = WORK / 'count_allocs.so'
+    if built not in COPIED:
+        WORK.mkdir(parents=True, exist_ok=True)
+        source = pathlib.Path(__file__).with_name('count_allocs.c')
+        subprocess.run(['cc', '-O2', '-shared', '-fPIC', '-o', str(built), str(source)], check=True)
+        COPIED.add(built)
+    return built
+
+
+# Allocations a scene makes, counted in a run of their own (`allocations`):
+# reported beside the instruction rows, gating nothing yet. `ZGX_GATE_ALLOCS=0`
+# leaves them out.
+ALLOCS = os.environ.get('ZGX_GATE_ALLOCS', '1') != '0'
+# Fewer allocations than this in a whole run: the scene's allocator is not
+# glibc's (mimalloc), and what passed through glibc is no measure of it.
+ALLOCS_FLOOR = 1000
+# A scene's length, where its environment says it: allocations per one.
+UNITS = ('TICKS', 'FRAMES', 'OPS')
+
+
+def allocations(binary, env, checkout):
+    """What `binary` allocates in the scene `env` describes, counted by
+    `count_allocs.so`: a native run (no valgrind) in the environment the
+    counted runs have (`environment`), the counter preloaded after
+    `same_run.so`. The instruction counts are other runs, which never load
+    it. A dict of allocations, reallocations, frees, bytes (asked for) and
+    peak (bytes held at once), or None when the run failed: these numbers
+    gate nothing, so a failure here is reported, not raised."""
+    # Warm, as a count is (`warm`): a cache written at a first launch (the
+    # font cache's, 8,973 allocations) is not the scene's.
+    warm(binary, env, checkout)
+    out = WORK / 'allocs.txt'
+    out.unlink(missing_ok=True)
+    environ = environment(binary, env, checkout)
+    environ['LD_PRELOAD'] = f'{environ["LD_PRELOAD"]} {count_allocs()}'
+    environ['ZGX_ALLOC_COUNT_OUT'] = str(out)
+    result = subprocess.run([str(binary)], env=environ, capture_output=True, text=True)
+    if result.returncode or not out.exists():
+        return None
+    fields = ('allocations', 'reallocations', 'frees', 'bytes', 'peak')
+    return dict(zip(fields, map(int, out.read_text().split())))
+
+
+def unit_of(env):
+    """The scene's length, per which allocations are reported: its first of
+    `UNITS` (`TICKS`, say, and 300), else None (per run)."""
+    for unit in UNITS:
+        if unit in env and env[unit].isdigit():
+            return unit, int(env[unit])
+    return None
+
+
+# What a scene draws, flush by flush (`fingerprint`): compared base against
+# head beside the instruction rows, gating nothing yet.
+# `ZGX_GATE_FINGERPRINT=0` leaves it out.
+FINGERPRINT = os.environ.get('ZGX_GATE_FINGERPRINT', '1') != '0'
+# Scenes whose bench gives no fingerprint yet, and why: said so in the table.
+UNPRINTED = {
+    'video': 'not hooked: the video stage keeps its scene to itself',
+    '3d-textured': 'not hooked: a 3D world drawn without a scene',
+    '3d-mixed': 'not hooked: a 3D world drawn without a scene',
+}
+
+
+def fingerprint(binary, env, checkout):
+    """What `binary` draws in the scene `env` describes, as the bench's
+    flushes hash it (`scripts/perf/fingerprint`, `ZGX_FINGERPRINT`): a native
+    run of its own, as `allocations` is but without the counter (the hashing
+    allocates). A list of (paint, damage) hashes, a flush each (damage `-`
+    where the bench's flush is a harness's), [] for a bench that gives none,
+    or None when the run failed."""
+    warm(binary, env, checkout)
+    out = WORK / 'fingerprint.txt'
+    out.unlink(missing_ok=True)
+    environ = environment(binary, env, checkout)
+    environ['ZGX_FINGERPRINT'] = str(out)
+    result = subprocess.run([str(binary)], env=environ, capture_output=True, text=True)
+    if result.returncode:
+        return None
+    if not out.exists():
+        return []
+    return [tuple(line.split()) for line in out.read_text().splitlines() if line.strip()]
+
+
+def output_of(name, before, after):
+    """`fingerprint`'s two sides, read: the same paint and damage, or where
+    they first part (paint before damage: same paint with other damage is a
+    repaint change of its own)."""
+    if after is None or before == 'failed':
+        return 'the run failed'
+    if not after:
+        return UNPRINTED.get(name, 'no fingerprint: the bench is not hooked')
+    if before is None:
+        return f'(new) {len(after)} flushes'
+    if not before:
+        return 'no fingerprint on the base'
+    for index, ((paint, damage), (paint_, damage_)) in enumerate(zip(before, after)):
+        if paint != paint_:
+            return f'output differs from flush {index} (of {len(after)})'
+    for index, ((paint, damage), (paint_, damage_)) in enumerate(zip(before, after)):
+        if '-' not in (damage, damage_) and damage != damage_:
+            return f'same paint; damage differs from flush {index} (of {len(after)})'
+    if len(before) != len(after):
+        return f'flush count differs ({len(before)} vs {len(after)})'
+    damage = '' if any(d == '-' for _, d in after) else ' and damage'
+    return f'same output: paint{damage} ({len(after)} flushes)'
+
+
+def output_lines(rows):
+    """The output table: a line a scene (`output_of`)."""
+    lines = ["**Output** (each flush's paint and damage hashed in a native run of each side; report only, "
+             "gating nothing)", '', '| scene | base vs head |', '| --- | --- |']
+    lines += [f'| {name} | {output_of(name, before, after)} |' for name, before, after in rows]
+    return lines
+
+
+def allocation_lines(rows):
+    """The allocations table, one row a scene: base and head, the change in
+    allocations, reallocations, bytes and peak bytes, per unit where the
+    scene has one (`unit_of`). A scene whose allocator bypasses glibc says
+    so rather than reading 0."""
+    lines = ['**Allocations** (a native run of each side, glibc\'s allocator counted; report only, '
+             'gating nothing)', '',
+             '| scene | per | base allocs | head allocs | change | reallocs | bytes | peak bytes |',
+             '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |']
+    for name, env, before, after in rows:
+        if after is None or (before is not None and before.get('failed')):
+            lines.append(f'| {name} | | | | the run failed | | | |')
+            continue
+        if after['allocations'] < ALLOCS_FLOOR:
+            lines.append(f'| {name} | | | | not counted: its allocator bypasses glibc | | | |')
+            continue
+        unit = unit_of(env)
+        per, n = (unit[0].lower().rstrip('s'), unit[1]) if unit else ('run', 1)
+        if before is None:
+            lines.append(f'| {name} | {per} | (new) | {after["allocations"] / n:,.1f} | | | | |')
+            continue
+        change = (after['allocations'] - before['allocations']) / n
+        percent = 100 * (after['allocations'] - before['allocations']) / max(before['allocations'], 1)
+        reallocs = (after['reallocations'] - before['reallocations']) / n
+        added = (after['bytes'] - before['bytes']) / n
+        peak = after['peak'] - before['peak']
+        lines.append(f'| {name} | {per} | {before["allocations"] / n:,.1f} | {after["allocations"] / n:,.1f} | '
+                     f'{change:+,.1f} ({percent:+.2f}%) | {reallocs:+,.1f} | {added:+,.0f} | {peak:+,} |')
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('base')
@@ -624,11 +813,13 @@ def main():
     if not cached:
         build(base, target, WORK / 'gate-bin-base')
     rows, failed = [], []
+    allocated, allocs_time = [], 0.0
+    printed, print_time = [], 0.0
     for name, package, example, env in SCENES:
         base_binary = WORK / 'gate-bin-base' / example
         head_binary = WORK / 'gate-bin-head' / example
         try:
-            runs = base_binary.exists() and runs_scene(base, env)
+            runs = base_binary.exists() and runs_scene(base, env, package, example)
             before, after, delta, deltas = compared(name, package, env, (base_binary, base) if runs else None,
                                                     (head_binary, ROOT))
         except Infra as error:
@@ -639,6 +830,19 @@ def main():
         if delta is not None and delta > args.threshold:
             failed.append(name)
         rows.append((name, before, after, delta, deltas))
+        if ALLOCS:
+            started = time.monotonic()
+            allocated_before = (allocations(base_binary, env, base) or {'failed': True}) if runs else None
+            allocated.append((name, env, allocated_before, allocations(head_binary, env, ROOT)))
+            allocs_time += time.monotonic() - started
+        if FINGERPRINT:
+            started = time.monotonic()
+            printed_before = None
+            if runs:
+                printed_before = fingerprint(base_binary, env, base)
+                printed_before = 'failed' if printed_before is None else printed_before
+            printed.append((name, printed_before, fingerprint(head_binary, env, ROOT)))
+            print_time += time.monotonic() - started
         shown = f'{before / 1e6:10.1f} M {after / 1e6:10.1f} M {delta:+7.2f}%' if before else f'{"new":>12} {after / 1e6:10.1f} M'
         if len(deltas) > 1:
             shown += f'  median of {", ".join(f"{d:+.3f}%" for d in deltas)}{layout_of(deltas)}'
@@ -663,6 +867,20 @@ def main():
     print(verdict, flush=True)
     if args.markdown:
         args.markdown.write_text('\n'.join(table) + '\n')
+    if printed:
+        lines = output_lines(printed)
+        lines.append(f'\n(the native runs took {print_time:.0f} s)')
+        print('\n'.join(lines), flush=True)
+        if args.markdown:
+            with args.markdown.open('a') as out:
+                out.write('\n' + '\n'.join(lines) + '\n')
+    if allocated:
+        lines = allocation_lines(allocated)
+        lines.append(f'\n(the native runs took {allocs_time:.0f} s)')
+        print('\n'.join(lines), flush=True)
+        if args.markdown:
+            with args.markdown.open('a') as out:
+                out.write('\n' + '\n'.join(lines) + '\n')
     if FUNCTIONS:
         explained = by_function(rows, {scene[0]: scene for scene in SCENES}, base)
         if args.markdown and explained:

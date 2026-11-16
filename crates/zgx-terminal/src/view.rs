@@ -15,6 +15,7 @@
 use crate::{
     GridSize, Session, SessionEvent, SessionOptions, keys,
     paint::{self, CursorAt, Look, Metrics, RowPaint},
+    search::{Highlight, Search},
 };
 use alacritty_terminal::{
     grid::{Dimensions, Scroll},
@@ -98,6 +99,9 @@ struct Engine {
     /// then).
     pictures: Signal<Rc<[Picture]>>,
     pictured: Signal<bool>,
+    /// Assistive technology reads the UI: the rows' nodes keep screen order
+    /// for it (`view`), which a scroll otherwise needn't change.
+    listening: Signal<bool>,
     /// Whether `pictured` holds, read as each paint begins; and the
     /// pictures a paint worked out, for its batch to show.
     any_pictures: Cell<bool>,
@@ -138,6 +142,15 @@ struct Engine {
     last_selection: RefCell<Option<SelectionRange>>,
     last_offset: Cell<usize>,
     last_focus: Cell<bool>,
+    /// The search open (`TerminalState::search`), if one is; `searching`
+    /// says so for a paint to test once. Its matches in view, drawn over
+    /// the rows while `found_open` (`found_view`), and the counts it last
+    /// reported.
+    search: RefCell<Option<Search>>,
+    searching: Cell<bool>,
+    found: Signal<Rc<[Highlight]>>,
+    found_open: Signal<bool>,
+    last_counts: Cell<Option<(usize, Option<usize>)>>,
     /// The content box last laid out, in points.
     size: Cell<(f32, f32)>,
     /// A press being dragged: selecting, or reported to the program.
@@ -216,6 +229,7 @@ impl EngineTerminal {
             caret: runtime.signal((PAD_X, PAD_Y)),
             pictures: runtime.signal(Rc::from([])),
             pictured: runtime.signal(false),
+            listening: runtime.signal(false),
             any_pictures: Cell::new(false),
             pictures_due: Cell::new(None),
             preedit: runtime.signal(String::new()),
@@ -239,6 +253,11 @@ impl EngineTerminal {
             last_selection: RefCell::new(None),
             last_offset: Cell::new(0),
             last_focus: Cell::new(false),
+            search: RefCell::new(None),
+            searching: Cell::new(false),
+            found: runtime.signal(Rc::from([])),
+            found_open: runtime.signal(false),
+            last_counts: Cell::new(None),
             size: Cell::new((0., 0.)),
             pressed: Cell::new(None),
             scroll_rest: Cell::new(0.),
@@ -456,8 +475,19 @@ impl Engine {
     }
 
     /// Work out the rows that changed and hand the canvases those that
-    /// differ.
+    /// differ; and while a search is open, its matches in view.
     fn paint(&self) {
+        self.paint_rows();
+        if self.searching.get() {
+            self.search_step();
+        }
+    }
+
+    /// `paint`'s rows: built as before searching. (With a search's steps
+    /// in its body, its hot loops took other registers on x86: the terminal
+    /// cells +0.05% to +0.40%.)
+    #[inline(never)]
+    fn paint_rows(&self) {
         let session = self.session.borrow();
         let Some(session) = session.as_ref() else {
             return;
@@ -471,6 +501,7 @@ impl Engine {
         let caret;
         let output;
         let screen_rows;
+        let scrolled;
         {
             let mut term = session.term();
             let rows = term.screen_lines();
@@ -496,6 +527,11 @@ impl Engine {
             output = !all;
             *self.last_selection.borrow_mut() = selection;
             let mut damaged = vec![false; rows];
+            // Lines the screen scrolled up, their damage moved with them:
+            // what the slots drew moves up as many rows, and only the rows
+            // damaged since are built (the lines new at the bottom, and any
+            // written to). Unless everything is drawn again anyway.
+            let lines_scrolled = term.scrolled();
             match term.damage() {
                 alacritty_terminal::term::TermDamage::Full => all = true,
                 alacritty_terminal::term::TermDamage::Partial(lines) => {
@@ -506,7 +542,12 @@ impl Engine {
                     }
                 }
             }
-            let was = self.last_cursor.replace(cursor_row);
+            scrolled = if all { 0 } else { lines_scrolled };
+            // The row the cursor was drawn on, moved up with its line.
+            let was = self
+                .last_cursor
+                .replace(cursor_row)
+                .and_then(|row| row.checked_sub(scrolled));
             for row in [was, cursor_row].into_iter().flatten() {
                 if let Some(row) = damaged.get_mut(row) {
                     *row = true;
@@ -552,15 +593,21 @@ impl Engine {
             Vec::new()
         };
         let news = if output && listening {
-            self.news_of(&shown, &changed)
+            match scrolled {
+                0 => self.news_of(&shown, &changed),
+                _ => self.scrolled_news_of(&shown, &changed, scrolled),
+            }
         } else {
             String::new()
         };
         self.runtime.batch(|| {
-            // Every row worked out again (output scrolled, most often): the
-            // slots of lines still on screen move up with them.
-            if every_row {
-                self.scroll_slots(shift(&shown, &changed));
+            // Output scrolled the screen: the slots of lines still on it
+            // move up with them, as many as it says, or, every row worked
+            // out again, as many as their rows show.
+            match scrolled {
+                0 if every_row => self.scroll_slots(shift(&shown, &changed)),
+                0 => {}
+                lines => self.scroll_slots(lines),
             }
             let rows = self.rows.borrow();
             let slots = self.slots.borrow();
@@ -670,6 +717,64 @@ impl Engine {
         } else {
             let mut after: Vec<&str> = shown.iter().map(|paint| paint.text.as_str()).collect();
             let before: Vec<&str> = after.clone();
+            for (row, paint) in changed {
+                if let Some(text) = after.get_mut(*row) {
+                    *text = &paint.text;
+                }
+            }
+            crate::news::news(&before, &after)
+        };
+        crate::news::less_echo(&mut self.typed.borrow_mut(), news)
+    }
+
+    /// `news_of` for a frame whose output scrolled the screen `scrolled`
+    /// rows (the changed rows built after the lines shown moved up, before
+    /// the slots move with them, which the batch does): each changed row is
+    /// compared with the row whose line it now shows (none for a line
+    /// brought in); every row, when every row changed, its lines moved up
+    /// first. Apart from `news_of`, which frames that don't scroll (every
+    /// frame of output pouring in) take as they always did.
+    #[cold]
+    #[inline(never)]
+    fn scrolled_news_of(
+        &self,
+        shown: &[Rc<RowPaint>],
+        changed: &[(usize, RowPaint)],
+        scrolled: usize,
+    ) -> String {
+        if changed.is_empty() {
+            return String::new();
+        }
+        let news = if shown.is_empty() {
+            // What each changed row showed before, moved up by the scroll:
+            // the row below by as many, or nothing for a line brought in.
+            let rows = self.rows.borrow();
+            let slots = self.slots.borrow();
+            // Top first, as a reader hears the screen.
+            let mut was: Vec<(usize, Option<Rc<RowPaint>>, &RowPaint)> = changed
+                .iter()
+                .map(|(row, now)| {
+                    let slot = slots.get(row + scrolled);
+                    (
+                        *row,
+                        slot.map(|slot| rows[*slot].with_untracked(Rc::clone)),
+                        now,
+                    )
+                })
+                .collect();
+            was.sort_unstable_by_key(|(row, ..)| *row);
+            crate::news::changed_news(was.iter().map(|(_, was, now)| {
+                (
+                    was.as_deref().map_or("", |was| was.text.as_str()),
+                    now.text.as_str(),
+                )
+            }))
+        } else {
+            let mut after: Vec<&str> = shown.iter().map(|paint| paint.text.as_str()).collect();
+            let before: Vec<&str> = after.clone();
+            // The rows scrolled off left out, the lines brought in blank.
+            after.drain(..scrolled.min(after.len()));
+            after.resize(before.len(), "");
             for (row, paint) in changed {
                 if let Some(text) = after.get_mut(*row) {
                     *text = &paint.text;
@@ -1372,10 +1477,86 @@ impl Engine {
                     .unwrap_or(FONT_SIZE);
                 self.set_font_size(size);
             }
+            // The search (`TerminalState::search`): a needle (empty ends
+            // it), the next older match or newer, scrolled to.
+            "search" => self.set_search(argument),
+            "end_search" => self.set_search(""),
+            "navigate_search" => self.navigate_search(argument != "previous"),
             "text" => self.write(unescape(argument)),
             "csi" => self.write([b"\x1b[".as_slice(), argument.as_bytes()].concat()),
             "esc" => self.write([b"\x1b".as_slice(), argument.as_bytes()].concat()),
             _ => {}
+        }
+    }
+
+    /// Search for `needle` from now on (none, empty), every row drawn again.
+    fn set_search(&self, needle: &str) {
+        let search = (!needle.is_empty()).then(|| Search::new(needle));
+        let open = search.is_some();
+        self.searching.set(open);
+        *self.search.borrow_mut() = search;
+        self.last_counts.set(None);
+        self.found.set(Rc::from([]));
+        self.found_open.set(open);
+        self.paint();
+    }
+
+    /// Select the next `older` match, or newer, and scroll the view to it
+    /// (in its middle, if it wasn't in view).
+    fn navigate_search(&self, older: bool) {
+        let line = {
+            let mut search = self.search.borrow_mut();
+            let Some(search) = search.as_mut() else {
+                return;
+            };
+            search.navigate(older);
+            search.selected_line()
+        };
+        if let Some(line) = line {
+            self.with_session(|session| {
+                let mut term = session.term();
+                let grid = term.grid();
+                let rows = grid.screen_lines() as i64;
+                let offset = grid.display_offset() as i64;
+                let line = line as i64 - grid.pushed() as i64;
+                if line < -offset || line >= rows - offset {
+                    let target = (rows / 2 - line).clamp(0, grid.history_size() as i64);
+                    term.scroll_display(Scroll::Delta((target - offset) as i32));
+                }
+            });
+        }
+        self.paint();
+    }
+
+    /// The search brought up to date with what the screen holds: its
+    /// matches in view to `found` (drawn over the rows) and its counts to
+    /// the state, where they changed. Out of `paint`'s line: only while a
+    /// search is open.
+    #[cold]
+    #[inline(never)]
+    fn search_step(&self) {
+        let step = self.with_session(|session| {
+            let term = session.term();
+            let mut search = self.search.borrow_mut();
+            let search = search.as_mut()?;
+            search.update(&term);
+            Some((search.in_view(&term), (search.total(), search.selected())))
+        });
+        let Some(Some((highlights, counts))) = step else {
+            return;
+        };
+        if self.found.with_untracked(|found| **found != highlights[..]) {
+            self.found.set(Rc::from(highlights));
+        }
+        if self.last_counts.replace(Some(counts)) != Some(counts)
+            && let Some(term) = self.controller()
+        {
+            term.update_state(|state| {
+                if let Some(search) = &mut state.search {
+                    search.total = Some(counts.0);
+                    search.selected = counts.1;
+                }
+            });
         }
     }
 
@@ -1626,13 +1807,30 @@ impl Replay {
 /// timer or a wake, so what a bench counts is the same each run.
 #[doc(hidden)]
 pub fn replay_terminal(term: &Terminal, runtime: Runtime) -> Replay {
+    replay_terminal_with_scrollback(term, runtime, SessionOptions::default().scrollback)
+}
+
+/// `replay_terminal`, keeping `scrollback` lines (a bench's search through
+/// a long history).
+#[doc(hidden)]
+pub fn replay_terminal_with_scrollback(
+    term: &Terminal,
+    runtime: Runtime,
+    scrollback: usize,
+) -> Replay {
     let executor = Rc::new(RefCell::new(zgx::task::LocalExecutor::new()));
     let engine = EngineTerminal::start(
         term,
         runtime,
         TaskRunner::from_executor(executor),
         None,
-        |options, wake| Ok(Session::replay(options, GridSize::new(80, 24), wake)),
+        move |options, wake| {
+            let options = SessionOptions {
+                scrollback,
+                ..options.clone()
+            };
+            Ok(Session::replay(&options, GridSize::new(80, 24), wake))
+        },
     )
     .expect("a replay starts");
     let shared = engine.0.clone();
@@ -1755,24 +1953,38 @@ fn view(engine: Rc<Engine>) -> View {
                 let layout = engine.layout.clone();
                 let order = engine.order.clone();
                 let pictured = engine.pictured.clone();
+                let listening = engine.listening.clone();
+                let found = engine.found_open.clone();
                 move || {
                     let (_, generation) = layout.get();
                     let pictured = pictured.get();
-                    order.with(|order| {
-                        let rows = order.iter().map(|slot| (*slot, generation));
-                        if !pictured {
-                            return rows.collect::<Vec<_>>();
-                        }
-                        std::iter::once((UNDER, 0))
-                            .chain(rows)
-                            .chain(std::iter::once((OVER, 0)))
-                            .collect()
-                    })
+                    // A search's matches over the rows, only while one is
+                    // open: one more node then, none otherwise.
+                    if found.get() {
+                        return found_layers(pictured, &order, &listening, generation);
+                    }
+                    // Each slot is drawn at its line whatever its place among
+                    // the nodes: only a reader meets them in that order. With
+                    // none, they keep theirs, and a scroll moves no node.
+                    let slots: Vec<usize> = if listening.get() {
+                        order.with(|order| order.to_vec())
+                    } else {
+                        (0..order.with_untracked(|order| order.len())).collect()
+                    };
+                    let rows = slots.into_iter().map(|slot| (slot, generation));
+                    if !pictured {
+                        return rows.collect::<Vec<_>>();
+                    }
+                    std::iter::once((UNDER, 0))
+                        .chain(rows)
+                        .chain(std::iter::once((OVER, 0)))
+                        .collect()
                 }
             },
             move |(slot, _), _cx| match slot {
                 UNDER => pictures_view(&engine, true),
                 OVER => pictures_view(&engine, false),
+                FOUND => found_view(&engine),
                 slot => row_view(&engine, slot),
             },
         )
@@ -1793,6 +2005,13 @@ fn view(engine: Rc<Engine>) -> View {
                 let _ = metrics.layout.get();
                 let height = metrics.metrics.get().cell_height;
                 Styles::new().translate(0., -(scrolled.get() as f32) * height)
+            })
+            // Scroll content: a move is what was drawn, copied up, and the
+            // line it uncovers, not every row damaged where it was and is.
+            .on_mount(|handle| {
+                if let Some(scene) = handle.scene() {
+                    scene.borrow_mut().set_scroll_copy(handle.node(), true);
+                }
             })
             .child(rows)
     };
@@ -1949,6 +2168,17 @@ fn view(engine: Rc<Engine>) -> View {
                 });
                 handle.retain(effect);
             }
+            // The rows in screen order while a reader listens.
+            if let Some(at) = handle.observe_assistive_technology() {
+                let listening = engine.listening.clone();
+                let effect = engine.runtime.effect(move || {
+                    let now = at.get();
+                    if listening.with_untracked(|was| *was != now) {
+                        listening.set(now);
+                    }
+                });
+                handle.retain(effect);
+            }
             if let Some(size) = handle.observe_size() {
                 let fit = engine.clone();
                 let effect = engine.runtime.effect(move || {
@@ -1965,6 +2195,7 @@ fn view(engine: Rc<Engine>) -> View {
 /// again at each scroll.
 const UNDER: usize = usize::MAX;
 const OVER: usize = usize::MAX - 1;
+const FOUND: usize = usize::MAX - 2;
 
 /// A picture as the view draws it, in points.
 #[derive(Clone, Debug, PartialEq)]
@@ -2050,6 +2281,63 @@ fn shown_pictures(term: &crate::Term, session: &Session, metrics: Metrics) -> Ve
 }
 
 /// The pictures under the text (negative z), or over it.
+/// The rows' layers while a search is open: the pictures' under them (if
+/// any), the rows, its matches over them (translucent, as a selection is:
+/// every match shows, on cells of any background), the pictures' over
+/// them. Out of the rows' list's line: only while a search is open.
+#[cold]
+#[inline(never)]
+fn found_layers(
+    pictured: bool,
+    order: &Signal<Rc<[usize]>>,
+    listening: &Signal<bool>,
+    generation: u32,
+) -> Vec<(usize, u32)> {
+    let slots: Vec<usize> = if listening.get() {
+        order.with(|order| order.to_vec())
+    } else {
+        (0..order.with_untracked(|order| order.len())).collect()
+    };
+    let rows = slots.into_iter().map(|slot| (slot, generation));
+    let under = pictured.then_some((UNDER, 0));
+    let over = pictured.then_some((OVER, 0));
+    under
+        .into_iter()
+        .chain(rows)
+        .chain(std::iter::once((FOUND, generation)))
+        .chain(over)
+        .collect()
+}
+
+/// A search's matches in view (`Engine::found`), over the rows, on the
+/// screen's rows as they show: in the rows' container, moved down as far
+/// as it moves up.
+fn found_view(engine: &Rc<Engine>) -> View {
+    let found = engine.found.clone();
+    let look = engine.look.clone();
+    let cells = engine.clone();
+    let placed = engine.clone();
+    canvas(move |_| {
+        // In the cells' size, drawn again with a new font.
+        let _ = cells.layout.get();
+        let metrics = cells.metrics.get();
+        look.with(|look| found.with(|found| paint::draw_found(found, look, metrics)))
+    })
+    .absolute()
+    .left(PAD_X)
+    .top(PAD_Y)
+    .w_full()
+    .reactive_style(move || {
+        // The rows' height (the container's own comes from its rows,
+        // placed absolutely), at the screen's top.
+        let (rows, _) = placed.layout.get();
+        let height = placed.metrics.get().cell_height;
+        let top = placed.scrolled.get() as f32 * height;
+        Styles::new().h(f32::from(rows) * height).translate(0., top)
+    })
+    .accessible_hidden()
+}
+
 fn pictures_view(engine: &Rc<Engine>, below: bool) -> View {
     let pictures = engine.pictures.clone();
     let shown = engine.pictures.clone();

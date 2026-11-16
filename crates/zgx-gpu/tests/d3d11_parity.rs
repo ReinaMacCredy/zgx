@@ -32,6 +32,9 @@ use zgx::{compose::prelude::*, reactive::Signal, scene::Color, widgets::Ui};
 use zgx_gpu::{GpuRenderer, text::FontData};
 
 #[cfg(windows)]
+#[path = "support/view_painters.rs"]
+mod view_painters;
+#[cfg(windows)]
 const GEIST: &[u8] = include_bytes!("fonts/GeistVariable-subset.ttf");
 #[cfg(windows)]
 const SIZE: (f32, f32) = (400., 300.);
@@ -434,6 +437,21 @@ fn fill_frames(scale: f32) -> Vec<Vec<u8>> {
 /// they would match.
 #[cfg(windows)]
 fn layer_frames(scale: f32) -> Vec<Vec<u8>> {
+    shader_frames(scale, false)
+}
+
+/// As `layer_frames`, of every ready-made layer shader reading the backdrop
+/// but not blurring it (glass, `zgx_fx`'s), and a glass of zgx's own mixing
+/// the backdrop with the box. Each cell is damaged at each moment: a frame
+/// of several regions, whose backdrop reads may reach past their own.
+#[cfg(windows)]
+fn glass_frames(scale: f32) -> Vec<Vec<u8>> {
+    shader_frames(scale, true)
+}
+
+/// The frames `layer_frames` or (`glass`) `glass_frames` draw.
+#[cfg(windows)]
+fn shader_frames(scale: f32, glass: bool) -> Vec<Vec<u8>> {
     use std::time::{Duration, Instant};
     use zgx::decoration::{ShaderUniforms, color_filter_shader};
     use zgx::scene::*;
@@ -441,7 +459,9 @@ fn layer_frames(scale: f32) -> Vec<Vec<u8>> {
     let mut layers: Vec<(String, Option<zgx_fx::Fx>)> = zgx_fx::catalog()
         .into_iter()
         .filter(|(_, fx)| {
-            fx.kind() == zgx_fx::FxKind::Layer && fx.frost() == 0. && !fx.shader().reads_backdrop()
+            fx.kind() == zgx_fx::FxKind::Layer
+                && fx.frost() == 0.
+                && fx.shader().reads_backdrop() == glass
         })
         .map(|(name, fx)| {
             // A one-shot alive since `start`, seen a moment on.
@@ -449,8 +469,20 @@ fn layer_frames(scale: f32) -> Vec<Vec<u8>> {
             (name, Some(fx))
         })
         .collect();
-    assert!(layers.len() >= 10, "{} layer shaders", layers.len());
-    layers.push(("hue_rotate".into(), None));
+    match glass {
+        false => {
+            assert!(layers.len() >= 10, "{} layer shaders", layers.len());
+            layers.push(("hue_rotate".into(), None));
+        }
+        true => layers.push(("glass mix".into(), None)),
+    }
+    let mix = zgx::decoration::FillShader::new(
+        "fn layer(input: LayerInput) -> vec4<f32> {
+    let behind = zgx_backdrop(input.p + vec2(6. * sin(input.time * 3.), 4.));
+    return vec4(mix(behind.rgb, input.color.rgb, 0.35), max(behind.a, input.color.a));
+}",
+        None,
+    );
     let (cell, columns) = (LAYER_CELL, LAYER_COLUMNS);
     let size = (
         cell.0 * columns as f32,
@@ -485,6 +517,30 @@ fn layer_frames(scale: f32) -> Vec<Vec<u8>> {
                 },
             );
         }
+        // Glass reads the backdrop at offsets across as well as down
+        // (chroma_split's split is across): columns over the stripes, so
+        // what's behind changes both ways.
+        for j in (1..(size.0 / 12.).ceil() as usize)
+            .step_by(2)
+            .filter(|_| glass)
+        {
+            let column = scene.append(
+                root,
+                NodeKind::Rect(Color(40, 200, 90, 140)),
+                Style {
+                    width: Some(12.),
+                    height: Some(size.1),
+                    ..Default::default()
+                },
+            );
+            scene.set_transform(
+                column,
+                Transform {
+                    x: j as f32 * 12.,
+                    y: 0.,
+                },
+            );
+        }
         for (index, (_, fx)) in layers.iter().enumerate() {
             let id = scene.append(
                 root,
@@ -498,7 +554,7 @@ fn layer_frames(scale: f32) -> Vec<Vec<u8>> {
                         // 11 compiles from two modules. As a fill it doesn't
                         // validate (no `fill`) and the box draws its colour;
                         // as the layer's shader it must still draw.
-                        decoration: fx.is_none().then(|| {
+                        decoration: (fx.is_none() && !glass).then(|| {
                             std::sync::Arc::new(zgx::decoration::Decoration {
                                 background: Some(zgx::decoration::Background::Shader(
                                     color_filter_shader(),
@@ -535,6 +591,16 @@ fn layer_frames(scale: f32) -> Vec<Vec<u8>> {
             match (time, fx) {
                 (None, _) => {}
                 (Some(time), Some(fx)) => fx.apply(&mut scene, id, time, false, later),
+                (Some(time), None) if glass => {
+                    scene.set_layer_shader(id, Some(mix.clone()));
+                    scene.set_layer_uniforms(
+                        id,
+                        ShaderUniforms {
+                            time,
+                            params: [[0.; 4]; 4],
+                        },
+                    );
+                }
                 (Some(_), None) => {
                     let matrix = hue_rotate_matrix(120.);
                     scene.set_layer_shader(id, Some(color_filter_shader()));
@@ -584,8 +650,540 @@ fn frames(scale: f32) -> Vec<Vec<u8>> {
     all.extend(effect_frames(scale));
     all.extend(image_effect_frames(scale));
     all.extend(blend_frames(scale));
+    all.extend(glass_frames(scale));
+    all.extend(cross_region_frames(scale));
+    all.extend(view_frames(scale));
+    all.extend(view_scene_frames(scale));
+    all.extend(blur_frames(scale));
+    all.extend(fade_frames(scale));
     all
 }
+
+/// The seven GPU-view scenes of `support/view_painters.rs`
+/// (`VIEW_SCENE_NAMES`): a lit textured cube with depth, MSAA resolved into
+/// the target, a transparent view over UI, a view resized between frames,
+/// one animated, two views in a window, and one clipped, rounded, turned,
+/// scaled and translucent. Each scene asserts its view drew.
+#[cfg(windows)]
+fn view_scene_frames(scale: f32) -> Vec<Vec<u8>> {
+    let frames = view_painters::view_scene_frames(scale);
+    assert_eq!(
+        frames.len(),
+        view_painters::VIEW_SCENE_NAMES.len(),
+        "a GPU is required here"
+    );
+    frames
+}
+
+/// A GPU view (`zgx::gpu_view`) drawn by a painter with wgpu: under
+/// Direct3D 11, on the views' own Direct3D 12 device, its texture shared
+/// with Direct3D 11 (`view_host`). It clears to a colour and draws a
+/// triangle with a pipeline of its own, in a rounded box at 0.8 opacity over
+/// a bar, drawn again in a new colour each frame (`GpuView::invalidate`).
+/// Each frame must show the view's colour and its triangle: a view left out
+/// would show the bar.
+#[cfg(windows)]
+fn view_frames(scale: f32) -> Vec<Vec<u8>> {
+    use std::{cell::Cell, rc::Rc};
+    use zgx_gpu::viewport::{Viewport, ViewportFrame};
+    struct Painter {
+        colour: Rc<Cell<[f64; 3]>>,
+        pipeline: Option<wgpu::RenderPipeline>,
+    }
+    impl Viewport for Painter {
+        fn render(&mut self, frame: &mut ViewportFrame<'_>) {
+            let (device, format) = (frame.device, frame.format);
+            let pipeline = self.pipeline.get_or_insert_with(|| {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("triangle"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = array(vec2(-0.6, -0.6), vec2(0.6, -0.6), vec2(0.0, 0.7));
+    return vec4(p[i], 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4<f32> { return vec4(0.95, 0.9, 0.2, 1.0); }"
+                            .into(),
+                    ),
+                });
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("triangle"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(format.into())],
+                    }),
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            });
+            let [r, g, b] = self.colour.get();
+            let mut pass = frame
+                .encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("view"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: frame.target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a: 1.0 }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+            pass.set_pipeline(pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        fn device_changed(&mut self) {
+            self.pipeline = None;
+        }
+    }
+    let size = VIEW_SIZE;
+    let mut gpu = GpuRenderer::new((size.0 * scale) as u32, (size.1 * scale) as u32).unwrap();
+    gpu.set_scale_factor(scale);
+    let colour = Rc::new(Cell::new([0.1, 0.3, 0.8]));
+    let view = zgx_gpu::viewport::view(Painter {
+        colour: colour.clone(),
+        pipeline: None,
+    });
+    let mut ui = Ui::new(size.0, size.1);
+    ui.mount(
+        div()
+            .size(size.0, size.1)
+            .bg(Color(20, 24, 32, 255))
+            .child(
+                div()
+                    .absolute()
+                    .ml(10.)
+                    .mt(60.)
+                    .size(220., 40.)
+                    .bg(Color(230, 130, 30, 255)),
+            )
+            .child(
+                gpu_view("view", &view)
+                    .absolute()
+                    .ml(40.)
+                    .mt(20.)
+                    .size(160., 120.)
+                    .rounded(12.)
+                    .opacity(0.8),
+            ),
+    );
+    [[0.1, 0.3, 0.8], [0.8, 0.2, 0.3], [0.2, 0.7, 0.4]]
+        .into_iter()
+        .map(|next| {
+            colour.set(next);
+            view.invalidate();
+            ui.prepare_frame();
+            let report = ui.scene.borrow_mut().flush();
+            gpu.render(&ui.scene.borrow(), &report.damage).unwrap();
+            let pixels = gpu.readback().unwrap();
+            // The view's middle shows its triangle, and its corner the
+            // colour it cleared to (over the bar, at 0.8): not the bar.
+            let width = (size.0 * scale) as usize;
+            let at = |x: f32, y: f32| ((y * scale) as usize * width + (x * scale) as usize) * 4;
+            let middle = &pixels[at(120., 80.)..][..4];
+            assert!(
+                middle[0] > 180 && middle[1] > 170 && middle[2] < 90,
+                "the view's triangle isn't drawn: {middle:?} at {scale}x"
+            );
+            let corner = &pixels[at(60., 70.)..][..4];
+            let strongest = |c: [f32; 3]| (0..3).max_by(|&a, &b| c[a].total_cmp(&c[b])).unwrap();
+            let drawn = [corner[0], corner[1], corner[2]].map(f32::from);
+            assert_eq!(
+                strongest(drawn),
+                strongest(next.map(|c| c as f32)),
+                "the view's clear colour {next:?} isn't drawn: {corner:?} at {scale}x"
+            );
+            pixels
+        })
+        .collect()
+}
+
+/// A card fading as one across a `fade_edges` band (bands.rs): light paper,
+/// rounded and clipping, holding dark art, in a clip whose top 40 points
+/// fade, over an opaque ground. Direct3D 12 draws what reaches the band
+/// into a texture and fades it once, so the paper never shows through the
+/// art as a veil. The card moves down through the band, a frame a step.
+#[cfg(windows)]
+fn fade_frames(scale: f32) -> Vec<Vec<u8>> {
+    use zgx::scene::*;
+    let size = FADE_SIZE;
+    let mut gpu = GpuRenderer::new((size.0 * scale) as u32, (size.1 * scale) as u32).unwrap();
+    gpu.set_scale_factor(scale);
+    let mut scene = Scene::new(size.0, size.1);
+    let root = scene.root();
+    scene.set_kind(root, NodeKind::Container(Layout::Overlay));
+    scene.append(
+        root,
+        NodeKind::Rect(Color(30, 90, 60, 255)),
+        Style {
+            width: Some(size.0),
+            height: Some(size.1),
+            ..Default::default()
+        },
+    );
+    let clip = scene.append(
+        root,
+        NodeKind::Container(Layout::Overlay),
+        Style {
+            width: Some(160.),
+            height: Some(160.),
+            clip: true,
+            fade_edges: [40., 0.],
+            ..Default::default()
+        },
+    );
+    scene.set_transform(clip, Transform { x: 20., y: 20. });
+    let card = scene.append(
+        clip,
+        NodeKind::Panel {
+            layout: Layout::Overlay,
+            quad: QuadStyle {
+                fill: Color(240, 238, 232, 255),
+                radius: 12.,
+                ..Default::default()
+            },
+        },
+        Style {
+            width: Some(160.),
+            height: Some(80.),
+            clip: true,
+            ..Default::default()
+        },
+    );
+    let art = zgx::image::ImageData::new(4, 4, [40u8, 40, 80, 255].repeat(16)).unwrap();
+    scene.append(
+        card,
+        NodeKind::Image(std::sync::Arc::new(art)),
+        Style {
+            width: Some(120.),
+            height: Some(60.),
+            ..Default::default()
+        },
+    );
+    [0., 13., 27.5, 60.]
+        .into_iter()
+        .map(|y| {
+            scene.set_transform(card, Transform { x: 0., y });
+            let report = scene.flush();
+            gpu.render(&scene, &report.damage).unwrap();
+            gpu.readback().unwrap()
+        })
+        .collect()
+}
+#[cfg(windows)]
+const VIEW_SIZE: (f32, f32) = (240., 160.);
+#[cfg(windows)]
+const FADE_SIZE: (f32, f32) = (200., 200.);
+
+/// Backdrop blurs (`Effects::blur_radius`), drawn as Direct3D 12 draws them
+/// (blur.wgsl's passes into an atlas, then back over the target): a plain
+/// one, one fading at its edges, one saturated and brightened, zgx-fx's
+/// frosted lens and fluted glass, and glass reading the backdrop over a blur
+/// of its own (`BLUR_NAMES`). A bar moves under them all each frame, so each
+/// blurs again. Each cell must change with it, and the plain blur must not
+/// be its box opaque (as Direct3D 11 drew one, left out).
+#[cfg(windows)]
+fn blur_frames(scale: f32) -> Vec<Vec<u8>> {
+    use zgx::decoration::{FillShader, ShaderUniforms};
+    use zgx::scene::*;
+    let (cell, columns) = (BLUR_CELL, 3);
+    let size = (cell.0 * columns as f32, cell.1 * 2.);
+    let mut gpu = GpuRenderer::new((size.0 * scale) as u32, (size.1 * scale) as u32).unwrap();
+    gpu.set_scale_factor(scale);
+    let mut scene = Scene::new(size.0, size.1);
+    let root = scene.root();
+    scene.set_kind(root, NodeKind::Container(Layout::Overlay));
+    let fixed = |width: f32, height: f32| Style {
+        width: Some(width),
+        height: Some(height),
+        ..Default::default()
+    };
+    // A checker of stripes and columns, then the bar that moves.
+    for i in 0..(size.1 / 12.).ceil() as usize {
+        let colour = match i % 2 {
+            0 => Color(30, 60, 200, 255),
+            _ => Color(230, 130, 30, 255),
+        };
+        let stripe = scene.append(root, NodeKind::Rect(colour), fixed(size.0, 12.));
+        scene.set_transform(
+            stripe,
+            Transform {
+                x: 0.,
+                y: i as f32 * 12.,
+            },
+        );
+    }
+    for j in (1..(size.0 / 12.).ceil() as usize).step_by(2) {
+        let column = scene.append(
+            root,
+            NodeKind::Rect(Color(40, 200, 90, 140)),
+            fixed(12., size.1),
+        );
+        scene.set_transform(
+            column,
+            Transform {
+                x: j as f32 * 12.,
+                y: 0.,
+            },
+        );
+    }
+    let bar = scene.append(
+        root,
+        NodeKind::Rect(Color(250, 250, 250, 255)),
+        fixed(30., size.1),
+    );
+    let fx = |name: &str| {
+        zgx_fx::catalog()
+            .into_iter()
+            .find(|(fx_name, _)| fx_name == name)
+            .unwrap_or_else(|| panic!("no {name} in zgx-fx's catalog"))
+            .1
+    };
+    let mix = FillShader::new(
+        "fn layer(input: LayerInput) -> vec4<f32> {
+    let behind = zgx_backdrop(input.p + vec2(3., 2.));
+    return vec4(mix(behind.rgb, input.color.rgb, 0.3), max(behind.a, input.color.a));
+}",
+        None,
+    );
+    let now = std::time::Instant::now();
+    let boxes: Vec<NodeId> = (0..BLUR_NAMES.len())
+        .map(|index| {
+            let id = scene.append(
+                root,
+                NodeKind::Panel {
+                    layout: Layout::Overlay,
+                    quad: QuadStyle {
+                        radius: 8.,
+                        fill: Color(20, 24, 32, 110),
+                        ..Default::default()
+                    },
+                },
+                fixed(cell.0 - 32., cell.1 - 24.),
+            );
+            scene.set_transform(
+                id,
+                Transform {
+                    x: (index % columns) as f32 * cell.0 + 16.,
+                    y: (index / columns) as f32 * cell.1 + 12.,
+                },
+            );
+            let blur = |radius: f32| Effects {
+                blur_radius: radius,
+                ..Default::default()
+            };
+            match index {
+                0 => scene.set_effects(id, blur(12.)),
+                1 => scene.set_effects(
+                    id,
+                    Effects {
+                        edge_fade: 12.,
+                        ..blur(8.)
+                    },
+                ),
+                2 => scene.set_effects(
+                    id,
+                    Effects {
+                        saturate: 1.6,
+                        brightness: 1.1,
+                        ..blur(10.)
+                    },
+                ),
+                3 => fx("lens frosted").apply(&mut scene, id, 0.4, false, now),
+                4 => fx("fluted_glass frosted").apply(&mut scene, id, 0.4, false, now),
+                _ => {
+                    scene.set_effects(id, blur(10.));
+                    scene.set_layer_shader(id, Some(mix.clone()));
+                    scene.set_layer_uniforms(
+                        id,
+                        ShaderUniforms {
+                            time: 0.,
+                            params: [[0.; 4]; 4],
+                        },
+                    );
+                }
+            }
+            id
+        })
+        .collect();
+    let width = (size.0 * scale) as usize;
+    // The bar's left edge: over each column's middle (56, 168, 280) in turn,
+    // so each cell's middle changes from one frame to the next.
+    let frames: Vec<Vec<u8>> = [41., 153., 265., 306.]
+        .into_iter()
+        .map(|x| {
+            scene.set_transform(bar, Transform { x, y: 0. });
+            let report = scene.flush();
+            gpu.render(&scene, &report.damage).unwrap();
+            gpu.readback().unwrap()
+        })
+        .collect();
+    let at = |frame: &[u8], x: f32, y: f32| {
+        let i = ((y * scale) as usize * width + (x * scale) as usize) * 4;
+        [frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]
+    };
+    for (index, name) in BLUR_NAMES.iter().enumerate() {
+        let (x, y) = (
+            (index % columns) as f32 * cell.0 + cell.0 / 2.,
+            (index / columns) as f32 * cell.1 + cell.1 / 2.,
+        );
+        let changes = frames
+            .windows(2)
+            .any(|pair| at(&pair[0], x, y) != at(&pair[1], x, y));
+        assert!(
+            changes,
+            "{name}: doesn't blur the bar moving under it at {scale}x"
+        );
+    }
+    let middle = at(&frames[0], cell.0 / 2., cell.1 / 2.);
+    assert!(
+        middle[3] == 255 && middle[..3] != [20, 24, 32],
+        "the plain blur drew as its box opaque: {middle:?} at {scale}x"
+    );
+    drop(boxes);
+    frames
+}
+#[cfg(windows)]
+const BLUR_CELL: (f32, f32) = (112., 80.);
+/// The blur frames' cells (`blur_frames`), for `where_`.
+#[cfg(windows)]
+const BLUR_NAMES: [&str; 6] = [
+    "backdrop blur",
+    "blur, edge fade",
+    "blur, saturated",
+    "lens frosted",
+    "fluted_glass frosted",
+    "glass over a blur",
+];
+
+/// Glass on a frame whose damage the scene's grid cuts (`CROSS_NAMES`): a
+/// box reading a bar 140 points below it (`zgx_backdrop` at an offset, its
+/// reach past it), a box beside the read from the bar's rows down, and 80
+/// dots far off, all changing in the second frame: past `DAMAGE_RECTS`, the
+/// damage goes on the grid, whose runs cut the read where the side box
+/// starts. (The renderer draws the read as one region again,
+/// `layer_shader.rs`'s `a_backdrop_read_is_never_split_between_regions`.)
+/// The glass must show the bar's new colour.
+#[cfg(windows)]
+fn cross_region_frames(scale: f32) -> Vec<Vec<u8>> {
+    use zgx::decoration::{FillShader, ShaderUniforms};
+    use zgx::scene::*;
+    let size = CROSS_SIZE;
+    let mut gpu = GpuRenderer::new((size.0 * scale) as u32, (size.1 * scale) as u32).unwrap();
+    gpu.set_scale_factor(scale);
+    let mut scene = Scene::new(size.0, size.1);
+    let root = scene.root();
+    scene.set_kind(root, NodeKind::Container(Layout::Overlay));
+    let fixed = |width: f32, height: f32| Style {
+        width: Some(width),
+        height: Some(height),
+        ..Default::default()
+    };
+    let reading = FillShader::new(
+        "fn layer(input: LayerInput) -> vec4<f32> {
+    let behind = zgx_backdrop(input.p + vec2(0., input.params[0].x));
+    return vec4(mix(behind.rgb, input.color.rgb, 0.2), 1.);
+}",
+        None,
+    );
+    let bar = scene.append(
+        root,
+        NodeKind::Rect(Color(200, 40, 40, 255)),
+        fixed(200., 20.),
+    );
+    scene.set_transform(bar, Transform { x: 40., y: 180. });
+    let side = scene.append(
+        root,
+        NodeKind::Rect(Color(30, 60, 200, 255)),
+        fixed(410., 300.),
+    );
+    scene.set_transform(side, Transform { x: 390., y: 176. });
+    let glass = scene.append(
+        root,
+        NodeKind::Panel {
+            layout: Layout::Overlay,
+            quad: QuadStyle {
+                fill: Color(20, 24, 32, 255),
+                ..Default::default()
+            },
+        },
+        fixed(200., 20.),
+    );
+    scene.set_transform(glass, Transform { x: 40., y: 40. });
+    scene.set_layer_shader(glass, Some(reading));
+    scene.set_layer_extent(glass, 0., 150.);
+    let uniforms = |changed: f32| ShaderUniforms {
+        time: 0.,
+        params: [[140., changed, 0., 0.], [0.; 4], [0.; 4], [0.; 4]],
+    };
+    scene.set_layer_uniforms(glass, uniforms(0.));
+    let dots: Vec<NodeId> = (0..80)
+        .map(|i| {
+            let dot = scene.append(
+                root,
+                NodeKind::Rect(Color(250, 250, 250, 255)),
+                fixed(2., 2.),
+            );
+            scene.set_transform(
+                dot,
+                Transform {
+                    x: 1000. + (i % 10) as f32 * 8.,
+                    y: 700. + (i / 10) as f32 * 8.,
+                },
+            );
+            dot
+        })
+        .collect();
+    let mut draw = |scene: &mut Scene| {
+        let report = scene.flush();
+        gpu.render(scene, &report.damage).unwrap();
+        (report.damage, gpu.readback().unwrap())
+    };
+    let (_, before) = draw(&mut scene);
+    scene.set_kind(bar, NodeKind::Rect(Color(40, 200, 90, 255)));
+    scene.set_kind(side, NodeKind::Rect(Color(200, 60, 30, 255)));
+    for &dot in &dots {
+        scene.set_kind(dot, NodeKind::Rect(Color(250, 200, 40, 255)));
+    }
+    scene.set_layer_uniforms(glass, uniforms(1.));
+    let (damage, after) = draw(&mut scene);
+    assert!(
+        damage.iter().any(|d| d.y + d.height == 176.) && damage.iter().any(|d| d.y == 176.),
+        "the damage isn't cut at the side box: {damage:?}"
+    );
+    let width = (size.0 * scale) as usize;
+    let at = ((50. * scale) as usize * width + (140. * scale) as usize) * 4;
+    // Mostly the bar it reads (a fifth the box): red, then green.
+    let (was, now) = (&before[at..at + 4], &after[at..at + 4]);
+    assert!(
+        was[0] > 120 && was[1] < 80,
+        "the glass doesn't show the bar: {was:?}"
+    );
+    assert!(
+        now[1] > 120 && now[0] < 80,
+        "the glass doesn't show the bar's new colour: {now:?}"
+    );
+    vec![before, after]
+}
+#[cfg(windows)]
+const CROSS_SIZE: (f32, f32) = (1200., 900.);
+/// The cross-region frames' parts (`cross_region_frames`), for `where_`.
+#[cfg(windows)]
+const CROSS_NAMES: [&str; 1] = ["glass on cut damage"];
 
 /// A layer in each blend mode but `Normal` (`BLEND_NAMES`): a translucent
 /// box holding a bar, over striped content, drawn first normally. Each must
@@ -1126,6 +1724,46 @@ fn where_(frame: usize, scale: f32, pixel: usize) -> String {
             LAYER_COLUMNS,
             EFFECT_NAMES.map(String::from).to_vec(),
         )
+    } else if frame
+        >= FRAMES + 3 + 5 + 4 + 2 + 2 + 5 + 2 + 3 + view_painters::VIEW_SCENE_NAMES.len() as u32 + 4
+    {
+        (FADE_SIZE.0, FADE_SIZE, 1, vec!["card in a fade".into()])
+    } else if frame
+        >= FRAMES + 3 + 5 + 4 + 2 + 2 + 5 + 2 + 3 + view_painters::VIEW_SCENE_NAMES.len() as u32
+    {
+        (
+            BLUR_CELL.0 * 3.,
+            BLUR_CELL,
+            3,
+            BLUR_NAMES.map(String::from).to_vec(),
+        )
+    } else if frame >= FRAMES + 3 + 5 + 4 + 2 + 2 + 5 + 2 + 3 {
+        let name = view_painters::VIEW_SCENE_NAMES[(frame
+            - (FRAMES + 3 + 5 + 4 + 2 + 2 + 5 + 2 + 3))
+            as usize
+            % view_painters::VIEW_SCENE_NAMES.len()];
+        (
+            view_painters::VIEW_SCENE_SIZE.0,
+            view_painters::VIEW_SCENE_SIZE,
+            1,
+            vec![name.to_string()],
+        )
+    } else if frame >= FRAMES + 3 + 5 + 4 + 2 + 2 + 5 + 2 {
+        (VIEW_SIZE.0, VIEW_SIZE, 1, vec!["GPU view".to_string()])
+    } else if frame >= FRAMES + 3 + 5 + 4 + 2 + 2 + 5 {
+        (
+            CROSS_SIZE.0,
+            CROSS_SIZE,
+            1,
+            CROSS_NAMES.map(String::from).to_vec(),
+        )
+    } else if frame >= FRAMES + 3 + 5 + 4 + 2 + 2 {
+        (
+            LAYER_CELL.0 * LAYER_COLUMNS as f32,
+            LAYER_CELL,
+            LAYER_COLUMNS,
+            glass_names(),
+        )
     } else if frame >= FRAMES + 3 + 5 + 4 + 2 {
         (
             LAYER_CELL.0 * LAYER_COLUMNS as f32,
@@ -1171,6 +1809,18 @@ fn fill_names() -> Vec<String> {
         .map(|(name, _)| name)
         .collect();
     names.push("radial".into());
+    names
+}
+#[cfg(windows)]
+fn glass_names() -> Vec<String> {
+    let mut names: Vec<String> = zgx_fx::catalog()
+        .into_iter()
+        .filter(|(_, fx)| {
+            fx.kind() == zgx_fx::FxKind::Layer && fx.frost() == 0. && fx.shader().reads_backdrop()
+        })
+        .map(|(name, _)| name)
+        .collect();
+    names.push("glass mix".into());
     names
 }
 #[cfg(windows)]

@@ -105,7 +105,9 @@ measured 89.8 MiB private where it is 81.0 MiB with one device.
 in DXGI's own order for that power preference (`EnumAdapterByGpuPreference`,
 `EnumAdapters1` without DXGI 1.6), that has Direct3D 12, a GPU before
 software (WARP) whatever that order, and opens no device on the rest; `auxil::dxgi::factory::enumerate_adapters_by` is the ordered
-enumeration. zgx-gpu (`preferred_dx12_adapter`) passes the result to
+enumeration. `dx12::Instance::expose_dxgi_adapter(raw)` exposes a given
+DXGI adapter (Direct3D 11's, for its GPU views' Direct3D 12 device: WARP's
+LUID differs from one DXGI factory to the next). zgx-gpu (`preferred_dx12_adapter`) passes the result to
 `wgpu::Instance::create_adapter_from_hal`, and falls back to
 `request_adapter` when it finds none or it cannot present to the window.
 Tested, for low power and high performance, by
@@ -123,8 +125,10 @@ a 330 ms start to first text on an RTX 4090 machine, every launch.
 given (its flags, target, entry point and source) and holds that key in
 full, which must match byte for byte before its bytecode (a DXBC container)
 is used: a hash collision, other flags or another version's HLSL compile
-again. Files are written whole and renamed into place, so another process
-never reads half of one. DXC's output is kept the same way, its key also
+again. Files are written whole, each from a file of its writer's own, and
+renamed into place, so no other process or thread reads half of one; a
+container is used only at the size its header gives, so a file cut short
+never reaches the driver. DXC's output is kept the same way, its key also
 naming the DLL's version and its file's size and time (the DLL is the
 app's own, so another one compiles again); a DLL found only by name on the
 search path, with no file to read, isn't kept. zgx-gpu sets `%LOCALAPPDATA%\zgx\shaders`

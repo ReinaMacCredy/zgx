@@ -211,23 +211,34 @@ and fades, kept frames, scroll copies, and isolated layers (translucent,
 nested, transformed), each drawn into a texture of its own and composited,
 images the CPU writes (pictures, gradients, canvases' and SVGs' images),
 and canvases' polyline strokes and filled areas, and shader fills and
-layer shaders that don't read the backdrop (`radial` gradients, `hue_rotate`,
-`sepia` and `invert`, and zgx-fx's fills and layer effects among them), each
-one's pixel stage compiled by FXC off the frame as Direct3D 12's is, in a
-process of its own, images drawn dithered or as characters
+layer shaders (`radial` gradients, `hue_rotate`, `sepia` and `invert`, and
+zgx-fx's fills and layer effects among them; those reading the backdrop,
+glass, over a copy of the target under them), each one's pixel stage
+compiled by FXC off the frame as Direct3D 12's is, in a process of its own,
+with the passes and tagged boxes a layer shader reads
+(`FillShader::with_inputs`: its passes drawn with Direct3D 11 ahead of the
+frame, as Direct3D 12 draws them), images drawn dithered or as characters
 (image_effects.wgsl's pixel stage, made when one first draws), and layer
-effects: blend modes (over a copy of the target under the layer, as on
-Direct3D 12), content blurs, masks and drop shadows, their passes drawn into the effect atlas with effects.wgsl as on
-Direct3D 12. What it doesn't draw yet, it leaves out where what's
-left can't show a picture a user would wrongly trust, naming each kind once
-on stderr: images a GPU view draws are left
-empty; a backdrop blur, or a layer shader reading the backdrop (glass),
-draws its box opaque in its own colour, as the system's Reduce transparency
-draws glass, so what's over it stays legible. The rest fails the frame
+effects: blend modes (over that copy too), content blurs, masks and drop
+shadows, their passes drawn into the effect atlas with effects.wgsl as on
+Direct3D 12, backdrop blurs (frosted glass among them): blur.wgsl's
+passes into an atlas of their own, drawn back over the target, mixed by
+dual-source blending, as Direct3D 12 draws them, and GPU views
+(`zgx::gpu_view`: zgx-3d's worlds, `scene3d`): their painters draw with
+wgpu on a Direct3D 12 device of the views' own, on Direct3D 11's adapter,
+made the first time one shows, into textures shared with Direct3D 11, which
+waits on a shared fence before sampling them
+(`crates/zgx-gpu/src/view_host.rs`). A painter needs nothing different: it
+draws with `frame.device` as anywhere, the device asking for what
+`viewport::view_device_features` lists where the adapter has it. What it
+doesn't draw yet, it leaves out where what's left can't show a picture a
+user would wrongly trust, naming each kind once on stderr: GPU views, where
+the views' device can't be made, are left empty, and layer shaders reading
+GPU views by name there composite their layer as painted, as while one
+compiles. The rest fails the frame
 with an error naming it (and panics in a debug build), since there is no
-Direct3D 12 to fall back to: a backdrop over a box with no colour of its
-own. What it draws (all but the opaque boxes) is Direct3D 12's
-frame byte for byte (`tests/d3d11_parity.rs`, at 1×, 1.5× and 2×). Both run
+Direct3D 12 to fall back to. What it draws is Direct3D 12's frame byte for
+byte (`tests/d3d11_parity.rs`, at 1×, 1.5× and 2×). Both run
 the same HLSL compiled by FXC: Direct3D 11 ahead of time (`dxbc/`, written
 again by `python scripts/d3d11_shaders.py`, on Windows), and zgx
 pins wgpu's Direct3D 12 to FXC too. Left to choose, wgpu takes DXC wherever
@@ -263,7 +274,17 @@ software. `WGPU_FORCE_FALLBACK_ADAPTER=1` takes WARP even beside a GPU, for
 Direct3D 12 and 11 alike, as CI's runners draw: to run the software lines
 or bless a `warp` family of goldens on a machine with a GPU. It is for
 Windows (WARP) and Linux (a software Vulkan driver); macOS has no software
-Metal adapter, so there the renderer fails to start with it. GPUs that old (Intel before Skylake, AMD before GCN, NVIDIA before
+Metal adapter, so there the renderer fails to start with it.
+
+Where WARP is the only adapter (no GPU, or none with a driver), an opaque
+window at 100% scale draws on zgx's software raster instead and shows its
+frames through GDI (softbuffer). DXGI's adapter list tells, without
+opening a device (`zgx_gpu::software_only`). A frame then costs 0.2 to 0.5
+ms of CPU where WARP took 7.6 to 9.6, at half the memory. A window that
+comes to show a GPU view or a layer shader moves to WARP. `ZGX_RENDERER`
+chooses: `gpu`, `raster`, or `auto` (the default).
+
+GPUs that old (Intel before Skylake, AMD before GCN, NVIDIA before
 Kepler) have no Windows Vulkan driver either, so Vulkan is a feature
 (`vulkan`, on zgx-desktop, zgx-script or zgx-gpu), off by default, for a
 driver whose Direct3D 12 fails: with it, Vulkan stands in where Direct3D 12

@@ -1,11 +1,10 @@
 //! What Direct3D 11 (`ZGX_D3D11=1`, the `d3d11` feature) leaves out of a
 //! frame rather than fail it, and what still fails it
-//! (`GpuRenderer::d3d11_leave_out`): a drop shadow draws; a backdrop
-//! blur and a layer shader reading the backdrop (glass) draw their box
-//! opaque in its own colour, as the system's Reduce transparency draws
-//! glass; a content blur and a blend mode draw. Each
-//! kind left out is named once. `ZGX_D3D11` is read once a process, so this
-//! test is one of its own, setting it first.
+//! (`GpuRenderer::d3d11_leave_out`): a drop shadow, a backdrop blur (not
+//! its box opaque), a layer shader reading the backdrop, a content blur, a
+//! blend mode and a layer shader's passes all draw, and none of them is
+//! left out; a layer shader reading a picture is. `ZGX_D3D11` is read once a
+//! process, so this test is one of its own, setting it first.
 #[cfg(windows)]
 use zgx::scene::*;
 #[cfg(windows)]
@@ -86,20 +85,17 @@ fn at(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
     pixels[i..i + 4].try_into().unwrap()
 }
 
-/// Every pixel inside the box, clear of its corners, is its fill opaque.
+/// Whether every pixel inside the box, clear of its corners, is its fill
+/// opaque (as Direct3D 11 once drew a backdrop blur).
 #[cfg(windows)]
-fn opaque_box(pixels: &[u8], what: &str) {
-    for y in 90..150 {
-        for x in 70..170 {
+fn opaque_box(pixels: &[u8]) -> bool {
+    (90..150).all(|y| {
+        (70..170).all(|x| {
             let [r, g, b, a] = at(pixels, x, y);
             let near = |value: u8, want: u8| value.abs_diff(want) <= 1;
-            assert!(
-                near(r, FILL.0) && near(g, FILL.1) && near(b, FILL.2) && a == 255,
-                "{what}: ({x}, {y}) is {:?}, not the box's colour opaque",
-                [r, g, b, a]
-            );
-        }
-    }
+            near(r, FILL.0) && near(g, FILL.1) && near(b, FILL.2) && a == 255
+        })
+    })
 }
 
 #[cfg(windows)]
@@ -124,7 +120,8 @@ fn main() {
     let layered = draw(|scene, id| scene.set_isolated(id, true)).expect("a layer draws");
     assert!(shadowed != layered, "the drop shadow drew nothing");
 
-    // A backdrop blur: the box opaque in its own colour.
+    // A backdrop blur draws (d3d11_parity compares it with Direct3D 12's):
+    // translucent over the stripes it blurs, not the box opaque.
     let blurred = draw(|scene, id| {
         scene.set_effects(
             id,
@@ -135,11 +132,16 @@ fn main() {
         )
     })
     .expect("a frame with a backdrop blur draws");
-    opaque_box(&blurred, "a backdrop blur");
+    assert!(
+        !opaque_box(&blurred),
+        "the backdrop blur drew as the opaque box"
+    );
+    assert_ne!(blurred, plain, "the backdrop blur drew nothing");
     // Outside it, the stripes as they were.
     assert_eq!(at(&blurred, 20, 30), at(&plain, 20, 30));
 
-    // A layer shader reading the backdrop (glass): the same.
+    // A layer shader reading the backdrop (glass): drawn over a copy of it
+    // (d3d11_parity compares it with Direct3D 12's), so not the opaque box.
     let glass = zgx::decoration::FillShader::new(
         "fn layer(input: LayerInput) -> vec4<f32> {
     return mix(zgx_backdrop(input.p), input.color, 0.5);
@@ -148,7 +150,33 @@ fn main() {
     );
     let read = draw(|scene, id| scene.set_layer_shader(id, Some(glass)))
         .expect("a frame with a layer shader reading the backdrop draws");
-    opaque_box(&read, "a layer shader reading the backdrop");
+    assert_ne!(read, plain, "the glass drew nothing");
+    let opaque = (90..150).all(|y| {
+        (70..170).all(|x| {
+            let [r, g, b, a] = at(&read, x, y);
+            [r, g, b] == [FILL.0, FILL.1, FILL.2] && a == 255
+        })
+    });
+    assert!(!opaque, "the glass drew as the opaque box");
+    // Glass reading at an offset, its reach past the box (as zgx-fx's
+    // glass reads): a stripe away, so neither the box as painted (its layer
+    // without the shader, `layered`) nor the glass reading straight under it.
+    let offset = zgx::decoration::FillShader::new(
+        "fn layer(input: LayerInput) -> vec4<f32> {
+    return mix(zgx_backdrop(input.p + vec2(0., 10.)), input.color, 0.5);
+}",
+        None,
+    );
+    let shifted = draw(|scene, id| {
+        scene.set_layer_shader(id, Some(offset));
+        scene.set_layer_extent(id, 0., 12.);
+    })
+    .expect("a frame with glass reading at an offset draws");
+    assert_ne!(
+        shifted, layered,
+        "the offset glass drew as the box as painted"
+    );
+    assert_ne!(shifted, read, "the offset glass read straight under it");
 
     // A content blur and a blend mode draw (d3d11_parity compares them
     // with Direct3D 12's).
@@ -159,13 +187,129 @@ fn main() {
         .expect("a frame with a blend mode draws");
     assert_ne!(blended, plain, "the blend mode drew nothing");
 
-    let left_out = GpuRenderer::debug_d3d11_left_out();
-    for kind in [
-        "backdrop blurs (drawn opaque)",
-        "backdrop reads (glass drawn opaque)",
-    ] {
-        assert!(left_out.contains(&kind), "{kind} not named: {left_out:?}");
+    // A layer shader reading a pass: drawn through it (shader_passes runs
+    // under Direct3D 11 too), red where its layer is.
+    let with_pass = zgx::decoration::FillShader::with_inputs(
+        "fn layer(input: LayerInput) -> vec4<f32> {
+    return vec4(zgx_count(vec2(0.5)).r, 0.0, 0.0, 1.0);
+}",
+        None,
+        zgx::decoration::ShaderInputs {
+            passes: vec![zgx::decoration::ShaderPass {
+                name: "count".into(),
+                source: "fn run(input: PassInput) -> vec4<f32> { return vec4(1.0); }".into(),
+                size: zgx::decoration::PassSize::Pixels(4, 4),
+                format: zgx::decoration::PassFormat::Rgba16Float,
+                feedback: false,
+                steps: 1,
+                once: false,
+            }],
+            ..Default::default()
+        },
+    );
+    let passed = draw(|scene, id| scene.set_layer_shader(id, Some(with_pass)))
+        .expect("a frame with a layer shader reading a pass draws");
+    assert_eq!(
+        at(&passed, 120, 120),
+        [255, 0, 0, 255],
+        "its pass wasn't read"
+    );
+    // One reading a picture: drawn through it, the picture's colour.
+    let picture =
+        std::sync::Arc::new(zgx::image::ImageData::new(1, 1, vec![10, 200, 30, 255]).unwrap());
+    let with_picture = zgx::decoration::FillShader::with_inputs(
+        "fn layer(input: LayerInput) -> vec4<f32> {
+    return vec4(zgx_photo(vec2(0.5)).rgb, 1.0);
+}",
+        None,
+        zgx::decoration::ShaderInputs {
+            images: vec![("photo".into(), picture)],
+            ..Default::default()
+        },
+    );
+    let pictured = draw(|scene, id| scene.set_layer_shader(id, Some(with_picture)))
+        .expect("a frame with a layer shader reading a picture draws");
+    assert_eq!(
+        at(&pictured, 120, 120),
+        [10, 200, 30, 255],
+        "its picture wasn't read"
+    );
+
+    // A GPU view draws (`view_host`): its painter's colour, on the views'
+    // own Direct3D 12 device on Direct3D 11's adapter (on a machine without
+    // a GPU, WARP, which wgpu's own list of adapters leaves out).
+    {
+        use zgx::{compose::prelude::*, widgets::Ui};
+        use zgx_gpu::viewport::{Viewport, ViewportFrame, view};
+        struct Clear;
+        impl Viewport for Clear {
+            fn render(&mut self, frame: &mut ViewportFrame<'_>) {
+                frame
+                    .encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("clear"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: frame.target,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.2,
+                                    g: 0.8,
+                                    b: 0.4,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        ..Default::default()
+                    });
+            }
+        }
+        let mut gpu = GpuRenderer::new(64, 64).unwrap();
+        let painter = view(Clear);
+        let mut ui = Ui::new(64., 64.);
+        ui.mount(gpu_view("view", &painter).size(64., 64.));
+        ui.prepare_frame();
+        let report = ui.scene.borrow_mut().flush();
+        gpu.render(&ui.scene.borrow(), &report.damage)
+            .expect("a frame with a GPU view draws");
+        let pixels = gpu.readback().unwrap();
+        let middle = &pixels[(32 * 64 + 32) * 4..][..4];
+        assert!(
+            middle[1] > 180 && middle[0] < 90 && middle[2] < 140,
+            "the GPU view didn't draw its painter's colour: {middle:?}"
+        );
+
+        // A layer shader reading the view by name: drawn through it, the
+        // painter's colour (its frame painted after the passes, ahead of
+        // the frame sampling it).
+        let with_view = zgx::decoration::FillShader::with_inputs(
+            "fn layer(input: LayerInput) -> vec4<f32> {
+    return vec4(zgx_app(vec2(0.5)).rgb, 1.0);
+}",
+            None,
+            zgx::decoration::ShaderInputs {
+                views: vec![("app".into(), painter.id())],
+                ..Default::default()
+            },
+        );
+        let viewed = draw(|scene, id| scene.set_layer_shader(id, Some(with_view)))
+            .expect("a frame with a layer shader reading a GPU view draws");
+        let [r, g, b, a] = at(&viewed, 120, 120);
+        assert!(
+            g > 180 && r < 90 && b < 140 && a == 255,
+            "its GPU view wasn't read: {:?}",
+            [r, g, b, a]
+        );
     }
+
+    let left_out = GpuRenderer::debug_d3d11_left_out();
+    assert!(
+        !left_out.contains(&"images a GPU view draws"),
+        "a GPU view was left out: {left_out:?}"
+    );
+    assert!(left_out.is_empty(), "left out: {left_out:?}");
     println!("d3d11_left_out: {left_out:?}");
 }
 

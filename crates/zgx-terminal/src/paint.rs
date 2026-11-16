@@ -34,6 +34,10 @@ pub(crate) struct Look {
     pub selection_text: Option<Color>,
     /// Text under a block cursor; `None` is the background.
     pub cursor_text: Option<Color>,
+    /// Over a search's matches, and its selected one: translucent, the
+    /// text under them read through.
+    pub found: Color,
+    pub found_selected: Color,
 }
 impl Default for Look {
     fn default() -> Self {
@@ -42,6 +46,8 @@ impl Default for Look {
             selection: Color(0x4a, 0x78, 0xc0, 0x88),
             selection_text: None,
             cursor_text: None,
+            found: Color(0xf0, 0xc0, 0x30, 0x60),
+            found_selected: Color(0xff, 0x8c, 0x1a, 0x90),
         }
     }
 }
@@ -642,6 +648,31 @@ fn styled_underline<L>(
         height,
         color,
     });
+}
+
+/// A search's `highlights` (the rows in view's columns), drawn over the
+/// rows, translucent.
+pub(crate) fn draw_found(
+    highlights: &[crate::search::Highlight],
+    look: &Look,
+    metrics: Metrics,
+) -> Canvas {
+    let mut canvas = Canvas::new();
+    for highlight in highlights {
+        canvas.fill(
+            Path::rectangle(Rect {
+                x: highlight.first as f32 * metrics.cell_width,
+                y: highlight.row as f32 * metrics.cell_height,
+                width: (highlight.last + 1 - highlight.first) as f32 * metrics.cell_width,
+                height: metrics.cell_height,
+            }),
+            match highlight.selected {
+                true => look.found_selected,
+                false => look.found,
+            },
+        );
+    }
+    canvas
 }
 
 /// The grid's font: the platform's monospaced one, without ligatures.

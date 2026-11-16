@@ -8,7 +8,34 @@ use zgx::{
     input::{InputEvent, PointerButton},
     native_view::NativeContent,
 };
-use zgx_script::{ScriptHost, Value};
+use zgx_script::{Registry, ScriptHost, Value};
+
+#[test]
+fn the_registry_lists_what_the_host_offers_and_the_shared_keys_scripts_made() {
+    let h = Harness::new(|runtime| {
+        let host = ScriptHost::inline(
+            runtime,
+            "registry",
+            r#"ui.shared("zeta.made", 0)
+            return ui.text { "registry" }"#,
+        );
+        host.action("save", |_| {});
+        host.action("open", |_| {});
+        host.function("width", |_| Value::Num(1.));
+        host.async_action("fetch", |value| async move { Ok(value) });
+        host.shared("alpha.host", 0.);
+        host
+    });
+    assert_eq!(
+        h.host.registry(),
+        Registry {
+            actions: vec!["open".into(), "save".into()],
+            functions: vec!["width".into()],
+            async_actions: vec!["fetch".into()],
+            shared: vec!["alpha.host".into(), "zeta.made".into()],
+        }
+    );
+}
 
 #[test]
 fn commands_are_published_after_a_load_and_run_by_id() {
@@ -201,7 +228,7 @@ fn capture_keys_needs_no_key_handler_of_its_own() {
 #[test]
 fn a_failed_load_keeps_the_published_commands() {
     let runtime = zgx::reactive::Runtime::new();
-    let dir = std::env::temp_dir().join(format!("zgx-commands-{}", std::process::id()));
+    let dir = common::temp_dir("commands");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("app.luau");
     std::fs::write(

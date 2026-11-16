@@ -27,6 +27,10 @@ use std::{
     time::Instant,
 };
 
+/// The name a session's command is given as `TERM_PROGRAM`, and XTVERSION
+/// answers, unless the app gives its own.
+const PROGRAM: &str = "zgx";
+
 /// The screen model a session keeps.
 pub type Term = alacritty_terminal::Term<Listener>;
 
@@ -156,7 +160,13 @@ enum Msg {
     Shutdown,
 }
 
-type ColorRequest = (usize, Arc<dyn Fn(Rgb) -> String + Send + Sync>);
+/// An answer a program asked for: written as it is, or a colour (OSC 4,
+/// 10, 11, 12), formatted once the screen model, whose lock the parse holds,
+/// can say which.
+enum Answer {
+    Bytes(Vec<u8>),
+    Color(usize, Arc<dyn Fn(Rgb) -> String + Send + Sync>),
+}
 struct Shared {
     /// The app was woken and hasn't read since.
     pending: AtomicBool,
@@ -164,7 +174,9 @@ struct Shared {
     wake: Box<dyn Fn() + Send + Sync>,
     size: Mutex<GridSize>,
     palette: Mutex<crate::Palette>,
-    colors_asked: Mutex<Vec<ColorRequest>>,
+    /// What programs asked for since the last answer, in the order they
+    /// asked (`answer`).
+    answers: Mutex<Vec<Answer>>,
     /// The pictures programs sent (the kitty graphics protocol), by id.
     images: Images,
     /// Whether pictures can arrive: not through Windows' own pseudoconsole,
@@ -190,6 +202,37 @@ impl Shared {
             let _ = self.poller.notify();
         }
     }
+    fn asked(&self, answer: Answer) {
+        self.answers.lock().unwrap().push(answer);
+    }
+    /// Answer what the parse was asked, in the order it was asked, in one
+    /// write: a colour a program set, else the app's. Programs ask several
+    /// at once and read the answers in order (termenv asks for the
+    /// background, OSC 11, then the cursor, CSI 6n, and takes a cursor
+    /// report first as no colour; the colour's answer, after, reads as typed
+    /// keys).
+    fn answer(&self, term: &Term) {
+        let asked = std::mem::take(&mut *self.answers.lock().unwrap());
+        if asked.is_empty() {
+            return;
+        }
+        let mut palette = None;
+        let mut out = Vec::new();
+        for answer in asked {
+            match answer {
+                Answer::Bytes(bytes) => out.extend_from_slice(&bytes),
+                Answer::Color(index, format) => {
+                    let color = term.colors()[index].unwrap_or_else(|| {
+                        palette
+                            .get_or_insert_with(|| self.palette.lock().unwrap().clone())
+                            .color(index)
+                    });
+                    out.extend_from_slice(format(color).as_bytes());
+                }
+            }
+        }
+        self.send(Msg::Input(out.into()));
+    }
 }
 
 /// How the screen model reaches its session (programs' titles, bells,
@@ -208,13 +251,12 @@ impl EventListener for Listener {
             Event::ClipboardLoad(ClipboardType::Clipboard, format) => {
                 shared.push(SessionEvent::ClipboardLoad(ClipboardRequest(format)))
             }
-            Event::PtyWrite(text) => shared.send(Msg::Input(text.into_bytes().into())),
-            Event::ColorRequest(index, format) => {
-                shared.colors_asked.lock().unwrap().push((index, format))
-            }
+            // Answers, kept in order until the parse ends (`Shared::answer`).
+            Event::PtyWrite(text) => shared.asked(Answer::Bytes(text.into_bytes())),
+            Event::ColorRequest(index, format) => shared.asked(Answer::Color(index, format)),
             Event::TextAreaSizeRequest(format) => {
                 let size = *shared.size.lock().unwrap();
-                shared.send(Msg::Input(format(size.window_size()).into_bytes().into()));
+                shared.asked(Answer::Bytes(format(size.window_size()).into_bytes()));
             }
             Event::MouseCursorDirty | Event::CursorBlinkingChange | Event::Wakeup => shared.mark(),
             // The selection clipboard (X11's primary) is the app's to keep,
@@ -269,7 +311,7 @@ impl Session {
         let mut env: std::collections::HashMap<String, String> = [
             ("TERM", "xterm-256color"),
             ("COLORTERM", "truecolor"),
-            ("TERM_PROGRAM", "zgx"),
+            ("TERM_PROGRAM", PROGRAM),
             ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
         ]
         .into_iter()
@@ -304,7 +346,7 @@ impl Session {
             wake: Box::new(wake),
             size: Mutex::new(size),
             palette: Mutex::new(crate::Palette::default()),
-            colors_asked: Mutex::new(Vec::new()),
+            answers: Mutex::new(Vec::new()),
             images: Images::default(),
             pictures,
             tx,
@@ -365,7 +407,7 @@ impl Session {
             wake: Box::new(wake),
             size: Mutex::new(size),
             palette: Mutex::new(crate::Palette::default()),
-            colors_asked: Mutex::new(Vec::new()),
+            answers: Mutex::new(Vec::new()),
             images: Images::default(),
             pictures,
             tx,
@@ -400,7 +442,10 @@ impl Session {
             return;
         };
         let mut parse = parse.lock().unwrap();
-        parse.feed(&self.shared, &mut self.term.lock(), bytes);
+        let mut term = self.term.lock();
+        parse.feed(&self.shared, &mut term, bytes);
+        self.shared.answer(&term);
+        drop(term);
         if parse.parser.sync_bytes_count() < bytes.len() {
             self.shared.mark();
         }
@@ -541,8 +586,16 @@ struct Io {
     exited: Arc<Mutex<Option<i32>>>,
 }
 /// The screen model's configuration: device attributes announce sixel
-/// only where pictures can arrive.
+/// only where pictures can arrive, and XTVERSION answers with the program
+/// name and version the session's command is given (`TERM_PROGRAM` and
+/// `TERM_PROGRAM_VERSION`, the app's own if it sets them).
 fn config(options: &SessionOptions, pictures: bool) -> Config {
+    let given = |key: &str, default: &'static str| {
+        let set = options.env.iter().rev().find(|(name, _)| name == key);
+        set.map_or(default, |(_, value)| value.as_str())
+    };
+    let program = given("TERM_PROGRAM", PROGRAM);
+    let version = given("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     Config {
         scrolling_history: options.scrollback,
         // Programs may set the clipboard, and ask to read it: the app asks
@@ -552,6 +605,7 @@ fn config(options: &SessionOptions, pictures: bool) -> Config {
         // view encodes keys as it asks.
         kitty_keyboard: true,
         sixel: pictures,
+        version: format!("{program}({version})"),
         ..Config::default()
     }
 }
@@ -604,7 +658,7 @@ impl Parse {
                     let size = *shared.size.lock().unwrap();
                     let cell = (size.cell_width, size.cell_height);
                     if let Some(answer) = graphics.command(&command, term, cell, &shared.images) {
-                        shared.send(Msg::Input(answer.into()));
+                        shared.asked(Answer::Bytes(answer));
                     }
                     return;
                 }
@@ -748,6 +802,7 @@ impl Io {
         let _lease = self.term.lease();
         let mut term = None;
         let mut processed = 0;
+        let mut failed = None;
         loop {
             let read = match self.pty.reader().read(buffer) {
                 Ok(0) => break,
@@ -757,7 +812,11 @@ impl Io {
                 {
                     break;
                 }
-                Err(error) => return Err(error),
+                // (What was read before it is still answered.)
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
             };
             let bytes = &buffer[..read];
             let term = term.get_or_insert_with(|| self.term.lock_unfair());
@@ -768,32 +827,17 @@ impl Io {
             }
         }
         if let Some(term) = &term {
-            self.answer_colors(term);
+            self.shared.answer(term);
         }
         drop(term);
+        if let Some(error) = failed {
+            return Err(error);
+        }
         // Unless all of it waits in a synchronized update.
         if processed > 0 && parse.parser.sync_bytes_count() < processed {
             self.shared.mark();
         }
         Ok(())
-    }
-
-    /// Answer programs' colour queries (OSC 4, 10, 11, 12): a colour they
-    /// set, else the app's.
-    fn answer_colors(&self, term: &Term) {
-        let asked = std::mem::take(&mut *self.shared.colors_asked.lock().unwrap());
-        if asked.is_empty() {
-            return;
-        }
-        let palette = self.shared.palette.lock().unwrap().clone();
-        for (index, format) in asked {
-            let color = term.colors()[index].unwrap_or_else(|| palette.color(index));
-            let _ = self
-                .shared
-                .tx
-                .send(Msg::Input(format(color).into_bytes().into()));
-        }
-        let _ = self.poller.notify();
     }
 
     fn write(
@@ -837,6 +881,14 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         status.code().unwrap_or(-1)
     }
 }
+
+#[cfg(test)]
+#[path = "conformance_tests.rs"]
+mod conformance_tests;
+
+#[cfg(test)]
+#[path = "real_programs_tests.rs"]
+mod real_programs_tests;
 
 #[cfg(test)]
 mod tests {
@@ -939,9 +991,47 @@ mod tests {
         let (written, session) = answers(true, &ask);
         assert_eq!(
             written,
-            ["\x1b[?62;4;22c", "\x1b_Gi=1;OK\x1b\\", "\x1b_Gi=2;OK\x1b\\"]
+            ["\x1b[?62;4;22c\x1b_Gi=1;OK\x1b\\\x1b_Gi=2;OK\x1b\\"]
         );
         assert!(session.shows_pictures());
         assert_eq!(session.term().placements().len(), 2);
+    }
+
+    /// Answers go back in the order they were asked, in one write: a colour
+    /// (OSC 4, 10, 11) among the rest, with the terminator its query had
+    /// (BEL or ST). A cursor report ahead of the colour asked before it
+    /// reads to termenv as "no colour", and the colour, after, as keys.
+    #[test]
+    fn answers_go_back_in_the_order_asked() {
+        let (written, _) = answers(true, b"\x1b]11;?\x1b\\\x1b[6n");
+        assert_eq!(written.len(), 1, "one write: {written:?}");
+        let both = &written[0];
+        assert!(
+            both.starts_with("\x1b]11;rgb:"),
+            "the colour first: {both:?}"
+        );
+        assert!(
+            both.ends_with("\x1b\\\x1b[1;1R"),
+            "ST, then the cursor: {both:?}"
+        );
+
+        let (written, _) = answers(
+            true,
+            b"\x1b]10;?\x07\x1b[c\x1b]4;1;?\x07\x1b]11;?\x07\x1b[6n",
+        );
+        assert_eq!(written.len(), 1, "one write: {written:?}");
+        let all = &written[0];
+        let at = |what: &str| {
+            all.find(what)
+                .unwrap_or_else(|| panic!("{what:?} in {all:?}"))
+        };
+        assert!(
+            at("\x1b]10;rgb:") < at("\x1b[?62;4;22c")
+                && at("\x1b[?62;4;22c") < at("\x1b]4;1;rgb:")
+                && at("\x1b]4;1;rgb:") < at("\x1b]11;rgb:")
+                && at("\x1b]11;rgb:") < at("\x1b[1;1R"),
+            "in the order asked: {all:?}"
+        );
+        assert_eq!(all.matches('\x07').count(), 3, "BEL for BEL: {all:?}");
     }
 }

@@ -565,6 +565,127 @@ impl Rect {
 /// A colour: red, green, blue and alpha, each 0 to 255.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color(pub u8, pub u8, pub u8, pub u8);
+/// What `Scene::world_bounds_kept` keeps of a node's sum of translations:
+/// its nearest scroll content strictly above it (`anchor`), the sum from the
+/// node up to just below that (`below`), and what it holds while: the
+/// node's own translation (`own`) and the scene's count of other moves
+/// (`translated`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScrollAnchor {
+    anchor: Option<NodeId>,
+    below: Transform,
+    own: Transform,
+    translated: u64,
+}
+/// What `Scene::shows_within_kept` keeps of an observed node: its nearest
+/// scroll content strictly above it (`anchor`), what of its box (grown by
+/// its margin) shows inside its clips up to and including that content,
+/// relative to where the content was (`inner`), and what it holds while.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShownAnchor {
+    anchor: NodeId,
+    inner: Shown,
+    own: Transform,
+    margin: u32,
+    translated: u64,
+    layout: u64,
+}
+/// What of a node shows inside the clips that move with it.
+#[derive(Clone, Copy, Debug)]
+enum Shown {
+    /// This part, relative to its scroll content.
+    Within(Rect),
+    /// None, however it scrolls: clipped away, transparent or hidden.
+    Never,
+    /// Too near an edge to say without the full walk.
+    Near,
+}
+/// What `Scene::shows_within_kept` works out once a pass for each scroll
+/// content: its offset and the clip above it.
+#[derive(Default)]
+pub(crate) struct ShownPass {
+    /// The first few scroll contents met: a window has one or two. Past
+    /// them, each is worked out for each node (nothing allocated, either).
+    met: [Option<(NodeId, Transform, Rect)>; SHOWN_PASS_KEEPS],
+}
+const SHOWN_PASS_KEEPS: usize = 4;
+impl ShownPass {
+    fn of(
+        &mut self,
+        anchor: NodeId,
+        work: impl FnOnce() -> (Transform, Rect),
+    ) -> (Transform, Rect) {
+        if let Some(&(_, offset, clip)) = self.met.iter().flatten().find(|(at, ..)| *at == anchor) {
+            return (offset, clip);
+        }
+        let (offset, clip) = work();
+        if let Some(free) = self.met.iter_mut().find(|met| met.is_none()) {
+            *free = Some((anchor, offset, clip));
+        }
+        (offset, clip)
+    }
+}
+/// How far from an edge, relative to the coordinates' size, a box must be
+/// for a range check to answer for the full walk: past the rounding of
+/// either's sums (a few dozen roundings of 2^-24 each, ~6e-8 of the size).
+const SHOWN_SLACK: f32 = 1e-4;
+/// A product of opacities below which what is kept of a node takes the
+/// full walk every time (`Shown::Near`): one so faint no pixel shows it
+/// (an 8-bit channel stops at 1/255), whose product could underflow to
+/// zero, as `world` multiplies them, without any of them reaching zero.
+/// Fades short of zero drop nothing kept, so the one case a kept answer can
+/// differ from the walk's is a product at least this, kept, later brought
+/// to exactly zero by opacities changed short of zero alone: some 2^-125
+/// of it, invisible long before.
+const FAINT: f32 = 1. / (1u32 << 24) as f32;
+/// Whether two boxes overlap, clearly apart, or too near to say.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Overlap {
+    Over,
+    Apart,
+    Near,
+}
+/// Where two boxes meet, kept even where they don't (a width or height of
+/// zero or less), for `overlap` to judge.
+fn meet(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    Rect::new(
+        x,
+        y,
+        (a.x + a.width).min(b.x + b.width) - x,
+        (a.y + a.height).min(b.y + b.height) - y,
+    )
+}
+fn overlap(a: Rect, b: Rect) -> Overlap {
+    let w = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
+    let h = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+    let size = [
+        a.x,
+        a.y,
+        a.x + a.width,
+        a.y + a.height,
+        b.x,
+        b.y,
+        b.x + b.width,
+        b.y + b.height,
+    ]
+    .into_iter()
+    .fold(1f32, |size, v| size.max(v.abs()));
+    let slack = SHOWN_SLACK * size;
+    if w > slack && h > slack {
+        Overlap::Over
+    } else if w < -slack || h < -slack {
+        Overlap::Apart
+    } else {
+        Overlap::Near
+    }
+}
+/// Whether two translations are the same to the bit (a zero's sign too:
+/// `-0. + -0.` is `-0.`, `0. + -0.` is `0.`).
+fn same_bits(a: Transform, b: Transform) -> bool {
+    a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits()
+}
 /// A translation, in logical points.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Transform {
@@ -2029,6 +2150,9 @@ struct Local {
 /// What few scenes have, by node; each entry goes with its node.
 #[derive(Default)]
 struct ColdMaps {
+    /// Absolute nodes moved by an inset alone since the last layout
+    /// (`move_by_insets`), arranged at the next (`lay_out_moved`).
+    moved: Vec<NodeId>,
     /// Track lists of grids that have them (`set_grid_template`): none kept
     /// for a list no node has any more.
     grid_templates: NodeMap<Arc<crate::grid_tracks::GridTemplate>>,
@@ -3067,7 +3191,7 @@ pub struct BakedLoop {
     pub frames: Vec<(f32, f32)>,
     pub fps: f32,
     /// When its first frame showed.
-    pub started: std::time::Instant,
+    pub started: crate::time::Instant,
     /// The renderer can't play it (`refuse`).
     refused: std::cell::Cell<bool>,
     wake: Box<dyn Fn()>,
@@ -3079,7 +3203,7 @@ impl BakedLoop {
         Self {
             frames,
             fps,
-            started: std::time::Instant::now(),
+            started: crate::time::Instant::now(),
             refused: std::cell::Cell::new(false),
             wake,
         }
@@ -3192,6 +3316,19 @@ impl PaintItem<'_> {
 }
 type FontMeasurer =
     dyn Fn(&std::sync::Arc<str>, f32, Option<f32>, &crate::text_layout::FontStyle) -> (f32, f32);
+/// Text services installed on a scene that has none of its host's
+/// (`Scene::set_default_text_services`): false, installing nothing, once
+/// they are gone.
+pub type DefaultTextServices = dyn Fn(&mut Scene) -> bool;
+thread_local! {
+    /// This thread's (`Scene::set_default_text_services`).
+    static DEFAULT_TEXT_SERVICES: std::cell::RefCell<Option<std::rc::Rc<DefaultTextServices>>> =
+        const { std::cell::RefCell::new(None) };
+    /// How many times they were set: a scene with none of its own looks at
+    /// them only when this moved (`Scene::text_epoch`), so one that never
+    /// gets any (headless) costs a load and a compare a layout.
+    static DEFAULT_TEXT_EPOCH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 /// A plain text's size, and the width up to which its lines break as they
 /// do at the limit given (`Scene::set_font_text_reach_measurer`).
 type FontReach = dyn Fn(
@@ -3232,6 +3369,11 @@ pub struct Scene {
     /// row no longer holding one, or its slot reused) costs one layout from
     /// that row, which clears it.
     shrank: Vec<u64>,
+    /// Whether rows and columns shrank their children (`layout_shrinks`),
+    /// by slot: the generation of the node, the pass of the layout found so
+    /// (none: 0) and what was found. Asked again of their children as each
+    /// is laid out alone, frame after frame, while that layout stands.
+    shrinks_of: Vec<(u32, u64, bool)>,
     slots: Vec<Slot>,
     free: Vec<u32>,
     /// Slots of nodes removed and not yet freed (`kill`).
@@ -3315,6 +3457,15 @@ pub struct Scene {
     rich_measurer: crate::rich_text::TextMeasure,
     rich_shaper: Option<std::rc::Rc<crate::rich_text::RichShaper>>,
     text_shaper_revision: u32,
+    /// The thread's default text services as it last looked at them
+    /// (`DEFAULT_TEXT_EPOCH`), with none of its own: looked at again once
+    /// they are set again (`settle_text_services`).
+    text_epoch: u32,
+    /// The default text services it took (`set_default_text_services`),
+    /// none once its host installs its own; and whether a renderer has drawn
+    /// it (`drawn_with_other_text_services`).
+    text_default: Option<std::rc::Rc<DefaultTextServices>>,
+    text_drawn: std::cell::Cell<bool>,
     pending_layout_nodes: usize,
     layout_revision: u64,
     layout_pass: u64,
@@ -3377,7 +3528,17 @@ pub struct Scene {
     /// layout moves them (`changed_geometry_readers`).
     geometry_reader: std::cell::Cell<Option<u64>>,
     geometry_reads: std::cell::RefCell<Vec<(u64, NodeId, Rect)>>,
+    /// Changes to geometry other than those `unmoved` counts: every
+    /// translation but a scroll's and a leaf's, clips, nodes shown or
+    /// hidden, which nodes are scroll content (`translated`). With
+    /// `unmoved`, all of them (`geometry_revision()`).
     geometry_revision: u64,
+    /// Changes to geometry that move no node under scroll content against
+    /// it, counted here instead: a scroll (`scroll_copy`'s move), a leaf's
+    /// move (which moves only itself) and layout (which moves boxes, read
+    /// as they are). Each site counts one change, as before, in one field
+    /// or the other.
+    unmoved: u64,
     /// The last moved node's parent and its context (`shown_context`: its
     /// translation and clip, or hidden): a reorder animation moves every row
     /// of one parent each frame, and moving a child leaves its parent's
@@ -3391,6 +3552,14 @@ pub struct Scene {
     /// Tests: work every move's context out again (`move_context` unused).
     #[cfg(test)]
     pub(crate) no_move_context: bool,
+    /// Tests: a moved leaf damaged by the two subtree walks, as every move
+    /// was (`move_damaged`), to compare the two.
+    #[cfg(test)]
+    pub(crate) leaf_moves_off: bool,
+    /// Tests: moved leaves damaged together, and of those to the grid's
+    /// cells (`damage_moved_leaf`).
+    #[cfg(test)]
+    pub(crate) leaf_moves: [u64; 2],
     #[cfg(test)]
     pub(crate) move_context_kept: u64,
     /// Tests: damage subtrees by the walks as they were before they took
@@ -3483,6 +3652,12 @@ pub struct Scene {
     selectable: select::Selectable,
     /// Canvas views and grid fills (`scene_view`).
     views: view::Views,
+    /// The nodes whose resources a renderer keeps may have changed
+    /// (`resource_changes`), made as one first reads them; noted while one
+    /// does (`recording`): a scene none reads notes none. Last: the fields
+    /// before keep the places they had, which the hot paths address.
+    changes: std::cell::OnceCell<Box<ResourceChanges>>,
+    recording: std::cell::Cell<bool>,
 }
 /// A visual line of text, for assistive technology (`Scene::text_lines`).
 #[derive(Clone, Debug, PartialEq)]
@@ -3526,6 +3701,7 @@ impl Scene {
         Self {
             pending_children: std::cell::Cell::new(u32::MAX),
             shrank: Default::default(),
+            shrinks_of: Vec::new(),
             identity: NEXT_SCENE_ID
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("scene identity exhausted"),
@@ -3611,6 +3787,8 @@ impl Scene {
             moves: Vec::new(),
             flush_serial: 0,
             repaints: Vec::new(),
+            changes: std::cell::OnceCell::new(),
+            recording: std::cell::Cell::new(false),
             repaints_from: 1,
             repaint_flushes: 0,
             repaints_read: std::cell::Cell::new(false),
@@ -3630,6 +3808,9 @@ impl Scene {
             rich_measurer: Default::default(),
             rich_shaper: None,
             text_shaper_revision: 0,
+            text_epoch: 0,
+            text_default: None,
+            text_drawn: std::cell::Cell::new(false),
             pending_layout_nodes: 0,
             layout_revision: 0,
             layout_pass: 0,
@@ -3656,9 +3837,14 @@ impl Scene {
             geometry_reader: Default::default(),
             geometry_reads: Default::default(),
             geometry_revision: 0,
+            unmoved: 0,
             move_context: None,
             #[cfg(test)]
             no_move_context: false,
+            #[cfg(test)]
+            leaf_moves_off: false,
+            #[cfg(test)]
+            leaf_moves: [0; 2],
             #[cfg(test)]
             move_context_kept: 0,
             #[cfg(test)]
@@ -4000,6 +4186,7 @@ impl Scene {
             + vec_bytes(&self.repaints)
             + vec_bytes(&self.inert)
             + vec_bytes(&self.shrank)
+            + vec_bytes(&self.shrinks_of)
             + map_bytes(&self.contents_styles)
             + map_bytes(&self.given_styles)
             + map_bytes(&self.directions)
@@ -4083,6 +4270,270 @@ impl Scene {
             parent = ancestor.parent;
         }
         node.bounds.translated(transform)
+    }
+    /// Changes to geometry that drop every kept sum: all but a scroll, a
+    /// leaf's move and layout (`unmoved`). While it holds, a node's
+    /// ancestors' translations up to its nearest scroll content hold.
+    #[inline(always)]
+    pub(crate) fn translated(&self) -> u64 {
+        self.geometry_revision
+    }
+    /// `world_bounds(id)`, to the bit, keeping in `kept` what of its sum
+    /// holds while only scroll content moves: the translations from `id` up
+    /// to just below its nearest scroll content (`ScrollAnchor`). A scroll
+    /// then walks only from there up, not through the rows and boxes a
+    /// transcript nests below it. Any translation set but scroll content's
+    /// on a node with children, or a node made scroll content or not, drops
+    /// what every node kept (`translated`); `id`'s own is checked each time.
+    /// A node's ancestors stay its ancestors as long as it lives (a move
+    /// mounts it again), and layout's boxes are read as they are now.
+    pub(crate) fn world_bounds_kept(&self, id: NodeId, kept: &mut Option<ScrollAnchor>) -> Rect {
+        let node = self.node(id);
+        let own = node.transform;
+        let anchor = match kept {
+            Some(anchor)
+                if anchor.translated == self.translated() && same_bits(anchor.own, own) =>
+            {
+                *anchor
+            }
+            _ => *kept.insert(self.scroll_anchor(id)),
+        };
+        // The same additions as `world_bounds`, in the same order: the sum
+        // below the anchor, then the anchor's and each of its ancestors'.
+        let mut transform = anchor.below;
+        let mut at = anchor.anchor;
+        while let Some(id) = at {
+            let ancestor = self.tree_node(id);
+            transform.x += ancestor.transform.x;
+            transform.y += ancestor.transform.y;
+            at = ancestor.parent;
+        }
+        node.bounds.translated(transform)
+    }
+    /// `id`'s nearest scroll content strictly above it, and its translations
+    /// summed from it upwards to just below that (`world_bounds`'s sum, cut
+    /// there; no anchor and the whole sum where none is).
+    fn scroll_anchor(&self, id: NodeId) -> ScrollAnchor {
+        let node = self.node(id);
+        let mut below = node.transform;
+        let mut parent = node.parent;
+        while let Some(at) = parent {
+            let ancestor = self.tree_node(at);
+            if ancestor.scroll_copy {
+                break;
+            }
+            below.x += ancestor.transform.x;
+            below.y += ancestor.transform.y;
+            parent = ancestor.parent;
+        }
+        ScrollAnchor {
+            anchor: parent,
+            below,
+            own: node.transform,
+            translated: self.translated(),
+        }
+    }
+    /// Whether any of `id` shows, grown by `margin` on every side
+    /// (`shows_within`) or not grown (`None`: `visible_bounds`), as those
+    /// answer, keeping in `kept` what of it holds while only scroll content
+    /// moves: the node's box inside its clips from it up to and including
+    /// its nearest scroll content, all of which move with that content. A
+    /// scroll then checks that box, moved with the content, against the
+    /// clip above it (`ShownPass`, once a pass for each scroll content): a
+    /// range check, not a walk. Where the box comes within `SHOWN_SLACK` of
+    /// an edge, the sums' order could decide it, and the full walk does.
+    /// Popups, transformed layers and nodes under no scroll content take
+    /// the full walk every time. What was kept is dropped by any change to
+    /// geometry but a scroll, a leaf's move or layout (`translated`: other
+    /// translations, clips, nodes hidden or shown, opacities), by layout
+    /// (`layout_revision`), a margin changed, or the node's own move.
+    pub(crate) fn shows_within_kept(
+        &self,
+        id: NodeId,
+        margin: Option<f32>,
+        kept: &mut Option<ShownAnchor>,
+        pass: &mut ShownPass,
+    ) -> bool {
+        let walked = |scene: &Self| match margin {
+            Some(margin) => scene.shows_within(id, margin),
+            None => scene.visible_bounds(id).is_some(),
+        };
+        if !self.popups.is_empty() || self.transformed > 0 {
+            *kept = None;
+            return walked(self);
+        }
+        let own = self.node(id).transform;
+        let margin_bits = margin.map_or(u32::MAX, f32::to_bits);
+        let holds = kept.as_ref().is_some_and(|k| {
+            k.translated == self.translated()
+                && k.layout == self.layout_revision
+                && k.margin == margin_bits
+                && same_bits(k.own, own)
+        });
+        if !holds {
+            match self.shown_anchor(id, margin.unwrap_or(0.), margin_bits) {
+                Ok(anchor) => *kept = Some(anchor),
+                Err(overlap) => {
+                    *kept = None;
+                    return match overlap {
+                        Overlap::Over => true,
+                        Overlap::Apart => false,
+                        Overlap::Near => walked(self),
+                    };
+                }
+            }
+        }
+        let Some(k) = kept.as_ref() else {
+            return walked(self);
+        };
+        let inner = match k.inner {
+            Shown::Never => return false,
+            Shown::Near => return walked(self),
+            Shown::Within(inner) => inner,
+        };
+        let (offset, outer) = pass.of(k.anchor, || {
+            let outer = self
+                .node(k.anchor)
+                .parent
+                .and_then(|parent| self.world_clip(parent))
+                .unwrap_or(self.viewport);
+            (self.offset_of(k.anchor), outer)
+        });
+        let shown = inner.translated(offset);
+        match overlap(shown, outer) {
+            Overlap::Over => true,
+            Overlap::Apart => false,
+            Overlap::Near => walked(self),
+        }
+    }
+    /// `id`'s translation and its ancestors', summed from it upwards.
+    fn offset_of(&self, id: NodeId) -> Transform {
+        let mut offset = Transform::default();
+        let mut at = Some(id);
+        while let Some(id) = at {
+            let node = self.tree_node(id);
+            offset.x += node.transform.x;
+            offset.y += node.transform.y;
+            at = node.parent;
+        }
+        offset
+    }
+    /// What `shows_within_kept` keeps of `id`: `None` under no scroll
+    /// content. One walk to the root and nothing allocated: every observed
+    /// node comes here on a frame that drops what was kept (anything moving
+    /// but a scroll). Boxes and clips are placed relative to `id`'s offset
+    /// (each ancestor's less the translations below it), then to its
+    /// scroll content's; its opacity is `world`'s product, in its order.
+    #[cold]
+    #[inline(never)]
+    fn shown_anchor(
+        &self,
+        id: NodeId,
+        margin: f32,
+        margin_bits: u32,
+    ) -> Result<ShownAnchor, Overlap> {
+        let node = self.node(id);
+        let mut opacity = match own_visible(&node.style) {
+            true => node.effects.opacity,
+            false => 0.,
+        };
+        // A node hidden or at an opacity of zero, its own or above: changing
+        // it shows or hides something, which drops what is kept
+        // (`translated`). The product alone could reach zero with none of
+        // them at zero (`FAINT`).
+        let mut nil = opacity <= 0.;
+        // What clips `id` from it up to its scroll content, where `id`'s
+        // offset is the origin, and the translations from `id` up to just
+        // below the one being looked at.
+        let clip_in =
+            |clip: Option<Rect>, node: &Node, below: Transform| match clip_axes(&node.style)
+                != (false, false)
+            {
+                true => clipped_bounds(
+                    clip,
+                    node.bounds.translated(Transform {
+                        x: -below.x,
+                        y: -below.y,
+                    }),
+                    &node.style,
+                ),
+                false => clip,
+            };
+        let mut clip = clip_in(None, node, Transform::default());
+        let mut below = node.transform;
+        let mut parent = node.parent;
+        let anchor = loop {
+            let Some(at) = parent else {
+                // Under no scroll content: the walk above, done, answers
+                // (against the viewport, placed as the clips are), the
+                // full walk only near an edge. Nothing is kept.
+                if nil {
+                    return Err(Overlap::Apart);
+                }
+                if opacity < FAINT {
+                    return Err(Overlap::Near);
+                }
+                let viewport = self.viewport.translated(Transform {
+                    x: -below.x,
+                    y: -below.y,
+                });
+                let shown = match clip {
+                    Some(clip) => meet(clip, viewport),
+                    None => viewport,
+                };
+                return Err(overlap(node.bounds.expand(margin), shown));
+            };
+            let ancestor = self.tree_node(at);
+            let own = match own_visible(&ancestor.style) {
+                true => ancestor.effects.opacity,
+                false => 0.,
+            };
+            nil |= own <= 0.;
+            opacity *= own;
+            clip = clip_in(clip, ancestor, below);
+            if ancestor.scroll_copy {
+                break at;
+            }
+            below.x += ancestor.transform.x;
+            below.y += ancestor.transform.y;
+            parent = ancestor.parent;
+        };
+        // Hidden by an opacity or a style above too: hidden however it
+        // scrolls, until one of those changes (`translated`).
+        let mut parent = self.tree_node(anchor).parent;
+        while let Some(at) = parent {
+            let ancestor = self.tree_node(at);
+            let own = match own_visible(&ancestor.style) {
+                true => ancestor.effects.opacity,
+                false => 0.,
+            };
+            nil |= own <= 0.;
+            opacity *= own;
+            parent = ancestor.parent;
+        }
+        let boxed = node.bounds.expand(margin);
+        let inner = match (nil, opacity < FAINT) {
+            (true, _) => Shown::Never,
+            (false, true) => Shown::Near,
+            (false, false) => match clip {
+                None => Shown::Within(boxed.translated(below)),
+                Some(clip) => match overlap(boxed, clip) {
+                    Overlap::Over => {
+                        Shown::Within(boxed.intersection(clip).unwrap_or(boxed).translated(below))
+                    }
+                    Overlap::Apart => Shown::Never,
+                    Overlap::Near => Shown::Near,
+                },
+            },
+        };
+        Ok(ShownAnchor {
+            anchor,
+            inner,
+            own: node.transform,
+            margin: margin_bits,
+            translated: self.translated(),
+            layout: self.layout_revision,
+        })
     }
     /// Where layout put `id`, in window coordinates, before any translation
     /// (its own or its ancestors', scrolling included): what moves only when
@@ -4367,13 +4818,30 @@ impl Scene {
                 .iter()
                 .any(|child| crate::deep(0, || self.paints(*child)))
     }
+    /// Whether `id`, its box at `bounds` (its `world_bounds`), is wholly
+    /// above or below scroll view `view` around it, which clips it
+    /// vertically: then nothing of it shows (`visible_bounds` is `None`, or
+    /// no taller than nothing), told without working out its clips, and the
+    /// read noted as `visible_bounds` notes it. False where it may show, or
+    /// a transform or popup could place it elsewhere.
+    pub(crate) fn misses_view(&self, id: NodeId, bounds: Rect, view: NodeId) -> bool {
+        if self.transformed > 0 || !self.popups.is_empty() || !self.clips(view).1 {
+            return false;
+        }
+        let shown = self.world_bounds(view);
+        let misses = bounds.y >= shown.y + shown.height || bounds.y + bounds.height <= shown.y;
+        if misses {
+            self.note_geometry_read(id);
+        }
+        misses
+    }
     /// The part of `id`'s box that shows: inside its clips and not fully
     /// transparent; `None` when nothing does. Under a popup root
     /// (`set_popup`) that is where its own window shows it, past this
     /// one's viewport and its ancestors' clips.
     pub fn visible_bounds(&self, id: NodeId) -> Option<Rect> {
         self.note_geometry_read(id);
-        let (bounds, effects, clip) = self.world(id);
+        let (bounds, effects, clip) = self.world_once(id);
         if effects.opacity <= 0. {
             return None;
         }
@@ -4404,7 +4872,7 @@ impl Scene {
     #[inline(never)]
     pub fn shows_within(&self, id: NodeId, margin: f32) -> bool {
         self.note_geometry_read(id);
-        let (bounds, effects, clip) = self.world(id);
+        let (bounds, effects, clip) = self.world_once(id);
         if effects.opacity <= 0. {
             return false;
         }
@@ -4745,6 +5213,11 @@ impl Scene {
             self.promoted_count += 1;
         }
         self.invalidate(id, COMPOSITE);
+    }
+    /// Whether any node composites through a layer shader: a renderer that
+    /// draws none (the software raster) hands such a window to the GPU's.
+    pub fn has_layer_shaders(&self) -> bool {
+        !self.layer_shaders.is_empty()
     }
     /// `id`'s layer shader and its uniforms, if either is set.
     pub fn layer_shader(&self, id: NodeId) -> Option<&LayerShader> {
@@ -5433,7 +5906,7 @@ impl Scene {
     /// Counts changes that affect what is under the pointer (geometry,
     /// cursors): unchanged, a host needn't hit test again.
     pub fn interaction_revision(&self) -> u64 {
-        self.geometry_revision
+        self.geometry_revision()
     }
     /// The cursor at `x`, `y`: a selectable text's, or the topmost node's.
     pub fn cursor_at(&self, x: f32, y: f32) -> Option<crate::cursor::Cursor> {
@@ -5941,7 +6414,7 @@ impl Scene {
         let key = (
             x.to_bits(),
             y.to_bits(),
-            self.geometry_revision,
+            self.geometry_revision(),
             self.content_revision,
         );
         // Asked again inside `f` (no caller does now): walked, not kept.
@@ -6664,6 +7137,14 @@ impl Scene {
         from: usize,
         children: &[NodeId],
     ) -> bool {
+        // Turned round by one (a terminal's rows as it scrolls a line): apart,
+        // so that every other order goes as it did, two compares more.
+        if let Some(by) = rotated_by(
+            &self.children_raw(self.tree_node(parent))[from..],
+            &children[from..],
+        ) {
+            return self.reorder_turned(parent, from, children, by);
+        }
         // A column that keeps its first children's places keeps none now.
         if self.tree_node(parent).special == Special::Kept {
             self.forget_column_end(parent);
@@ -6702,6 +7183,56 @@ impl Scene {
         self.invalidate_layout(parent);
         // Children removed or moved: its kept ink union goes unless only
         // its tail changed (`KeptInk`).
+        if self.kept_any.get() {
+            self.children_moved(parent);
+        }
+        self.children_changed(parent);
+        // In another order, another may be hit on top.
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        true
+    }
+    /// `reorder_changed_children` for children turned round by one
+    /// (`rotated_by`): the one that went round moves past the others, which
+    /// stay. If it is absolute (a terminal's row taking another line), the
+    /// parent's layout stands: those in the flow keep their order, and an
+    /// absolute child's place is its own, wherever it is among its siblings
+    /// (the parent's next layout takes the new order). Not under a layer,
+    /// whose contents a layout's walk marks.
+    #[cold]
+    #[inline(never)]
+    fn reorder_turned(
+        &mut self,
+        parent: NodeId,
+        from: usize,
+        children: &[NodeId],
+        by: usize,
+    ) -> bool {
+        // A column that keeps its first children's places keeps none now.
+        if self.tree_node(parent).special == Special::Kept {
+            self.forget_column_end(parent);
+        }
+        let children = &children[from..];
+        let count = children.len();
+        // The longer run stays, as the longest increasing run would.
+        let tail_stays = count - by >= by;
+        let mut flow_kept = true;
+        for (at, child) in children.iter().enumerate() {
+            if (at >= count - by) == tail_stays {
+                flow_kept = flow_kept && self.tree_node(*child).style.absolute;
+                self.damage_subtree(*child);
+            }
+        }
+        self.node_mut(parent).children.get_mut()[from..].copy_from_slice(children);
+        let held = self.tree_node(parent);
+        let stands = flow_kept
+            && held.measurement.is_some()
+            && !held.special.any()
+            && self.isolation_count + self.promoted_count == 0;
+        if !stands {
+            self.invalidate_layout(parent);
+        }
+        // Children moved: its kept ink union goes unless only its tail
+        // changed (`KeptInk`).
         if self.kept_any.get() {
             self.children_moved(parent);
         }
@@ -6863,6 +7394,63 @@ impl Scene {
             |shaper| shaper(rich, width),
         )
     }
+    /// Make `install` the text services of every scene on this thread whose
+    /// host installed none (no font measurer), at its next layout: a
+    /// renderer's, which `zgx_gpu` makes it, so that text a renderer draws
+    /// was measured as it is drawn and not by the estimate (a label laid out
+    /// narrower than its glyphs, its last one cut). `install` returns false,
+    /// installing nothing, once its services are gone; a host's own always
+    /// win. `None` takes it back.
+    pub fn set_default_text_services(install: Option<std::rc::Rc<DefaultTextServices>>) {
+        DEFAULT_TEXT_SERVICES.with_borrow_mut(|default| *default = install);
+        DEFAULT_TEXT_EPOCH.set(DEFAULT_TEXT_EPOCH.get().wrapping_add(1));
+    }
+    /// The default text services it took (`set_default_text_services`),
+    /// none if its host installed its own.
+    pub fn default_text_services(&self) -> Option<&std::rc::Rc<DefaultTextServices>> {
+        self.text_default.as_ref()
+    }
+    /// A renderer drawing it, `ours` its text services: whether this is the
+    /// first to draw it and it took other default ones (two contexts on one
+    /// thread, the last made the default), which it keeps (installing them
+    /// again would lay out and repaint all its text, for the same system
+    /// fonts on each); its host chooses with `install_text`. Once: two
+    /// drawing it each frame (a reference renderer's) say it no more.
+    pub fn drawn_with_other_text_services(&self, ours: &std::rc::Rc<DefaultTextServices>) -> bool {
+        !self.text_drawn.replace(true)
+            && self.text_default.as_ref().is_some_and(|taken| {
+                !std::ptr::addr_eq(std::rc::Rc::as_ptr(taken), std::rc::Rc::as_ptr(ours))
+            })
+    }
+    /// At layout, a scene with no font measurer takes this thread's default
+    /// text services, if there are any (`set_default_text_services`), unless
+    /// its host installed text measurement of another kind (a plain text
+    /// measurer or a shaper): what it chose stays, and nothing is laid out
+    /// again.
+    #[cold]
+    #[inline(never)]
+    fn settle_text_services(&mut self, epoch: u32) {
+        self.text_epoch = epoch;
+        let chosen = self.text_measurer.is_some()
+            || self.text_shaper.is_some()
+            || self.font_shaper.is_some()
+            || self.rich_shaper.is_some();
+        if chosen {
+            return;
+        }
+        if let Some(install) = DEFAULT_TEXT_SERVICES.with_borrow(Option::clone) {
+            match install(self) {
+                true => self.text_default = Some(install),
+                false => DEFAULT_TEXT_SERVICES.with_borrow_mut(|default| {
+                    if default.as_ref().is_some_and(|d| {
+                        std::ptr::addr_eq(std::rc::Rc::as_ptr(d), std::rc::Rc::as_ptr(&install))
+                    }) {
+                        *default = None;
+                    }
+                }),
+            }
+        }
+    }
     /// Install wrapping plain text's measurement with the widths it holds
     /// for: its size at a limit, and the width up to which (from its widest
     /// line's) its lines break the same. Layout serves a width between from
@@ -6904,6 +7492,8 @@ impl Scene {
         + 'static,
     ) {
         self.font_measurer = Some(Box::new(measure));
+        // Its host's own (or a default's, which says so after).
+        self.text_default = None;
         self.text_shaper_revision = self.text_shaper_revision.wrapping_add(1);
         let ids: Vec<_> = self
             .paint_items()
@@ -7490,7 +8080,22 @@ impl Scene {
         crate::gpu_view::count_plane_frame();
     }
     /// Append a node of `kind` with `style` as `parent`'s last child.
-    pub fn append(&mut self, parent: NodeId, kind: NodeKind, mut style: Style) -> NodeId {
+    pub fn append(&mut self, parent: NodeId, kind: NodeKind, style: Style) -> NodeId {
+        self.append_as::<false>(parent, kind, style)
+    }
+    /// `append` into `parent`, a box of a fixed size (a canvas's labels'
+    /// group): what it holds changes neither its size nor its place, so the
+    /// walk stops at it (`invalidate_children_layout`).
+    pub(crate) fn append_held(&mut self, parent: NodeId, kind: NodeKind, style: Style) -> NodeId {
+        self.append_as::<true>(parent, kind, style)
+    }
+    #[inline(always)]
+    fn append_as<const HELD: bool>(
+        &mut self,
+        parent: NodeId,
+        kind: NodeKind,
+        mut style: Style,
+    ) -> NodeId {
         self.content_revision = self.content_revision.wrapping_add(1);
         if let Some(options) = &style.layout_options {
             let normalized = (**options).normalized();
@@ -7594,14 +8199,21 @@ impl Scene {
             self.overflow_fades.push((id, [0.; 4]));
         }
         self.dirty.push(id);
-        self.invalidate_layout(parent);
+        match HELD {
+            true => self.invalidate_children_layout(parent),
+            false => self.invalidate_layout(parent),
+        }
         self.children_changed(parent);
         id
     }
     /// Remove `id` and its subtree, damaging where they painted. Panics for
     /// the root.
     pub fn remove(&mut self, id: NodeId) {
-        self.remove_as::<false>(id, 0);
+        self.remove_as::<false, false>(id, 0);
+    }
+    /// `remove` from a box of a fixed size (`append_held`).
+    pub(crate) fn remove_held(&mut self, id: NodeId) {
+        self.remove_as::<false, true>(id, 0);
     }
     #[cfg(target_os = "macos")]
     /// `id`'s looping animation, sampled for the renderer to bake and play
@@ -7635,10 +8247,10 @@ impl Scene {
         self.plays_loops.set(plays);
     }
     pub(crate) fn remove_indexed(&mut self, id: NodeId, index: usize) {
-        self.remove_as::<true>(id, index);
+        self.remove_as::<true, false>(id, index);
     }
     #[inline(always)]
-    fn remove_as<const INDEXED: bool>(&mut self, id: NodeId, index: usize) {
+    fn remove_as<const INDEXED: bool, const HELD: bool>(&mut self, id: NodeId, index: usize) {
         if !INDEXED {
             self.settle_children();
         }
@@ -7668,13 +8280,19 @@ impl Scene {
                 .get_mut()
                 .retain(|child| *child != id);
         }
+        if self.recording.get() {
+            self.removing_subtree(id);
+        }
         self.free_subtree(id);
         if !self.inert.is_empty() {
             let mut inert = std::mem::take(&mut self.inert);
             inert.retain(|n| self.contains(*n));
             self.inert = inert;
         }
-        self.invalidate_layout(parent);
+        match HELD {
+            true => self.invalidate_children_layout(parent),
+            false => self.invalidate_layout(parent),
+        }
         // Children removed or moved: its kept ink union goes unless only
         // its tail changed (`KeptInk`).
         if self.kept_any.get() {
@@ -7725,6 +8343,9 @@ impl Scene {
             ids.extend_from_slice(unsafe { &*slot.node.as_ref().unwrap().children.get() });
         }
         self.dead += ids.len();
+        if self.recording.get() {
+            self.removed(&ids);
+        }
         let slots = &self.slots;
         let live = |id: &NodeId| slots[id.index as usize].generation == id.generation;
         self.blur_nodes.retain(live);
@@ -9130,7 +9751,7 @@ impl Scene {
         match HELD {
             true => self.invalidate_layout_with::<true>(id, false, true, owner),
             false if (STOPS || self.relative_count != 0) && absolute => {
-                self.invalidate_absolute_layout(id)
+                self.invalidate_absolute_restyled(id)
             }
             false => self.invalidate_layout(id),
         }
@@ -9190,12 +9811,8 @@ impl Scene {
         // What it needs of the node, read once (a move is the hottest
         // setter: a reorder animation moves every row each frame).
         let node = self.node(id);
-        let (scroll_copy, from, transparent, parent) = (
-            node.scroll_copy,
-            node.transform,
-            node.effects.opacity <= 0.,
-            node.parent,
-        );
+        let (scroll_copy, from, transparent) =
+            (node.scroll_copy, node.transform, node.effects.opacity <= 0.);
         if scroll_copy {
             transform = self.on_pixels(transform);
         }
@@ -9210,7 +9827,7 @@ impl Scene {
             }
             self.move_context = None;
             self.node_mut(id).transform = transform;
-            self.geometry_revision = self.geometry_revision.wrapping_add(1);
+            self.unmoved = self.unmoved.wrapping_add(1);
             self.invalidate(id, COMPOSITE);
             return;
         }
@@ -9223,20 +9840,155 @@ impl Scene {
             self.invalidate(id, COMPOSITE);
             return;
         }
+        self.move_damaged(id, &transform);
+    }
+    /// `set_transform`'s damage for `id` moved to `to` from where it is,
+    /// and the move itself. A leaf with nothing transformed or filtered (each row of
+    /// a list animating its order) has both its places worked out at once,
+    /// from one look at the node, and added together, as layout adds a
+    /// moved leaf's (`leaf_damage`); anything else is walked where it was
+    /// and where it lands (`damage_subtree_with`). Out of line, so
+    /// `set_transform`'s other paths stay as they were.
+    #[inline(never)]
+    fn move_damaged(&mut self, id: NodeId, to: &Transform) {
+        // Read here, not passed: `set_transform`'s own paths keep no more
+        // live for the call.
+        let node = self.node(id);
+        let (from, parent, to) = (node.transform, node.parent, *to);
         // Its old place and its new, under the same ancestors: their
         // context is worked out once, and kept for the next move under the
         // same parent while nothing else changed (`move_context`).
         let mut context = self.kept_context(parent);
-        self.damage_subtree_with(id, &mut context);
+        let leaf = self.transformed + self.filtered.get() == 0
+            && self.children_raw(self.node(id)).is_empty();
+        #[cfg(test)]
+        let leaf = leaf && !self.leaf_moves_off;
+        match leaf {
+            true => self.damage_moved_leaf(id, from, to, &mut context),
+            false => self.damage_subtree_with(id, &mut context),
+        }
         self.move_context = None;
-        self.node_mut(id).transform = transform;
-        self.geometry_revision = self.geometry_revision.wrapping_add(1);
-        self.damage_subtree_with(id, &mut context);
+        self.node_mut(id).transform = to;
+        if leaf {
+            // A leaf moves no node but itself, which its observer checks
+            // (`world_bounds_kept`): a scrollbar thumb leaves the rest kept.
+            self.unmoved = self.unmoved.wrapping_add(1);
+        } else {
+            self.geometry_revision = self.geometry_revision.wrapping_add(1);
+            self.damage_subtree_with(id, &mut context);
+        }
         self.invalidate(id, COMPOSITE);
         // Moving a child (and marking it and its ancestors to repaint)
         // leaves the parent's places, clips and visibility as they were: a
         // child is never its own parent's ancestor.
         self.keep_context(parent, context);
+    }
+    /// A moved leaf's damage where it was (`from`) and where it lands
+    /// (`to`): to the grid's cells when it takes them, else as rounded
+    /// rectangles, those sharing their extent along an axis and
+    /// overlapping as one (as `add_moved_leaf_damage`, which stays
+    /// `arrange::<false>`'s alone), into the list as the walks add them.
+    fn damage_moved_leaf(
+        &mut self,
+        id: NodeId,
+        from: Transform,
+        to: Transform,
+        context: &mut Option<DamageContext>,
+    ) {
+        #[cfg(test)]
+        {
+            self.leaf_moves[0] += 1;
+            self.leaf_moves[1] += self.grid_takes_cells() as u64;
+        }
+        if self.grid_takes_cells() {
+            let (before, after) = self.moved_leaf_rects::<true>(id, context, from, to);
+            if let Some(grid) = &mut self.damage_grid {
+                grid.mark_clipped_pair(before, after);
+            }
+            return;
+        }
+        match self.moved_leaf_rects::<false>(id, context, from, to) {
+            (Some(before), Some(after))
+                if (before.x == after.x && before.width == after.width
+                    || before.y == after.y && before.height == after.height)
+                    && before.intersects(after) =>
+            {
+                self.add_damage(before.union(after));
+            }
+            (before, after) => {
+                for rect in [before, after].into_iter().flatten() {
+                    self.add_damage(rect);
+                }
+            }
+        }
+    }
+    /// What `damage_subtree_with` adds for leaf `id` under translation
+    /// `from` and then `to`, with nothing transformed or filtered: as
+    /// `leaf_damage` works a leaf's two boxes out, for one box at two
+    /// translations.
+    fn moved_leaf_rects<const CELLS: bool>(
+        &self,
+        id: NodeId,
+        context: &mut Option<DamageContext>,
+        from: Transform,
+        to: Transform,
+    ) -> (Option<Rect>, Option<Rect>) {
+        // Hidden, or never laid out (a row mounting as it moves in): it
+        // damages nothing, and its parent's context goes unworked, as
+        // `damage_subtree_with` leaves it.
+        let node = self.node(id);
+        let unplaced = node.measurement.is_none() && node.bounds == Rect::default();
+        if !own_visible(&node.style) || unplaced || self.damage_is_full() {
+            return (None, None);
+        }
+        let Some((parent, parent_clip)) =
+            *context.get_or_insert_with(|| self.damage_context(node.parent))
+        else {
+            return (None, None);
+        };
+        let at = |translation: Transform| Transform {
+            x: parent.x + translation.x,
+            y: parent.y + translation.y,
+        };
+        let (was, now) = (at(from), at(to));
+        let clips = clip_axes(&node.style) != (false, false);
+        let past_clip = clips && matches!(node.kind, NodeKind::Quad(_) | NodeKind::Panel { .. });
+        let bounds = node.bounds;
+        macro_rules! pair {
+            ($paint:expr) => {{
+                let paint = $paint;
+                let rect = |transform| {
+                    self.leaf_rect::<CELLS>(
+                        node,
+                        bounds,
+                        transform,
+                        parent_clip,
+                        clips,
+                        past_clip,
+                        &paint,
+                    )
+                };
+                (rect(was), rect(now))
+            }};
+        }
+        match &node.kind {
+            NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } => {
+                if quad.decoration.is_none() && quad.shadow.is_none() && quad.outline.is_none() {
+                    pair!(Some)
+                } else {
+                    pair!(|bounds| Some(quad.paint_bounds(bounds)))
+                }
+            }
+            NodeKind::Image(image) => pair!(|bounds| Some(image.paint_bounds(bounds))),
+            NodeKind::Svg(svg) => pair!(|bounds| Some(svg.paint_bounds(bounds))),
+            NodeKind::Text { .. } | NodeKind::RichText { .. }
+                if node.effects.blur_radius <= 0.0 =>
+            {
+                pair!(|bounds| Some(self.text_ink(id, bounds)))
+            }
+            NodeKind::Container(_) if node.effects.blur_radius <= 0.0 => (None, None),
+            _ => pair!(Some),
+        }
     }
     /// The context kept for `parent` (`move_context`), if any.
     #[inline(always)]
@@ -9506,6 +10258,30 @@ impl Scene {
     fn invalidate_layout(&mut self, id: NodeId) {
         self.invalidate_layout_with::<false>(id, false, true, id);
     }
+    /// `invalidate_layout` for `id` whose children changed, its own style
+    /// not (`append_held`): of a fixed size, laid out before, it stops the
+    /// walk at itself, laid out alone (`relayout_alone`; its size is its
+    /// style's, so it stands, and if not, its ancestors are marked then).
+    /// Otherwise the walk goes up as ever.
+    #[cold]
+    #[inline(never)]
+    fn invalidate_children_layout(&mut self, id: NodeId) {
+        let node = self.node(id);
+        let fixed = node.style.width.is_some()
+            && node.style.height.is_some()
+            && !node.style.intrinsic_width
+            && !node.style.intrinsic_height
+            && node.style.width_percent.is_none()
+            && node.style.height_percent.is_none()
+            && node.measurement.is_some()
+            && node
+                .parent
+                .is_some_and(|parent| self.node(parent).measurement.is_some());
+        match fixed {
+            true => self.invalidate_layout_with::<true>(id, false, true, id),
+            false => self.invalidate_layout(id),
+        }
+    }
     /// Whether absolute node `id`'s parent may be where its change's walk
     /// stops (`absolute_stop`), by its own fields alone: laid out once, under
     /// one question, and what it reads known or kept. Or, with a relative
@@ -9529,6 +10305,32 @@ impl Scene {
                             && parent.style.height.is_some()))
             })
     }
+    /// `invalidate_absolute_layout` for absolute node `id` restyled: moved by
+    /// an inset alone, of a fixed size, it is placed where its parent's layout
+    /// would put it, nothing measured (`move_by_insets`). Apart, so the walk's
+    /// own code stays as it was.
+    #[cold]
+    #[inline(never)]
+    fn invalidate_absolute_restyled(&mut self, id: NodeId) {
+        // Through a pointer: called directly, the layout code it reaches
+        // counts as reachable from `restyle` for rustc's MIR inliner, which
+        // then inlines less into `set_style_within` (19 more instructions
+        // on x86, every call).
+        let moved: fn(&mut Scene, NodeId) -> bool = Scene::moved_by_insets_alone;
+        if !moved(self, id) {
+            self.invalidate_absolute_layout(id)
+        }
+    }
+    /// `id` moved alone if its new style only moves it (`inset_move_laid`).
+    fn moved_by_insets_alone(&mut self, id: NodeId) -> bool {
+        let Some((at, mapped)) = self.inset_move_laid(id) else {
+            return false;
+        };
+        let parent = self.node(id).parent.expect("checked by `inset_move_laid`");
+        self.moved_leaf_style(parent, id, mapped);
+        self.move_by_insets(id, at);
+        true
+    }
     /// `invalidate_layout` for absolute node `id`: one placed by its parent (a
     /// thumb, a badge, a run of a row's text) changes nothing of its parent's
     /// answer, so the walk stops there, to lay it out alone
@@ -9543,6 +10345,70 @@ impl Scene {
         match self.absolute_stop(id) {
             Some(stop) => self.invalidate_layout_with::<true>(id, false, true, stop),
             None => self.invalidate_layout(id),
+        }
+    }
+    /// `id`, whose new style moves it alone to `at` in its parent
+    /// (`inset_move_laid`): its parent's result places it there, and the next
+    /// layout arranges it there (`lay_out_moved`), measuring nothing. Its
+    /// parent's other results go (they placed it where it was), and a layout
+    /// of its parent maps its new style (`style_writes`).
+    fn move_by_insets(&mut self, id: NodeId, at: (f32, f32)) {
+        let parent = self.node(id).parent.expect("checked by `inset_move_laid`");
+        let held = self.tree_node_mut(parent);
+        held.alternates.clear();
+        let result = held
+            .measurement
+            .as_mut()
+            .expect("checked by `inset_move_laid`");
+        for (child, rect, _) in &mut result.children {
+            if *child == id {
+                (rect.x, rect.y) = at;
+            }
+        }
+        let moved = &mut self.cold.get_or_insert_default().moved;
+        if !moved.contains(&id) {
+            moved.push(id);
+        }
+        // In the flush's queue, as `arrange` puts a node it moves.
+        self.invalidate(id, PAINTED);
+        self.alone_pending = true;
+    }
+    /// The nodes moved alone since the last layout (`move_by_insets`), each
+    /// arranged where its parent's results now place it. Not one laid out
+    /// anyway, or under a parent that is: that layout places it.
+    #[cold]
+    #[inline(never)]
+    fn lay_out_moved(&mut self, report: &mut FrameReport) {
+        // Its room kept: a thumb moves every frame of a scroll.
+        let mut moved = match &mut self.cold {
+            Some(cold) => std::mem::take(&mut cold.moved),
+            None => return,
+        };
+        for &id in &moved {
+            if !self.contains(id) {
+                continue;
+            }
+            let node = self.node(id);
+            let Some(parent) = node.parent else {
+                continue;
+            };
+            let held = self.node(parent);
+            if node.dirty & LAYOUT != 0 || held.dirty & LAYOUT != 0 {
+                continue;
+            }
+            let placed = held
+                .measurement
+                .as_ref()
+                .and_then(|m| m.children.iter().find(|(child, ..)| *child == id));
+            let Some(&(_, rect, _)) = placed else {
+                continue;
+            };
+            let origin = held.bounds;
+            self.arrange_from(id, origin.x + rect.x, origin.y + rect.y, report);
+        }
+        moved.clear();
+        if let Some(cold) = &mut self.cold {
+            cold.moved = moved;
         }
     }
     /// `invalidate_layout` for a change of a leaf's content (a text's): its
@@ -9831,9 +10697,16 @@ impl Scene {
         // Held (`set_style_within`): its parent chose its size, and it answers
         // that as it did or isn't let stand.
         let held = !self.held_alone.is_empty() && self.held_alone.contains(&id);
+        // Or, not sized by its parent along its axis, held at its floor by
+        // a parent that shrank it, a floor its content just lowered: its
+        // parent shrinks it now (as for a boundary, `floor_dropped`), though
+        // its own size answers as it did. Asked only under a row or column
+        // that shrank (`shrank`).
+        let floor = flexed.is_none() && !self.shrank.is_empty() && self.shrank_bit(parent);
         let stands = (held || flexed.is_none())
             && self.reads_bits(id) == kept_reads
-            && self.measure_full(id, asked) == was;
+            && self.measure_full(id, asked) == was
+            && !(floor && self.floor_dropped_alone(id));
         if stands && held {
             // What it answered to other questions read what just changed.
             let node = self.tree_node_mut(id);
@@ -9857,6 +10730,13 @@ impl Scene {
         // row inside the box laid out alone): the deepest first, so that the
         // one around it measures it as it now is, and its arrange then
         // leaves nothing marked. Otherwise, as the queue holds them.
+        if self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| !cold.moved.is_empty())
+        {
+            self.lay_out_moved(report);
+        }
         if std::mem::take(&mut self.absolute_alone) {
             self.lay_out_deepest_stops(report);
         }
@@ -9973,7 +10853,8 @@ impl Scene {
     /// held there and no longer holds: at its size under a parent that
     /// shrank its children (`shrank`), it was held at its automatic minimum,
     /// and that is now less than its size, so its parent would shrink it.
-    /// Asked only of the few boundaries a frame lays out alone.
+    /// Asked only of the few boundaries a frame lays out alone (and of the
+    /// stops `floor_dropped_alone` finds held).
     #[inline(never)]
     fn floor_dropped(&mut self, id: NodeId, constraints: Constraints, size: (f32, f32)) -> bool {
         let node = self.node(id);
@@ -10010,6 +10891,189 @@ impl Scene {
         }
         dropped
     }
+    /// `floor_dropped` for `id`, a stop laid out alone (`relayout_alone`)
+    /// at the size it holds, not sized by its parent along its axis, under a row or
+    /// column that shrank its children (`shrank`, set by any layout of
+    /// `parent`, a probe's too): only if the layout `parent` holds shrank
+    /// them, which held it at its automatic minimum, where it stands. Else
+    /// it stands where nothing was shrunk, and a floor below it changes
+    /// nothing. Its parent's layout told apart (`layout_shrinks`) or not,
+    /// as before.
+    #[cold]
+    #[inline(never)]
+    fn floor_dropped_alone(&mut self, id: NodeId) -> bool {
+        let Some(parent) = self.node(id).parent else {
+            return false;
+        };
+        // Of a pass: an expired result's (`EXPIRED_PASS`) is no layout's,
+        // and 0 is an empty slot's.
+        let pass = self.node(parent).measurement.as_ref().map(|m| m.pass);
+        let pass = pass.filter(|&pass| pass != EXPIRED_PASS && pass != 0);
+        let slot = parent.index as usize;
+        let known = pass.and_then(|pass| match self.shrinks_of.get(slot) {
+            Some(&(generation, of, shrinks)) if generation == parent.generation && of == pass => {
+                Some(shrinks)
+            }
+            _ => None,
+        });
+        let shrinks = match known {
+            Some(shrinks) => shrinks,
+            None => match self.layout_shrinks(parent) {
+                Some(shrinks) => {
+                    if let Some(pass) = pass {
+                        if self.shrinks_of.len() <= slot {
+                            self.shrinks_of.resize(slot + 1, (0, 0, false));
+                        }
+                        self.shrinks_of[slot] = (parent.generation, pass, shrinks);
+                    }
+                    shrinks
+                }
+                // Not told apart: the floor is looked at, as before.
+                None => true,
+            },
+        };
+        if !shrinks {
+            return false;
+        }
+        // Under the constraint it was laid out again at, at the size it
+        // answered as before: the result it holds.
+        let Some((constraints, size)) = self
+            .node(id)
+            .measurement
+            .as_ref()
+            .map(|m| (m.constraints, m.size))
+        else {
+            return false;
+        };
+        self.floor_dropped(id, constraints, size)
+    }
+    /// Whether the layout row or column `id` holds (its only result, with
+    /// its children's places) shrank its children: its children's bases
+    /// and gaps, more than the room along its axis, as the flex loop finds
+    /// them. A child its parent sized along that axis has its base in the
+    /// result it was measured at first (without that size); None where one
+    /// is gone, or the layout is not one this can tell.
+    fn layout_shrinks(&self, id: NodeId) -> Option<bool> {
+        let node = self.node(id);
+        let horizontal = match node.kind {
+            NodeKind::Container(Layout::Row) => true,
+            NodeKind::Container(Layout::Column) => false,
+            _ => return None,
+        };
+        let measured = node.measurement.as_ref()?;
+        let constraints = measured.constraints;
+        let resolved;
+        let style = match node.style.layout_options {
+            None => &node.style,
+            Some(_) => {
+                resolved = self.resolved_leaf_style(id, constraints);
+                &resolved
+            }
+        };
+        let padding = style.padding_edges.unwrap_or(Insets::all(style.padding));
+        // Along its axis, as its layout has them: its padding, the size it
+        // was given or sets, and the room its children were measured in.
+        let (padding, explicit, min, max, room) = if horizontal {
+            let explicit = constraints
+                .force_width
+                .or(style.width)
+                .or_else(|| percentage(style.width_percent, constraints.percent_width));
+            let (min, max) = (style.min_width, style.max_width);
+            (
+                padding.left.max(0.0) + padding.right.max(0.0),
+                explicit,
+                min,
+                max,
+                constraints.width,
+            )
+        } else {
+            let explicit = constraints
+                .force_height
+                .or(style.height)
+                .or_else(|| percentage(style.height_percent, constraints.percent_height));
+            let (min, max) = (style.min_height, style.max_height);
+            (
+                padding.top.max(0.0) + padding.bottom.max(0.0),
+                explicit,
+                min,
+                max,
+                constraints.height,
+            )
+        };
+        // Sized by its children, with no maximum (or room, across a row),
+        // it holds them all: it shrinks none.
+        if explicit.is_none() && max.is_none() && (!horizontal || room.is_none()) {
+            return Some(false);
+        }
+        let explicit = explicit.map(|size| dimension(size, min, max));
+        let room = explicit
+            .or_else(|| room.map(|size| size.min(max.unwrap_or(f32::INFINITY))))
+            .or(max)
+            .map(|size| (size - padding).max(0.0));
+        let mut bases = 0.0;
+        let mut count = 0usize;
+        for &(child, place, under) in &measured.children {
+            let child_node = self.node(child);
+            if child_node.style.absolute {
+                continue;
+            }
+            count += 1;
+            let m = child_node.style.margin;
+            bases += if horizontal {
+                m.left + m.right
+            } else {
+                m.top + m.bottom
+            };
+            let sized = if horizontal {
+                under.force_width
+            } else {
+                under.force_height
+            };
+            if sized.is_none() {
+                bases += if horizontal {
+                    place.width
+                } else {
+                    place.height
+                };
+                continue;
+            }
+            // Its base: the result it was measured at before it was sized,
+            // in the room it then had.
+            let natural = self.relevant(
+                child,
+                if horizontal {
+                    Constraints {
+                        width: room,
+                        force_width: None,
+                        ..under
+                    }
+                } else {
+                    Constraints {
+                        height: room,
+                        force_height: None,
+                        ..under
+                    }
+                },
+            );
+            let base = child_node
+                .measurement
+                .iter()
+                .chain(&child_node.alternates)
+                .map(|m| (m.constraints, m.size))
+                .chain(child_node.sizes.iter().map(|s| (s.constraints, s.size)))
+                .find(|(asked, _)| *asked == natural)?
+                .1;
+            bases += if horizontal { base.0 } else { base.1 };
+        }
+        bases += style.gap * count.saturating_sub(1) as f32;
+        // A row sized by its content fits it in its room (`measure_uncached`).
+        let content = explicit.unwrap_or(match room.filter(|_| horizontal) {
+            Some(room) => bases.min(room) + padding,
+            None => bases + padding,
+        });
+        let limit = dimension(content, min, max) - padding;
+        Some(limit - bases <= -0.001)
+    }
     /// Whether the row or column in slot `id` shrank its children when last
     /// laid out (`shrank`).
     fn shrank_bit(&self, id: NodeId) -> bool {
@@ -10037,11 +11101,18 @@ impl Scene {
         let style = &self.node(id).style;
         style.absolute && style.layout_options.is_none()
     }
-    /// Mark every ancestor up to the root, ignoring boundaries.
+    /// Mark every ancestor up to the root, ignoring boundaries. What one
+    /// answered this pass, laid out alone before this boundary was found
+    /// not to stand (`layout_alone`, which runs first), took its old
+    /// answer, and serves no more (`expire_this_pass`): the layout that
+    /// follows would keep it, and leave the boundary's subtree unarranged.
     fn invalidate_layout_to_root(&mut self, mut id: NodeId) {
         let mut own = true;
         loop {
-            self.invalidate_with(id, LAYOUT, false, std::mem::take(&mut own));
+            self.invalidate_with(id, LAYOUT, false, own);
+            if !std::mem::take(&mut own) {
+                self.expire_this_pass(id);
+            }
             match self.node(id).parent {
                 Some(parent) => id = parent,
                 None => break,
@@ -10359,6 +11430,67 @@ impl Scene {
             ancestor = self.tree_node(parent);
         }
         clip
+    }
+    /// `world`, in one walk up, for the readers of what shows
+    /// (`visible_bounds`, `shows_within`) where deep observed nodes read it
+    /// every frame: each clipping box met on the way sums its own
+    /// translation from there on, as walking up again from it would (the
+    /// same sums in the same order, so the same floats), and the clips are
+    /// cut from the node up, as ever. Past `CLIPS` clipping boxes (none a
+    /// real tree has),
+    /// `world_clip` walks as it does. `world` itself stays the two walks:
+    /// damage and flush call it, for nodes with no clips around them, where
+    /// those cost less.
+    #[inline(never)]
+    fn world_once(&self, id: NodeId) -> (Rect, Effects, Option<Rect>) {
+        const CLIPS: usize = 6;
+        let node = self.node(id);
+        let mut effects = node.effects;
+        if !own_visible(&node.style) {
+            effects.opacity = 0.;
+        }
+        let mut transform = node.transform;
+        let mut clips = [(node, Transform::default()); CLIPS];
+        let mut count = 0;
+        let mut over = false;
+        let mut boxed = node;
+        loop {
+            if clip_axes(&boxed.style) != (false, false) {
+                match count < CLIPS {
+                    true => {
+                        clips[count] = (boxed, boxed.transform);
+                        count += 1;
+                    }
+                    false => over = true,
+                }
+            }
+            let Some(parent) = boxed.parent else {
+                break;
+            };
+            boxed = self.tree_node(parent);
+            transform.x += boxed.transform.x;
+            transform.y += boxed.transform.y;
+            for (_, offset) in &mut clips[..count] {
+                offset.x += boxed.transform.x;
+                offset.y += boxed.transform.y;
+            }
+            effects.opacity *= if own_visible(&boxed.style) {
+                boxed.effects.opacity
+            } else {
+                0.
+            };
+        }
+        let clip = match over {
+            true => self.world_clip(id),
+            false => {
+                let mut clip = Some(self.viewport);
+                for (boxed, offset) in &clips[..count] {
+                    clip = clipped_bounds(clip, boxed.bounds.translated(*offset), &boxed.style);
+                }
+                clip
+            }
+        };
+        (node.bounds.translated(transform), effects, clip)
     }
     fn damage_subtree(&mut self, id: NodeId) {
         self.damage_subtree_with(id, &mut None);
@@ -13964,7 +15096,7 @@ impl Scene {
         self.move_context = None;
     }
     pub(crate) fn geometry_revision(&self) -> u64 {
-        self.geometry_revision
+        self.geometry_revision.wrapping_add(self.unmoved)
     }
     pub(crate) fn layout_revision(&self) -> u64 {
         self.layout_revision
@@ -13988,6 +15120,16 @@ impl Scene {
     // Materializing children and starting the profile span do not dirty root.
     #[inline(never)]
     fn prepare_layout_active(&mut self, full: bool) {
+        // With no text services of its own, the thread's default, set since
+        // it last looked (a renderer made): its text then measured as drawn.
+        let epoch = DEFAULT_TEXT_EPOCH.get();
+        let full = match self.font_measurer.is_none() && self.text_epoch != epoch {
+            true => {
+                self.settle_text_services(epoch);
+                full || self.node(self.root).dirty & LAYOUT != 0
+            }
+            false => full,
+        };
         self.settle_children();
         let _span = crate::profile::span(crate::profile::Phase::Layout);
         self.layout_pass = self.layout_pass.wrapping_add(1);
@@ -14081,7 +15223,7 @@ impl Scene {
         }
         self.pending_layout_nodes += report.layout_nodes;
         self.layout_revision = self.layout_revision.wrapping_add(1);
-        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        self.unmoved = self.unmoved.wrapping_add(1);
     }
     /// Lay out, paint and composite what changed since the last flush, and
     /// report the damage.
@@ -14277,6 +15419,7 @@ impl Scene {
     /// device pixels (`set_pixel_scale`).
     pub fn set_scroll_copy(&mut self, id: NodeId, enabled: bool) {
         self.node_mut(id).scroll_copy = enabled;
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
     }
     /// How many device pixels a point is (the window's scale factor).
     /// Scroll content then moves by whole device pixels, as Safari's and
@@ -14441,6 +15584,96 @@ impl Scene {
     pub fn repaints(&self) -> (std::ops::RangeInclusive<u64>, &[(NodeId, u8)]) {
         self.repaints_read.set(true);
         (self.repaints_from..=self.repaint_flushes, &self.repaints)
+    }
+    /// The nodes removed in the flushes given (every flush counted, as
+    /// [`Scene::repaints`]), and since: each node of a subtree removed, so a
+    /// renderer keeping something by node lets go of those rather than look
+    /// over all it keeps; a node may be named more than once. Nodes appended
+    /// or given another kind aren't named: what a renderer keeps for those
+    /// it learns of as it draws them, and checks as `content_revision`
+    /// moves. One that read up to the flush before the range starts has all
+    /// since; past a gap, it looks over all it keeps. Noted once a renderer
+    /// has read them, and within a bound; a flush costs nothing for them.
+    pub fn resource_changes(&self) -> (std::ops::RangeInclusive<u64>, &[NodeId]) {
+        let flushes = self.repaint_flushes;
+        let changes = self.changes.get_or_init(|| {
+            Box::new(ResourceChanges {
+                since: std::cell::Cell::new(flushes + 1),
+                ..Default::default()
+            })
+        });
+        self.recording.set(true);
+        changes.read.set(true);
+        let from = changes.since.replace(flushes + 1);
+        let given = changes.read_len.replace(changes.noted.len());
+        (from..=flushes, &changes.noted[given..])
+    }
+    /// Note each node of `id`'s subtree, about to go (`free_subtree`), in
+    /// [`Scene::resource_changes`]. Out of line, called only while a
+    /// renderer reads them: the removal runs as it did.
+    #[cold]
+    #[inline(never)]
+    fn removing_subtree(&mut self, id: NodeId) {
+        // Walked into the list it is noted in (`removed`), which keeps its
+        // room from one flush to the next: no list of its own, and no copy
+        // of each node's children.
+        let Some(changes) = self.changes.get_mut() else {
+            return;
+        };
+        if changes.read.replace(false) {
+            changes.noted.clear();
+            changes.read_len.set(0);
+            changes.dropping = false;
+        }
+        if changes.dropping {
+            return;
+        }
+        let mut noted = std::mem::take(&mut changes.noted);
+        let mut at = noted.len();
+        noted.push(id);
+        while let Some(&id) = noted.get(at) {
+            at += 1;
+            noted.extend_from_slice(self.children_raw(self.node(id)));
+        }
+        let flushes = self.repaint_flushes;
+        let changes = self.changes.get_mut().expect("noting changes");
+        changes.noted = noted;
+        if changes.noted.len() > REPAINTS_KEPT {
+            changes.noted = Vec::new();
+            changes.read_len.set(0);
+            // These were the next flush's: what is read next starts after.
+            changes.since.set(flushes + 2);
+            changes.dropping = true;
+        }
+    }
+    /// Note `ids`, a subtree's nodes removed at once, in
+    /// [`Scene::resource_changes`]. Those a renderer has read go first. Past the bound, all go, and none are
+    /// noted until it reads again: the range it then reads starts past the
+    /// gap.
+    #[cold]
+    #[inline(never)]
+    fn removed(&mut self, ids: &[NodeId]) {
+        let flushes = self.repaint_flushes;
+        let Some(changes) = self.changes.get_mut() else {
+            return;
+        };
+        // Read since the last: all noted were given.
+        if changes.read.replace(false) {
+            changes.noted.clear();
+            changes.read_len.set(0);
+            changes.dropping = false;
+        }
+        if changes.dropping {
+            return;
+        }
+        changes.noted.extend_from_slice(ids);
+        if changes.noted.len() > REPAINTS_KEPT {
+            changes.noted = Vec::new();
+            changes.read_len.set(0);
+            // These were the next flush's: what is read next starts after.
+            changes.since.set(flushes + 2);
+            changes.dropping = true;
+        }
     }
     /// Whether a paint walk since the last call passed a node fading its
     /// edges (`Style::fade_edges`): what it painted then carries a fade
@@ -14830,8 +16063,8 @@ impl Scene {
     }
     /// Paints a single compositor layer, replacing nested isolation boundaries with
     /// one item. A layer root excludes its own opacity/filter from its cached pixels.
-    /// Changes whenever nodes are added, removed or change kind. Renderers can
-    /// prune per-node caches only when it moves.
+    /// Changes whenever nodes are added, removed or change kind. Which nodes,
+    /// for a renderer letting go of what it keeps by node: `resource_changes`.
     pub fn content_revision(&self) -> u64 {
         self.content_revision
     }
@@ -14914,18 +16147,117 @@ impl Scene {
     ) -> Vec<PaintItem<'_>> {
         match self.plain_walks() {
             true => match damage {
-                Some(_) => self.layer_items_walk::<false, false, false>(
+                Some(_) => self.layer_items_walk::<false, false, false, false, false>(
                     root,
                     damage,
                     &mut Vec::new(),
                     None,
+                    None,
                 ),
                 None => self.layer_items_whole(root),
             },
-            false => {
-                self.layer_items_walk::<true, false, false>(root, damage, &mut Vec::new(), None)
-            }
+            false => self.layer_items_walk::<true, false, false, false, false>(
+                root,
+                damage,
+                &mut Vec::new(),
+                None,
+                None,
+            ),
         }
+    }
+    /// The window's paint items within `clip`, as
+    /// `layer_items_within(None, Some(&[clip]))` finds them, but for what
+    /// `node` holds: its own items stay, its descendants' are left out. Only
+    /// where what it holds paints as plain items alone, its paint order the
+    /// tree's (`paints_plainly`, and no raised or sticky children or popups
+    /// anywhere, which could paint between them); `None` otherwise. For a
+    /// renderer asking what lies around content that moves (zgx-gpu's
+    /// scroll copies). Renderer plumbing, not a stable API.
+    #[doc(hidden)]
+    pub fn layer_items_around(&self, node: NodeId, clip: Rect) -> Option<Vec<PaintItem<'_>>> {
+        if !self.plain_walks() || !self.paints_plainly(node, clip) {
+            return None;
+        }
+        Some(self.layer_items_walk::<false, false, false, true, false>(
+            None,
+            Some(&[clip]),
+            &mut Vec::new(),
+            None,
+            Some(node),
+        ))
+    }
+    /// Whether everything `root` holds that can show within `clip` (`root`
+    /// itself among it) paints as a plain item: no layer (isolated,
+    /// transformed or an effect's), backdrop blur, edge fade, picture drawn
+    /// with an effect, layer shader, baked loop, or node painted outside its
+    /// parent's fade. Its nodes are looked at, as far down as the paint walk
+    /// would go within `clip`, and no item is made; whatever might paint
+    /// otherwise, shown or not, says `false`.
+    #[doc(hidden)]
+    pub fn paints_plainly(&self, root: NodeId, clip: Rect) -> bool {
+        // (These lists can hold removed nodes until they're let go:
+        // `outside_fade` as it grows, the others on a flush or a free.)
+        let within = |id: &NodeId| self.contains(*id) && self.is_within(*id, root);
+        if self.blur_nodes.iter().any(within) || self.layer_shaders.keys().any(within) {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        if self.baked_loops.iter().any(|(id, _)| within(id)) {
+            return false;
+        }
+        if let Some(cold) = &self.cold
+            && cold.outside_fade.keys().any(within)
+        {
+            return false;
+        }
+        self.settle_children();
+        let mut transform = Transform::default();
+        let mut parent = self.node(root).parent;
+        while let Some(id) = parent {
+            let n = self.node(id);
+            transform.x += n.transform.x;
+            transform.y += n.transform.y;
+            parent = n.parent;
+        }
+        let mut stack = vec![(root, transform)];
+        while let Some((id, parent_transform)) = stack.pop() {
+            let node = self.node(id);
+            if node.isolated
+                || node.transformed()
+                || node.effect_layer()
+                || node.effects.blur_radius > 0.
+                // A fade of its own, as the walk makes one: bands of a
+                // `fade_overflow` node the content doesn't run past are none.
+                || fades(&node.style)
+                    && fade_mask(None, Some(node.bounds), &node.style, self.overflow_of(id, node))
+                        .is_some()
+                || matches!(&node.kind, NodeKind::Image(image)
+                    if image.effect() != crate::image::ImageEffect::Plain)
+            {
+                return false;
+            }
+            let transform = Transform {
+                x: parent_transform.x + node.transform.x,
+                y: parent_transform.y + node.transform.y,
+            };
+            let children = match self.children_raw(node) {
+                all if all.len() >= SEARCHED_CHILDREN => {
+                    self.searched(id, node, all, transform, clip)
+                }
+                all => all,
+            };
+            // The children the walk goes on to, as it filters them.
+            stack.extend(
+                children
+                    .iter()
+                    .filter(|child| {
+                        self.ink(**child)
+                            .is_some_and(|ink| ink.translated(transform).intersects(clip))
+                    })
+                    .map(|child| (*child, transform)),
+            );
+        }
+        true
     }
     /// Of `node`'s `children`, those whose ink can meet `reach` (a damaged
     /// walk's damage, all of it, in the window) at `transform` (its
@@ -14978,16 +16310,41 @@ impl Scene {
     /// its damage already, and pays nothing for it.
     #[inline(never)]
     fn layer_items_whole(&self, root: Option<NodeId>) -> Vec<PaintItem<'_>> {
-        self.layer_items_walk::<false, false, true>(root, None, &mut Vec::new(), None)
+        match self.long_lists {
+            true => self.layer_items_walk::<false, false, true, false, true>(
+                root,
+                None,
+                &mut Vec::new(),
+                None,
+                None,
+            ),
+            false => self.layer_items_walk::<false, false, true, false, false>(
+                root,
+                None,
+                &mut Vec::new(),
+                None,
+                None,
+            ),
+        }
     }
     /// The window's paint items (as [`Scene::layer_items`] with `None`), and
     /// into `inherited` what each took from its ancestors, for
     /// [`Scene::item_in`] to work it out again alone.
     pub fn layer_items_recorded(&self, inherited: &mut Vec<Inherited>) -> Vec<PaintItem<'_>> {
         inherited.clear();
-        match self.plain_walks() {
-            true => self.layer_items_walk::<false, true, false>(None, None, inherited, None),
-            false => self.layer_items_walk::<true, true, false>(None, None, inherited, None),
+        match (self.plain_walks(), self.long_lists) {
+            (true, false) => self.layer_items_walk::<false, true, false, false, false>(
+                None, None, inherited, None, None,
+            ),
+            (true, true) => self.layer_items_walk::<false, true, false, false, true>(
+                None, None, inherited, None, None,
+            ),
+            (false, false) => self.layer_items_walk::<true, true, false, false, false>(
+                None, None, inherited, None, None,
+            ),
+            (false, true) => self.layer_items_walk::<true, true, false, false, true>(
+                None, None, inherited, None, None,
+            ),
         }
     }
     /// The paint items of `id`'s subtree as the window's walk makes them,
@@ -15003,14 +16360,75 @@ impl Scene {
         out: &mut Vec<Inherited>,
     ) -> Vec<PaintItem<'_>> {
         out.clear();
-        match self.plain_walks() {
-            true => {
-                self.layer_items_walk::<false, true, false>(None, None, out, Some((id, inherited)))
-            }
-            false => {
-                self.layer_items_walk::<true, true, false>(None, None, out, Some((id, inherited)))
+        let from = Some((id, inherited));
+        match (self.plain_walks(), self.long_lists) {
+            (true, false) => self
+                .layer_items_walk::<false, true, false, false, false>(None, None, out, from, None),
+            (true, true) => self
+                .layer_items_walk::<false, true, false, false, true>(None, None, out, from, None),
+            (false, false) => self
+                .layer_items_walk::<true, true, false, false, false>(None, None, out, from, None),
+            (false, true) => {
+                self.layer_items_walk::<true, true, false, false, true>(None, None, out, from, None)
             }
         }
+    }
+    /// What a kept frame rests on: every child its walk's search of a long
+    /// list left out, `ink_may_show` says can't show (but where a clip
+    /// inset narrows the walk's clip past what `ink_may_show` applies).
+    #[cfg(debug_assertions)]
+    #[cold]
+    fn left_out_cant_show(&self, all: &[NodeId], found: &[NodeId]) {
+        if found.len() == all.len() {
+            return;
+        }
+        let inset_above = |id: NodeId| {
+            let mut at = self.node(id).parent;
+            while let Some(a) = at {
+                if self.node(a).clip_inset.is_some() {
+                    return true;
+                }
+                at = self.node(a).parent;
+            }
+            false
+        };
+        for child in all {
+            if !found.contains(child) {
+                debug_assert!(
+                    !self.ink_may_show(*child) || inset_above(*child),
+                    "left {child:?} out of a kept frame (its long list searched by its clip), \
+                     yet ink_may_show says it can show, with no ancestor's clip inset narrowing \
+                     the walk's clip past ink_may_show's (the one mismatch that is safe)"
+                );
+            }
+        }
+    }
+    /// Whether `id`'s ink can show in the window: the test a walk cut to its
+    /// clips puts to it (`layer_items_walk`'s `within`), at its parent's
+    /// world translation and the clip it paints within. A kept frame's walk
+    /// leaves out only nodes for which this is false (a long list's rows
+    /// out of view), so one changing that still can't show paints nothing
+    /// a patch must draw. Never false where the walk would keep something
+    /// that paints (its clip insets aren't applied, which only widens the
+    /// clip); false where an ancestor is hidden. Unlike `within`, false
+    /// within a clip for a node with no ink or an empty one: the walk keeps
+    /// it, but nothing in it paints, and once something does its ink is
+    /// worked out afresh.
+    /// Renderer plumbing, not a stable API.
+    #[doc(hidden)]
+    pub fn ink_may_show(&self, id: NodeId) -> bool {
+        let Some(parent) = self.node(id).parent else {
+            return true;
+        };
+        let Some((transform, clip)) = self.shown_context(parent) else {
+            return false;
+        };
+        let Some(clip) = clip else {
+            return true;
+        };
+        self.ink(id).is_some_and(|ink| {
+            ink.width > 0. && ink.height > 0. && ink.translated(transform).intersects(clip)
+        })
     }
     /// Plain node `id`'s box as [`Scene::item_in`] places it, from what it
     /// `inherited`, and what it paints: for a renderer patching a node
@@ -15076,14 +16494,25 @@ impl Scene {
     }
     /// `POPUPS`: popup roots exist, which this walk leaves out below `root`.
     /// `RECORD`: what each item inherits goes into `inherited`.
+    /// `LONG`: some list grew long (`long_lists`): without damage, a whole
+    /// repaint's or a kept frame's walk searches long lists by its clip;
+    /// without one, the walk compiles as it did.
     /// `from`: a subtree alone, from what its root inherited (`root` and
     /// `damage` are then `None`).
-    fn layer_items_walk<const POPUPS: bool, const RECORD: bool, const CLIPS: bool>(
+    /// `AROUND`: what `around` holds is left out, its own items kept.
+    fn layer_items_walk<
+        const POPUPS: bool,
+        const RECORD: bool,
+        const CLIPS: bool,
+        const AROUND: bool,
+        const LONG: bool,
+    >(
         &self,
         root: Option<NodeId>,
         damage: Option<&[Rect]>,
         inherited: &mut Vec<Inherited>,
         from: Option<(NodeId, &Inherited)>,
+        around: Option<NodeId>,
     ) -> Vec<PaintItem<'_>> {
         self.settle_children();
         let reach = damage.map(|damage| {
@@ -15352,10 +16781,33 @@ impl Scene {
                     .shared(),
                 };
                 let children = match POPUPS {
+                    _ if AROUND && around == Some(id) => &[][..],
                     true => self.paint_order(id, node),
                     false => match (reach, self.children_raw(node)) {
                         (Some(reach), all) if all.len() >= SEARCHED_CHILDREN => {
                             self.searched(id, node, all, transform, reach)
+                        }
+                        // A walk cut to its clips (a whole repaint) or a kept
+                        // frame's (`RECORD`) searches long lists by their
+                        // clip, as a damaged one does by its damage: the
+                        // rows that can show, not every row. (A kept
+                        // frame's leaves its other children as they are:
+                        // testing each against its clip costs more than
+                        // the few it would leave out.)
+                        (None, all)
+                            if LONG && (CLIPS || RECORD) && all.len() >= SEARCHED_CHILDREN =>
+                        {
+                            match clip {
+                                Some(clip) => {
+                                    let found = self.searched(id, node, all, transform, clip);
+                                    #[cfg(debug_assertions)]
+                                    if RECORD {
+                                        self.left_out_cant_show(all, found);
+                                    }
+                                    found
+                                }
+                                None => all,
+                            }
                         }
                         (_, all) => all,
                     },
@@ -15367,9 +16819,11 @@ impl Scene {
                         // What it holds is cut to `clip`: a child whose ink
                         // misses it paints nothing here (a scroll view's
                         // rows out of view), on a whole repaint (`CLIPS`; a
-                        // damaged walk prunes by its damage). A recorded
-                        // walk keeps them: a kept frame patches what comes
-                        // into view from its list.
+                        // damaged walk prunes by its damage). A kept
+                        // frame's walk leaves out only a long list's rows
+                        // out of view (above); what comes into view later
+                        // reaches it through a splice of an ancestor that
+                        // changed (`Scene::ink_may_show`).
                         .filter(|child| {
                             let ink = self.ink(**child);
                             touches(ink, transform) && (!CLIPS || within(ink, transform, clip))
@@ -15472,6 +16926,19 @@ impl Scene {
             stack: vec![(self.root, Transform::default(), 1.0, self.viewport, None)],
         }
     }
+}
+/// What [`Scene::resource_changes`] keeps: the nodes noted (`noted`), how
+/// many of them a renderer was given (`read_len`), the flush the next read
+/// starts at (`since`), whether one read since the last was noted (`read`),
+/// and whether past the bound they are given up until it reads again
+/// (`dropping`). A flush does nothing here.
+#[derive(Default)]
+struct ResourceChanges {
+    noted: Vec<NodeId>,
+    read_len: std::cell::Cell<usize>,
+    since: std::cell::Cell<u64>,
+    read: std::cell::Cell<bool>,
+    dropping: bool,
 }
 /// Whether `style` fades any edge (`fade_mask` makes a mask of its own).
 fn fades(style: &Style) -> bool {
@@ -15788,6 +17255,515 @@ mod tests {
         assert!(relayered.has_inline_boxes());
     }
     use super::*;
+
+    /// What `world_bounds_kept` keeps gives `world_bounds` to the bit after
+    /// every change a scene takes, in any order: scroll content and the
+    /// nodes in it moving (by pixel-rounded and fractional amounts, to
+    /// zero, transparent, with effects), nested scroll content, scroll
+    /// content inside a translated parent, nodes made scroll content and
+    /// not, boxes laid out again, nodes mounted and removed, a row moved
+    /// from one scroll view to another and a scroll view moved (both mount
+    /// Opacities none of which is zero whose product is (0.01 to the 23rd
+    /// underflows; to the 22nd it doesn't): hidden as `world` multiplies
+    /// them, and shown again once one of them changes, though none crossed
+    /// zero and nothing kept was dropped. A product that faint (`FAINT`)
+    /// takes the full walk every time.
+    #[test]
+    fn kept_visibility_multiplies_opacities_as_the_walk() {
+        let boxed = |w: f32, h: f32, clip: bool| Style {
+            width: Some(w),
+            height: Some(h),
+            clip,
+            ..Style::default()
+        };
+        let faint = Effects {
+            opacity: 0.01,
+            ..Effects::default()
+        };
+        let mut scene = Scene::new(400., 300.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Column));
+        let view = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Column),
+            boxed(300., 200., true),
+        );
+        let content = scene.append(
+            view,
+            NodeKind::Container(Layout::Column),
+            boxed(280., 2000., false),
+        );
+        scene.set_scroll_copy(content, true);
+        let mut at = content;
+        let mut levels = Vec::new();
+        for _ in 0..23 {
+            at = scene.append(
+                at,
+                NodeKind::Container(Layout::Column),
+                boxed(280., 40., false),
+            );
+            scene.set_effects(at, faint);
+            levels.push(at);
+        }
+        let row = scene.append(
+            at,
+            NodeKind::Rect(Color(9, 9, 9, 255)),
+            boxed(200., 20., false),
+        );
+        scene.prepare_layout();
+        let mut kept = None;
+        let mut check = |scene: &Scene, shown: bool| {
+            let mut pass = ShownPass::default();
+            assert_eq!(scene.visible_bounds(row).is_some(), shown, "the walk");
+            assert_eq!(
+                scene.shows_within_kept(row, None, &mut kept, &mut pass),
+                shown
+            );
+        };
+        check(&scene, false);
+        scene.set_transform(content, Transform { x: 0., y: -5. });
+        check(&scene, false);
+        // One level opaque: the product no longer underflows.
+        scene.set_effects(levels[3], Effects::default());
+        check(&scene, true);
+        scene.set_transform(content, Transform { x: 0., y: -8. });
+        check(&scene, true);
+        scene.set_effects(levels[3], faint);
+        check(&scene, false);
+    }
+    /// A row whose edge lands on its scroll view's within a rounding, as
+    /// sums in another order could put it either side: `shows_within_kept`
+    /// takes the full walk there and answers as it does, ulp by ulp.
+    #[test]
+    fn kept_visibility_near_an_edge_is_the_walks() {
+        let boxed = |w: f32, h: f32, clip: bool| Style {
+            width: Some(w),
+            height: Some(h),
+            clip,
+            ..Style::default()
+        };
+        let mut scene = Scene::new(400., 300.);
+        scene.set_pixel_scale(2.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Column));
+        let root = scene.root();
+        scene.append(
+            root,
+            NodeKind::Rect(Color(0, 0, 0, 255)),
+            boxed(10., 33.3, false),
+        );
+        let view = scene.append(
+            root,
+            NodeKind::Container(Layout::Column),
+            boxed(300., 200., true),
+        );
+        let content = scene.append(
+            view,
+            NodeKind::Container(Layout::Column),
+            boxed(280., 2000., false),
+        );
+        scene.set_scroll_copy(content, true);
+        scene.append(
+            content,
+            NodeKind::Rect(Color(0, 0, 0, 255)),
+            boxed(10., 412.7, false),
+        );
+        let wrapper = scene.append(
+            content,
+            NodeKind::Container(Layout::Column),
+            boxed(280., 17.9, false),
+        );
+        let row = scene.append(
+            wrapper,
+            NodeKind::Rect(Color(9, 9, 9, 255)),
+            boxed(200., 17.9, false),
+        );
+        scene.prepare_layout();
+        let row_bottom = scene.node(row).bounds.y + scene.node(row).bounds.height;
+        let view_top = scene.node(view).bounds.y;
+        let mut kept = None;
+        let (mut near, mut checked) = (0, 0);
+        for margin in [None, Some(0.), Some(0.3)] {
+            // The wrapper put so that the row's bottom meets the view's top
+            // as the content scrolls to -400, give or take a few ulps.
+            let meet = view_top - margin.unwrap_or(0.) - row_bottom + 400.;
+            let mut y = meet;
+            for _ in 0..40 {
+                y = y.next_down();
+            }
+            for _ in 0..80 {
+                scene.set_transform(wrapper, Transform { x: 0., y });
+                for scroll in [-401., -400.5, -400., -399.5, -399.] {
+                    scene.set_transform(content, Transform { x: 0., y: scroll });
+                    let mut pass = ShownPass::default();
+                    let walked = match margin {
+                        Some(margin) => scene.shows_within(row, margin),
+                        None => scene.visible_bounds(row).is_some(),
+                    };
+                    let got = scene.shows_within_kept(row, margin, &mut kept, &mut pass);
+                    assert_eq!(
+                        got, walked,
+                        "wrapper at {y}, content at {scroll}, margin {margin:?}"
+                    );
+                    checked += 1;
+                    near +=
+                        usize::from(matches!(kept.as_ref().map(|k| k.inner), Some(Shown::Near)))
+                            + usize::from(overlap_near(&scene, row, margin));
+                }
+                y = y.next_up();
+            }
+        }
+        assert_eq!(checked, 3 * 80 * 5);
+        assert!(near > 0, "some answers came within the slack of an edge");
+    }
+    /// Whether `id`'s box (grown by `margin`) is within `SHOWN_SLACK` of its
+    /// clip's edge, as the full walk places both.
+    fn overlap_near(scene: &Scene, id: NodeId, margin: Option<f32>) -> bool {
+        let (bounds, _, clip) = scene.world(id);
+        let clip = clip.unwrap_or(scene.viewport);
+        overlap(bounds.expand(margin.unwrap_or(0.)), clip) == Overlap::Near
+    }
+    /// What `shows_within_kept` keeps answers as the full walk does
+    /// (`shows_within` with a margin, `visible_bounds` without), after every
+    /// change a scene takes: scrolls by whole points and fractions, nested
+    /// scroll content and scroll content under a translated parent, nodes
+    /// and leaves moving, clips turned on and off on either axis, nodes
+    /// hidden by their style or an opacity of zero, margins changed, boxes
+    /// laid out again, the window resized, nodes mounted, removed and moved
+    /// under another (mounted again), each pass with its own `ShownPass`.
+    #[test]
+    fn kept_visibility_is_the_full_walks() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        let styled = |w: f32, h: f32, clip: u64, hidden: bool| {
+            let mut style = Style {
+                width: Some(w),
+                height: Some(h),
+                clip: clip == 1,
+                ..Style::default()
+            };
+            if clip >= 2 || hidden {
+                style.layout_options = Some(Arc::new(crate::layout::LayoutOptions {
+                    clip_x: (clip == 2).then_some(true),
+                    clip_y: (clip == 3).then_some(true),
+                    visible: hidden.then_some(false),
+                    ..Default::default()
+                }));
+            }
+            style
+        };
+        let (mut kept_answers, mut walked_answers) = (0, 0);
+        for _ in 0..16 {
+            let mut scene = Scene::new(400., 300.);
+            scene.set_pixel_scale(2.);
+            scene.set_kind(scene.root(), NodeKind::Container(Layout::Column));
+            let mut nodes = vec![scene.root()];
+            let mut kept: NodeMap<Option<ShownAnchor>> = NodeMap::default();
+            let mut margins: NodeMap<Option<f32>> = NodeMap::default();
+            // A scroll view to start from: a clip holding scroll content.
+            let view = scene.append(
+                scene.root(),
+                NodeKind::Container(Layout::Column),
+                styled(300., 200., 1, false),
+            );
+            let content = scene.append(
+                view,
+                NodeKind::Container(Layout::Column),
+                styled(280., 900., 0, false),
+            );
+            scene.set_scroll_copy(content, true);
+            nodes.extend([view, content]);
+            let mut scrolls = vec![content];
+            for step in 0..1200 {
+                nodes.retain(|id| scene.contains(*id));
+                scrolls.retain(|id| scene.contains(*id));
+                let pick = |n: u64| nodes[n as usize % nodes.len()];
+                let at = pick(next(1 << 20));
+                let amount = |n: u64| match n % 5 {
+                    0 => 0.,
+                    1 => (n % 900) as f32 / 3. - 300.,
+                    2 => -((n % 97) as f32) * 0.37,
+                    3 => (n % 600) as f32 * 1.25 - 200.,
+                    _ => 1e-3 * (n % 7) as f32,
+                };
+                let to = Transform {
+                    x: amount(next(1 << 20)) * 0.1,
+                    y: amount(next(1 << 20)),
+                };
+                match next(16) {
+                    // Mostly scrolls.
+                    0..=5 if !scrolls.is_empty() => {
+                        let scroll = scrolls[next(scrolls.len() as u64) as usize];
+                        scene.set_transform(scroll, to);
+                    }
+                    6 if at != scene.root() => scene.set_transform(at, to),
+                    7 if at != scene.root() => {
+                        let opacity = [0., 0.5, 1.][next(3) as usize];
+                        scene.set_effects(
+                            at,
+                            Effects {
+                                opacity,
+                                ..Effects::default()
+                            },
+                        );
+                    }
+                    8 => {
+                        let scroll = next(3) == 0;
+                        scene.set_scroll_copy(at, scroll);
+                        if scroll {
+                            scrolls.push(at);
+                        }
+                    }
+                    9 if at != scene.root() => {
+                        let w = 20. + next(300) as f32;
+                        let h = 10. + next(400) as f32;
+                        scene.set_style(at, styled(w, h, next(5), next(9) == 0));
+                    }
+                    10 | 11 if nodes.len() < 140 => {
+                        let kind = match next(3) {
+                            0 => NodeKind::Rect(Color(9, 9, 9, 255)),
+                            1 => NodeKind::Container(Layout::Overlay),
+                            _ => NodeKind::Container(Layout::Column),
+                        };
+                        let w = 10. + next(260) as f32;
+                        let h = 5. + next(120) as f32;
+                        let id = scene.append(at, kind, styled(w, h, next(5), false));
+                        nodes.push(id);
+                    }
+                    12 if at != scene.root() => {
+                        let to = pick(next(1 << 20));
+                        let inside = |mut id: NodeId| loop {
+                            if id == at {
+                                break true;
+                            }
+                            match scene.parent(id) {
+                                Some(parent) => id = parent,
+                                None => break false,
+                            }
+                        };
+                        if next(2) == 0 && !inside(to) {
+                            let scroll = scene.node(at).scroll_copy;
+                            let from = scene.transform(at);
+                            let again = scene.append(
+                                to,
+                                NodeKind::Container(Layout::Column),
+                                styled(120., 300., 1, false),
+                            );
+                            scene.set_scroll_copy(again, scroll);
+                            scene.set_transform(again, from);
+                            let row = scene.append(
+                                again,
+                                NodeKind::Rect(Color(1, 1, 1, 255)),
+                                styled(60., 18., 0, false),
+                            );
+                            nodes.extend([again, row]);
+                            if scroll {
+                                scrolls.push(again);
+                            }
+                        }
+                        scene.remove(at);
+                    }
+                    13 => {
+                        margins.insert(
+                            at,
+                            [None, Some(0.), Some(40.), Some(200.5)][next(4) as usize],
+                        );
+                    }
+                    14 if next(8) == 0 => {
+                        scene.resize(300. + next(200) as f32, 200. + next(200) as f32)
+                    }
+                    15 => {
+                        scene.flush();
+                    }
+                    _ => {}
+                }
+                if step % 3 == 0 {
+                    scene.prepare_layout();
+                }
+                let mut pass = ShownPass::default();
+                for &id in &nodes {
+                    if !scene.contains(id) {
+                        kept.remove(&id);
+                        continue;
+                    }
+                    let margin = margins.get(&id).copied().flatten();
+                    let walked = match margin {
+                        Some(margin) => scene.shows_within(id, margin),
+                        None => scene.visible_bounds(id).is_some(),
+                    };
+                    let entry = kept.entry(id).or_insert(None);
+                    let got = scene.shows_within_kept(id, margin, entry, &mut pass);
+                    assert_eq!(got, walked, "node {id:?} at step {step}, margin {margin:?}");
+                    match entry.as_ref().map(|k| k.inner) {
+                        Some(Shown::Within(_)) | Some(Shown::Never) => kept_answers += 1,
+                        _ => walked_answers += 1,
+                    }
+                }
+            }
+        }
+        // Both ways are taken, each often (nodes under no scroll content
+        // and near an edge take the walk).
+        assert!(
+            kept_answers > 50_000 && walked_answers > 50_000,
+            "{kept_answers} kept, {walked_answers} walked"
+        );
+    }
+    /// again, as `Ui` moves them), and frames between some of those.
+    #[test]
+    fn kept_world_bounds_are_the_full_walks_to_the_bit() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        let boxed = |w: f32, h: f32| Style {
+            width: Some(w),
+            height: Some(h),
+            clip: true,
+            ..Style::default()
+        };
+        for _ in 0..12 {
+            let mut scene = Scene::new(400., 300.);
+            scene.set_pixel_scale(2.);
+            scene.set_kind(scene.root(), NodeKind::Container(Layout::Column));
+            let mut nodes = vec![scene.root()];
+            let mut kept: NodeMap<Option<ScrollAnchor>> = NodeMap::default();
+            for step in 0..1500 {
+                nodes.retain(|id| scene.contains(*id));
+                let pick = |n: u64| nodes[n as usize % nodes.len()];
+                let at = pick(next(1 << 20));
+                let amount = |n: u64| match n % 6 {
+                    0 => 0.,
+                    1 => -0.,
+                    2 => (n % 400) as f32 / 3. - 60.,
+                    3 => -((n % 97) as f32) * 0.1,
+                    4 => (n % 1000) as f32 * 1.375,
+                    _ => 1e-3 * (n % 7) as f32,
+                };
+                let to = Transform {
+                    x: amount(next(1 << 20)),
+                    y: amount(next(1 << 20)),
+                };
+                match next(14) {
+                    // Mostly moves: of scroll content (a scroll) and not.
+                    0..=4 if at != scene.root() => scene.set_transform(at, to),
+                    5 if at != scene.root() => {
+                        let opacity = [0., 0.5, 1.][next(3) as usize];
+                        scene.set_transform_and_effects(
+                            at,
+                            to,
+                            Effects {
+                                opacity,
+                                ..Effects::default()
+                            },
+                        );
+                    }
+                    6 if at != scene.root() => {
+                        let opacity = [0., 1.][next(2) as usize];
+                        scene.set_effects(
+                            at,
+                            Effects {
+                                opacity,
+                                ..Effects::default()
+                            },
+                        );
+                    }
+                    7 => scene.set_scroll_copy(at, next(3) != 0),
+                    8 => {
+                        let w = 20. + next(300) as f32;
+                        let h = 10. + next(200) as f32;
+                        scene.set_style(at, boxed(w, h));
+                    }
+                    // Mounted: under any node, a box or a leaf.
+                    9 | 10 if nodes.len() < 160 => {
+                        let kind = match next(3) {
+                            0 => NodeKind::Rect(Color(9, 9, 9, 255)),
+                            1 => NodeKind::Container(Layout::Overlay),
+                            _ => NodeKind::Container(Layout::Column),
+                        };
+                        let w = 10. + next(200) as f32;
+                        let h = 5. + next(80) as f32;
+                        nodes.push(scene.append(at, kind, boxed(w, h)));
+                    }
+                    // Removed, or moved under another node: mounted again
+                    // there with what it held (a row between scroll views,
+                    // a scroll view under another parent).
+                    11 if at != scene.root() => {
+                        let to = pick(next(1 << 20));
+                        let inside = |mut id: NodeId| loop {
+                            if id == at {
+                                break true;
+                            }
+                            match scene.parent(id) {
+                                Some(parent) => id = parent,
+                                None => break false,
+                            }
+                        };
+                        if next(2) == 0 && !inside(to) {
+                            let scroll = scene.node(at).scroll_copy;
+                            let from = scene.transform(at);
+                            let again = scene.append(
+                                to,
+                                NodeKind::Container(Layout::Column),
+                                boxed(90., 40.),
+                            );
+                            scene.set_scroll_copy(again, scroll);
+                            scene.set_transform(again, from);
+                            let row = scene.append(
+                                again,
+                                NodeKind::Rect(Color(1, 1, 1, 255)),
+                                boxed(30., 9.),
+                            );
+                            nodes.extend([again, row]);
+                        }
+                        scene.remove(at);
+                    }
+                    12 => {
+                        scene.flush();
+                    }
+                    _ => {}
+                }
+                // Layout runs at times, as a frame does, between steps that
+                // move.
+                if step % 5 == 0 {
+                    scene.prepare_layout();
+                }
+                for &id in &nodes {
+                    if !scene.contains(id) {
+                        kept.remove(&id);
+                        continue;
+                    }
+                    let fresh = scene.world_bounds(id);
+                    let got = scene.world_bounds_kept(id, kept.entry(id).or_insert(None));
+                    let bits = |r: Rect| [r.x, r.y, r.width, r.height].map(f32::to_bits);
+                    assert_eq!(bits(got), bits(fresh), "node {id:?} at step {step}");
+                }
+            }
+        }
+    }
+    /// A node painted outside its parent's fade, removed, leaves its entry
+    /// (let go only as the map grows): asking what paints plainly passes
+    /// it by rather than looking it up.
+    #[test]
+    fn paints_plainly_passes_removed_nodes_by() {
+        let mut scene = Scene::new(200., 200.);
+        let root = scene.root();
+        let view = scene.append(root, NodeKind::Container(Layout::Column), Style::default());
+        let bar = scene.append(view, NodeKind::Container(Layout::Column), Style::default());
+        scene.set_outside_fade(bar);
+        scene.flush();
+        let clip = Rect::new(0., 0., 200., 200.);
+        assert!(!scene.paints_plainly(view, clip));
+        scene.remove(bar);
+        scene.flush();
+        assert!(scene.paints_plainly(view, clip));
+        assert!(scene.paints_plainly(root, clip));
+    }
     /// A long column's ink worked out from its kept union and the children
     /// that grew where they were (`grown_ink`) is, to the bit, the ink worked
     /// out over every child (`rescan_inks`), and so is every walk's: as its
@@ -18144,6 +20120,119 @@ mod tests {
             },
         );
         assert_eq!(scene.visible_bounds(item), None);
+    }
+    /// `world` and `world_clip` as they walked: up once for translation
+    /// and opacity, and up again from each clipping box for its own.
+    fn world_walked_twice(scene: &Scene, id: NodeId) -> (Rect, f32, Option<Rect>) {
+        let node = scene.node(id);
+        let mut transform = node.transform;
+        let mut opacity = if own_visible(&node.style) {
+            node.effects.opacity
+        } else {
+            0.
+        };
+        let mut parent = node.parent;
+        while let Some(id) = parent {
+            let ancestor = scene.tree_node(id);
+            transform.x += ancestor.transform.x;
+            transform.y += ancestor.transform.y;
+            opacity *= if own_visible(&ancestor.style) {
+                ancestor.effects.opacity
+            } else {
+                0.
+            };
+            parent = ancestor.parent;
+        }
+        let mut clip = Some(scene.viewport);
+        let mut ancestor = node;
+        loop {
+            if clip_axes(&ancestor.style) != (false, false) {
+                let mut offset = ancestor.transform;
+                let mut parent = ancestor.parent;
+                while let Some(parent_id) = parent {
+                    let p = scene.tree_node(parent_id);
+                    offset.x += p.transform.x;
+                    offset.y += p.transform.y;
+                    parent = p.parent;
+                }
+                clip = clipped_bounds(clip, ancestor.bounds.translated(offset), &ancestor.style);
+            }
+            let Some(parent) = ancestor.parent else {
+                break;
+            };
+            ancestor = scene.tree_node(parent);
+        }
+        (node.bounds.translated(transform), opacity, clip)
+    }
+    /// One walk up works out what walking up again from each clip did, to
+    /// the bit: nested boxes, every other one clipping (on one axis, the
+    /// other or both, more than fit inline), moved by tenths (sums that
+    /// round), faded by thirds.
+    #[test]
+    fn world_in_one_walk_is_what_walking_twice_was() {
+        use crate::layout::LayoutOptions;
+        let mut scene = Scene::new(300.0, 200.0);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        let mut nodes = vec![scene.root()];
+        for branch in 0..3 {
+            let mut parent = scene.root();
+            for depth in 0..24 {
+                let mut style = Style {
+                    absolute: true,
+                    width: Some(280. - depth as f32 * 9.7),
+                    height: Some(190. - depth as f32 * 6.3),
+                    ..Default::default()
+                };
+                match depth % 6 {
+                    0 => style.clip = true,
+                    2 => {
+                        style.layout_options = Some(Arc::new(LayoutOptions {
+                            clip_x: Some(true),
+                            ..Default::default()
+                        }))
+                    }
+                    4 => {
+                        style.layout_options = Some(Arc::new(LayoutOptions {
+                            clip_y: Some(true),
+                            ..Default::default()
+                        }))
+                    }
+                    _ => {}
+                }
+                let node = scene.append(parent, NodeKind::Container(Layout::Overlay), style);
+                let tenth = 0.1 * (depth as f32 + 1.) * (branch as f32 - 1.3);
+                scene.set_transform(
+                    node,
+                    Transform {
+                        x: tenth + 0.3,
+                        y: -tenth * 1.7,
+                    },
+                );
+                if depth % 5 == 3 {
+                    scene.set_effects(
+                        node,
+                        Effects {
+                            opacity: 1. / 3.,
+                            ..Default::default()
+                        },
+                    );
+                }
+                nodes.push(node);
+                parent = node;
+            }
+        }
+        scene.flush();
+        let mut cut = 0;
+        for &id in &nodes {
+            let (bounds, effects, clip) = scene.world(id);
+            let walked = world_walked_twice(&scene, id);
+            assert_eq!((bounds, effects.opacity, clip), walked, "{id:?}");
+            assert_eq!(scene.world_clip(id), walked.2, "{id:?}");
+            let (bounds, effects, clip) = scene.world_once(id);
+            assert_eq!((bounds, effects.opacity, clip), walked, "once: {id:?}");
+            cut += usize::from(clip.is_some_and(|c| c.width < 280. || c.height < 190.));
+        }
+        assert!(cut > nodes.len() / 2, "the clips cut: {cut}");
     }
     #[test]
     fn what_a_popup_holds_damages_nothing_in_the_window() {
@@ -20542,12 +22631,12 @@ mod nonfinite_transform_tests {
             && r.height.is_finite()));
         assert_eq!(scene.hit_test(5., 30.), Some(node));
         assert_ne!(scene.hit_test(45., 30.), Some(node));
-        let revision = scene.geometry_revision;
+        let revision = scene.geometry_revision();
         for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0., 0.] {
             scene.set_transform(node, Transform { x, y: 25. });
             assert_eq!(scene.transform(node).x.to_bits(), 0);
             assert!(scene.flush().is_idle());
-            assert_eq!(scene.geometry_revision, revision);
+            assert_eq!(scene.geometry_revision(), revision);
         }
         scene.set_transform(
             node,
@@ -20622,6 +22711,29 @@ fn finite_effects(mut effects: Effects) -> Effects {
     effects.contrast = finite_factor(effects.contrast);
     effects.saturate = finite_factor(effects.saturate);
     effects
+}
+/// How far `children` is `current` turned round by one, either way (a
+/// terminal's rows as it scrolls a line: the first to the end, or the last
+/// to the front), if that is all it is. Any other order is told apart in
+/// two comparisons, as most reorders are no turn at all; a longer turn takes
+/// the general path. `current`'s children are each once in it, so
+/// `children` is then the same children, each once.
+#[inline(never)]
+fn rotated_by(current: &[NodeId], children: &[NodeId]) -> Option<usize> {
+    let count = current.len();
+    if count < 2 || children.len() != count {
+        return None;
+    }
+    let by = match (children[0] == current[1], children[0] == current[count - 1]) {
+        (true, _) => 1,
+        (false, true) => count - 1,
+        (false, false) => return None,
+    };
+    children
+        .iter()
+        .enumerate()
+        .all(|(at, id)| *id == current[(at + by) % count])
+        .then_some(by)
 }
 /// The indices of a longest strictly increasing subsequence of `values`
 /// (patience sorting, n log n).
@@ -20793,6 +22905,114 @@ mod set_box_tests {
             style.height = Some(25.);
             style.padding = 6.;
         });
+    }
+    /// A thumb moved by an inset alone, as its list scrolls
+    /// (`move_by_insets`): nothing is measured and the thumb alone is
+    /// arranged, where a page built with that inset places it, its old and
+    /// new boxes damaged; and so after its rail is laid out again. From its
+    /// top, from its bottom, and twice in a frame.
+    /// A move by an inset is only taken from a layout its parent's tree
+    /// holds (`inset_move_laid`). With none to read (a thumb moved in the
+    /// frame it was appended, or its parent's tree gone), its walk is the
+    /// stop's or the root's as before: measured, and placed where a page
+    /// built whole puts it.
+    #[test]
+    fn a_thumb_moved_with_no_layout_to_read_lays_out_as_before() {
+        use crate::layout::Length::Px;
+        let rail = placed(Some(8.), Some(700.), [Some(Px(0.)), Some(Px(0.)), None]);
+        let (badge, escaped) = (Style::default(), Style::default());
+        let thumb = |f: f32| placed(Some(4.), Some(60.), [Some(Px(f)), Some(Px(2.)), None]);
+        let page = |f: f32| rail_page(200, rail.clone(), thumb(f), badge.clone(), escaped.clone());
+        // Appended, then moved, in one frame: never laid out.
+        let (mut scene, [rail_id, _, ..]) = page(0.);
+        let late = scene.append(rail_id, NodeKind::Rect(Color(1, 1, 1, 255)), thumb(3.));
+        assert_eq!(
+            scene.inset_move_laid(late),
+            None,
+            "nothing to read for a new node"
+        );
+        scene.set_style(late, thumb(41.5));
+        scene.flush();
+        let rail_top = scene.bounds(rail_id).y;
+        assert_eq!(
+            scene.bounds(late).y,
+            rail_top + 41.5,
+            "placed by its layout"
+        );
+        // Its parent's tree gone (as a parent laid out another way would
+        // leave it): the move isn't taken, and the walk lays it out.
+        let (mut scene, [rail_id, id, ..]) = page(0.);
+        scene.node_mut(rail_id).advanced_layout = None;
+        let before = scene.measure_calls;
+        scene.set_style(id, thumb(22.25));
+        assert!(
+            scene.cold.as_ref().is_none_or(|cold| cold.moved.is_empty()),
+            "no move without its parent's tree"
+        );
+        scene.flush();
+        assert!(scene.measure_calls > before, "laid out by its walk");
+        same_bounds(&scene, &page(22.25).0);
+    }
+
+    #[test]
+    fn a_thumb_moved_by_an_inset_alone_measures_nothing() {
+        use crate::layout::Length::Px;
+        let rail = placed(Some(8.), Some(700.), [Some(Px(0.)), Some(Px(0.)), None]);
+        // No box another block places: each layout places those again.
+        let (badge, escaped) = (Style::default(), Style::default());
+        // Through `set_style` (what a style effect calls) and the stop asked
+        // for whatever the scene holds (`set_style_stopping`): the same move.
+        for (from_bottom, plain) in [(false, true), (true, true), (false, false), (true, false)] {
+            let write = |scene: &mut Scene, id: NodeId, style: Style| match plain {
+                true => scene.set_style(id, style),
+                false => scene.set_style_stopping(id, style),
+            };
+            let thumb = |f: f32| match from_bottom {
+                false => placed(Some(4.), Some(60.), [Some(Px(f)), Some(Px(2.)), None]),
+                true => placed(Some(4.), Some(60.), [None, Some(Px(2.)), Some(Px(f))]),
+            };
+            let page = |rail: &Style, f: f32| {
+                rail_page(200, rail.clone(), thumb(f), badge.clone(), escaped.clone())
+            };
+            let (mut scene, [rail_id, id, ..]) = page(&rail, 0.);
+            let mut at = 0.;
+            for f in 1..=8 {
+                at = f as f32 * 7.37;
+                let (before, was, revision) = (
+                    scene.measure_calls,
+                    scene.bounds(id),
+                    scene.geometry_revision(),
+                );
+                if f % 3 == 0 {
+                    write(&mut scene, id, thumb(at - 3.1));
+                }
+                write(&mut scene, id, thumb(at));
+                let report = scene.flush();
+                assert_eq!(scene.measure_calls, before, "measured nothing at {f}");
+                assert_eq!(report.layout_nodes, 1, "the thumb alone at {f}");
+                let now = scene.bounds(id);
+                assert_ne!(was, now);
+                for rect in [was, now] {
+                    assert!(
+                        report.damage.iter().any(|d| d.intersects(rect)),
+                        "{rect:?} damaged: {:?}",
+                        report.damage
+                    );
+                }
+                assert_ne!(scene.geometry_revision(), revision, "hit tests see it");
+                same_bounds(&scene, &page(&rail, at).0);
+            }
+            // Its rail laid out again: it stays where its inset places it,
+            // and moves on from there.
+            let mut shorter = rail.clone();
+            shorter.height = Some(650.);
+            scene.set_style(rail_id, shorter.clone());
+            scene.flush();
+            same_bounds(&scene, &page(&shorter, at).0);
+            write(&mut scene, id, thumb(3.5));
+            scene.flush();
+            same_bounds(&scene, &page(&shorter, 3.5).0);
+        }
     }
     /// A page of `rows` rows under a few columns, in an overlay 700 high with
     /// an absolute rail over it (`rail`), holding an absolute thumb
@@ -20972,6 +23192,135 @@ mod set_box_tests {
             costs[0].0 <= 6 && costs[0].1 <= 2,
             "the rail alone: {costs:?}"
         );
+    }
+    /// A terminal's rows reordered as its slots take other lines: absolute
+    /// children moved among a column's children measure nothing (their
+    /// places are their own) and stay where a column built in the new order
+    /// puts them. A child in the flow moved lays the column out as before.
+    #[test]
+    fn absolute_children_reordered_measure_nothing() {
+        use crate::layout::{EdgeLengths, LayoutOptions, Length::Px};
+        let column = |order: &[usize]| {
+            let mut scene = Scene::new(800., 600.);
+            scene.set_text_measurer(|text: &str, size: f32, _: Option<f32>| {
+                (text.len() as f32 * size * 0.5, size)
+            });
+            let column = scene.append(
+                scene.root(),
+                NodeKind::Container(Layout::Column),
+                Style {
+                    gap: 3.,
+                    ..Default::default()
+                },
+            );
+            let mut ids = Vec::new();
+            for &at in order {
+                let style = match at {
+                    // In the flow: a line of text, then a box.
+                    0 | 1 => Style {
+                        height: Some(10. + at as f32),
+                        ..Default::default()
+                    },
+                    _ => Style {
+                        absolute: true,
+                        width_percent: Some(1.),
+                        height: Some(19.),
+                        layout_options: Some(Arc::new(LayoutOptions {
+                            inset: EdgeLengths {
+                                left: Some(Px(10.)),
+                                top: Some(Px(at as f32 * 19.)),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                };
+                let row = scene.append(column, NodeKind::Container(Layout::Overlay), style);
+                scene.append(row, label(&format!("row {at}")), Default::default());
+                ids.push((at, row));
+            }
+            scene.flush();
+            (scene, column, ids)
+        };
+        // The absolute rows first, then the flow's two.
+        let first: Vec<usize> = (2..12).chain([0, 1]).collect();
+        let (mut scene, parent, ids) = column(&first);
+        let id_of = |at: usize| ids.iter().find(|(a, _)| *a == at).unwrap().1;
+        // Turned by one, the first row to the end (the flow's two keep
+        // their order).
+        let rotated: Vec<usize> = (3..12).chain([0, 1, 2]).collect();
+        let before = scene.measure_calls;
+        let reordered: Vec<NodeId> = rotated.iter().map(|at| id_of(*at)).collect();
+        assert!(scene.reorder_children(parent, &reordered));
+        scene.flush();
+        assert_eq!(scene.measure_calls, before, "nothing measured");
+        same_bounds_by(&scene, &column(&rotated).0, &rotated);
+        // A child in the flow moved: laid out, as a column built so.
+        let swapped: Vec<usize> = (3..12).chain([1, 0, 2]).collect();
+        let reordered: Vec<NodeId> = swapped.iter().map(|at| id_of(*at)).collect();
+        assert!(scene.reorder_children(parent, &reordered));
+        scene.flush();
+        assert!(scene.measure_calls > before, "the column laid out");
+        same_bounds_by(&scene, &column(&swapped).0, &swapped);
+    }
+    /// A turn by one either way is found as one (`rotated_by`), and moves
+    /// just what the general path's longest increasing run leaves (the one
+    /// child that went round); a longer turn, or anything else, takes the
+    /// general path.
+    #[test]
+    fn a_rotation_moves_what_the_longest_run_leaves() {
+        let ids: Vec<NodeId> = (0..9)
+            .map(|index| NodeId {
+                index,
+                generation: 0,
+            })
+            .collect();
+        let count = ids.len();
+        for by in 1..count {
+            let turned: Vec<NodeId> = ids[by..].iter().chain(&ids[..by]).copied().collect();
+            let one = by == 1 || by == count - 1;
+            assert_eq!(
+                rotated_by(&ids, &turned),
+                one.then_some(by),
+                "turned by {by}"
+            );
+            if one {
+                let places: Vec<usize> = turned.iter().map(|id| id.index as usize).collect();
+                let kept = longest_increasing(&places);
+                let moved: Vec<usize> = (0..count).filter(|at| !kept.contains(at)).collect();
+                // As the reorder works it out from the turn.
+                let tail_stays = count - by >= by;
+                let turn: Vec<usize> = (0..count)
+                    .filter(|at| (*at >= count - by) == tail_stays)
+                    .collect();
+                assert_eq!(moved, turn, "turned by {by}");
+            }
+        }
+        let mut swapped = ids.clone();
+        swapped.swap(2, 5);
+        assert_eq!(rotated_by(&ids, &swapped), None);
+        assert_eq!(rotated_by(&ids, &ids), None);
+        assert_eq!(rotated_by(&ids, &ids[1..]), None);
+    }
+    /// `same_bounds` for scenes whose nodes were made in other orders: the
+    /// rows' (and their labels') boxes, matched by what they are.
+    fn same_bounds_by(live: &Scene, fresh: &Scene, _order: &[usize]) {
+        let boxes = |scene: &Scene| {
+            let mut all: Vec<(String, Rect)> = scene
+                .ids()
+                .filter_map(|id| match scene.kind(id) {
+                    NodeKind::Text { text, .. } => {
+                        let row = scene.node(id).parent.unwrap();
+                        Some((text.to_string(), scene.bounds(row)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            all
+        };
+        assert_eq!(boxes(live), boxes(fresh));
     }
     /// A terminal's screen: an absolute rows box holding one absolute row
     /// per line (its whole width, a cell high), each with an absolute group
@@ -22264,8 +24613,9 @@ mod local_transform_tests {
     /// A full paint walk (no damage, as a resize repaints) passes by what
     /// its clip cuts away: a scroll view's rows out of view give no items,
     /// while one partly in view, and one out of view whose shadow reaches
-    /// into it, do. A recorded walk (a kept frame's list, patched as rows
-    /// come into view) keeps every row.
+    /// into it, do. A recorded walk (a kept frame's list) keeps a short
+    /// list's rows, out of view or not: it leaves out a long list's alone,
+    /// those its search finds can't show (`kept_lists`).
     #[test]
     fn a_full_walk_passes_by_what_its_clip_cuts_away() {
         let mut scene = Scene::new(400., 300.);
@@ -22321,6 +24671,109 @@ mod local_transform_tests {
         for id in [inside, partly, below, reaching] {
             assert!(recorded.contains(&id), "recorded: {id:?}");
         }
+        assert!(scene.ink_may_show(reaching) && !scene.ink_may_show(below));
+    }
+    /// A kept frame's walk and a splice's re-walk of a long list's parent
+    /// cut the list alike: with nothing changed, the splice walks again the
+    /// very rows the keep recorded (those its clip shows), each with what
+    /// it inherited.
+    #[test]
+    fn a_splice_of_a_long_list_walks_the_rows_its_keep_recorded() {
+        let mut scene = Scene::new(400., 300.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        let view = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                clip: true,
+                ..fixed(200., 100.)
+            },
+        );
+        let list = scene.append(view, NodeKind::Container(Layout::Column), Style::default());
+        for i in 0..400u32 {
+            scene.append(
+                list,
+                NodeKind::Quad(QuadStyle {
+                    fill: Color((i % 251) as u8, 9, 9, 255),
+                    ..QuadStyle::default()
+                }),
+                fixed(200., 20.),
+            );
+        }
+        scene.set_transform(list, Transform { x: 0., y: -2000. });
+        scene.flush();
+        let mut inherited = Vec::new();
+        let recorded = scene.layer_items_recorded(&mut inherited);
+        let ids: Vec<NodeId> = recorded.iter().map(|item| item.id).collect();
+        let at = ids
+            .iter()
+            .position(|id| *id == list)
+            .expect("the list recorded");
+        let rows: Vec<NodeId> = ids[at..].to_vec();
+        assert!(
+            rows.len() < 20,
+            "the rows its clip shows, not the list: {}",
+            rows.len()
+        );
+        let mut out = Vec::new();
+        let spliced: Vec<NodeId> = scene
+            .layer_items_from(list, &inherited[at], &mut out)
+            .iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(spliced, rows, "the splice walks the rows the keep did");
+        assert_eq!(out.len(), spliced.len(), "each with what it inherited");
+    }
+    #[test]
+    fn a_long_list_leaves_out_a_row_that_paints_nothing_out_of_view() {
+        let mut scene = Scene::new(400., 300.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        let view = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                clip: true,
+                ..fixed(200., 100.)
+            },
+        );
+        let list = scene.append(view, NodeKind::Container(Layout::Column), Style::default());
+        let mut empty = None;
+        for i in 0..400u32 {
+            let kind = match i {
+                300 => NodeKind::Container(Layout::Overlay),
+                _ => NodeKind::Quad(QuadStyle {
+                    fill: Color((i % 251) as u8, 9, 9, 255),
+                    ..QuadStyle::default()
+                }),
+            };
+            let row = scene.append(list, kind, fixed(200., 20.));
+            if i == 300 {
+                empty = Some(row);
+            }
+        }
+        let empty = empty.unwrap();
+        scene.flush();
+        // A debug build checks each row left out can't show.
+        let mut inherited = Vec::new();
+        let ids: Vec<NodeId> = scene
+            .layer_items_recorded(&mut inherited)
+            .iter()
+            .map(|item| item.id)
+            .collect();
+        assert!(!ids.contains(&empty));
+        assert!(!scene.ink_may_show(empty), "it paints nothing");
+        // Given something to paint, in view, it can show.
+        scene.append(
+            empty,
+            NodeKind::Quad(QuadStyle {
+                fill: Color(9, 9, 9, 255),
+                ..QuadStyle::default()
+            }),
+            fixed(200., 20.),
+        );
+        scene.set_transform(list, Transform { x: 0., y: -6000. });
+        scene.flush();
+        assert!(scene.ink_may_show(empty));
     }
     #[test]
     fn colour_filters_compose_down_the_tree_without_layers() {
@@ -22599,6 +25052,168 @@ mod local_transform_tests {
         scene.set_mask_offset(id, (1., 1.));
         assert!(scene.flush().is_idle());
     }
+
+    /// `resource_changes` names, flush by flush, the nodes removed, each of
+    /// a subtree, and no other: nodes appended or given another kind (an
+    /// image replaced, a canvas or text redrawn, a box recoloured, as a
+    /// terminal's rows and an animation's characters are every frame) a
+    /// renderer learns of as it draws and checks them. Kept until read,
+    /// however many flushes; past its bound, given up, and its range starts
+    /// past the gap.
+    /// A removed subtree is named whole to a renderer, its root first,
+    /// walked into the list it is noted in (`removing_subtree`): no list of
+    /// its own, and noted after what was noted before.
+    #[test]
+    fn a_removed_subtree_is_named_whole_after_what_was_noted_before() {
+        let mut scene = Scene::new(400., 400.);
+        let root = scene.root();
+        scene.resource_changes();
+        let row = |scene: &mut Scene| {
+            let row = scene.append(root, NodeKind::Container(Layout::Row), Style::default());
+            let cell = scene.append(row, NodeKind::Container(Layout::Column), Style::default());
+            let leaves: Vec<_> = (0..3)
+                .map(|_| scene.append(cell, NodeKind::Container(Layout::Row), Style::default()))
+                .collect();
+            (row, cell, leaves)
+        };
+        let (first, first_cell, first_leaves) = row(&mut scene);
+        let (second, second_cell, _) = row(&mut scene);
+        scene.flush();
+        scene.resource_changes();
+        scene.remove(first);
+        scene.remove(second);
+        let (_, changed) = scene.resource_changes();
+        assert_eq!(changed.len(), 10, "both subtrees, whole");
+        assert_eq!(
+            &changed[..2],
+            &[first, first_cell],
+            "the first's root, then its child"
+        );
+        assert_eq!(&changed[2..5], &first_leaves[..]);
+        assert_eq!(&changed[5..7], &[second, second_cell], "then the second's");
+    }
+    #[test]
+    fn resource_changes_name_the_nodes_whose_resources_changed() {
+        let image = |n: u8| Arc::new(crate::image::ImageData::new(1, 1, vec![n; 4]).unwrap());
+        let mut scene = Scene::new(100., 100.);
+        let root = scene.root();
+        scene.resource_changes();
+        // Read every flush: the range reaches back to the last read, and on
+        // to this flush.
+        let changed = |scene: &mut Scene| {
+            scene.flush();
+            let (covered, changed) = scene.resource_changes();
+            assert!(*covered.start() <= scene.repaint_flushes);
+            assert_eq!(*covered.end(), scene.repaint_flushes);
+            changed.to_vec()
+        };
+        let text = scene.append(
+            root,
+            NodeKind::Text {
+                text: "a".into(),
+                color: Color(0, 0, 0, 255),
+                font_size: 13.,
+            },
+            Style::default(),
+        );
+        assert_eq!(changed(&mut scene), [], "text added");
+        scene.set_kind(
+            text,
+            NodeKind::Text {
+                text: "b".into(),
+                color: Color(0, 0, 0, 255),
+                font_size: 13.,
+            },
+        );
+        assert_eq!(changed(&mut scene), [], "text changed");
+        let picture = scene.append(root, NodeKind::Image(image(1)), Style::default());
+        assert_eq!(changed(&mut scene), [], "image added");
+        scene.set_kind(picture, NodeKind::Image(image(2)));
+        assert_eq!(changed(&mut scene), [], "image replaced");
+        let backed = |n| {
+            NodeKind::Quad(QuadStyle {
+                decoration: Some(Arc::new(crate::decoration::Decoration {
+                    background: Some(crate::decoration::Background::Image {
+                        image: image(n),
+                        fit: Default::default(),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        };
+        let quad = scene.append(root, NodeKind::Quad(QuadStyle::default()), Style::default());
+        assert_eq!(changed(&mut scene), [], "a plain box added");
+        scene.set_kind(
+            quad,
+            NodeKind::Quad(QuadStyle {
+                fill: Color(1, 2, 3, 255),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(changed(&mut scene), [], "a box recoloured");
+        scene.set_kind(quad, backed(3));
+        assert_eq!(changed(&mut scene), [], "a background image given");
+        scene.set_kind(quad, NodeKind::Quad(QuadStyle::default()));
+        assert_eq!(changed(&mut scene), [], "a background image taken");
+        scene.set_mask(
+            quad,
+            Some(ImageMask {
+                image: image(4),
+                offset: (0., 0.),
+                size: (1., 1.),
+            }),
+        );
+        assert_eq!(changed(&mut scene), [], "a mask given");
+        scene.remove(text);
+        assert_eq!(changed(&mut scene), [text], "a node removed");
+        let canvas = scene.append(root, NodeKind::Canvas(Default::default()), Style::default());
+        assert_eq!(changed(&mut scene), [], "a canvas added");
+        scene.set_kind(canvas, NodeKind::Canvas(Default::default()));
+        assert_eq!(changed(&mut scene), [], "a canvas redrawn");
+        let column = scene.append(root, NodeKind::Container(Layout::Column), Style::default());
+        let inner = scene.append(
+            column,
+            NodeKind::Container(Layout::Column),
+            Style::default(),
+        );
+        let leaf = scene.append(inner, NodeKind::Container(Layout::Column), Style::default());
+        changed(&mut scene);
+        scene.remove(column);
+        let mut gone = changed(&mut scene);
+        gone.sort_by_key(|id| id.index);
+        let mut subtree = vec![column, inner, leaf];
+        subtree.sort_by_key(|id| id.index);
+        assert_eq!(gone, subtree, "each node of a subtree removed");
+        // Read again some flushes on: all since.
+        let read = scene.repaint_flushes;
+        scene.remove(picture);
+        for _ in 0..=REPAINTS_UNREAD {
+            scene.flush();
+        }
+        let (covered, noted) = scene.resource_changes();
+        let flushes = u64::from(REPAINTS_UNREAD) + 1;
+        assert_eq!(
+            (covered, noted),
+            (read + 1..=read + flushes, &[picture][..])
+        );
+        // Past the bound: those noted are given up, and the range says so.
+        let many = scene.append(root, NodeKind::Container(Layout::Column), Style::default());
+        for _ in 0..REPAINTS_KEPT {
+            scene.append(many, NodeKind::Container(Layout::Column), Style::default());
+        }
+        changed(&mut scene);
+        let read = scene.repaint_flushes;
+        scene.remove(many);
+        scene.remove(quad);
+        scene.flush();
+        let (covered, noted) = scene.resource_changes();
+        assert!(noted.is_empty(), "given up past the bound");
+        assert!(*covered.start() > read + 1, "past the gap");
+        // And noted again once read.
+        scene.remove(canvas);
+        assert_eq!(changed(&mut scene), [canvas]);
+    }
 }
 
 #[cfg(test)]
@@ -22712,4 +25327,247 @@ fn rect_minus(outer: Rect, inner: Rect) -> impl Iterator<Item = Rect> {
     ]
     .into_iter()
     .filter(|rect| rect.width > 0. && rect.height > 0.)
+}
+#[cfg(test)]
+mod leaf_move_tests {
+    use super::*;
+
+    /// A column (clipping or not) of leaves (boxes, panels with a shadow
+    /// past their clip) and a group of two: the scene the comparisons run.
+    fn built(scene: &mut Scene) -> (NodeId, NodeId, NodeId, Vec<NodeId>) {
+        let column = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Column),
+            Style {
+                width: Some(300.),
+                height: Some(16_000.),
+                ..Default::default()
+            },
+        );
+        let shadow = BoxShadow {
+            color: Color(0, 0, 0, 128),
+            offset: Transform { x: 3., y: 5. },
+            blur_radius: 6.,
+            spread: 1.,
+        };
+        let mut leaves: Vec<NodeId> = (0..200)
+            .map(|i| {
+                let style = Style {
+                    width: Some(40. + (i % 5) as f32 * 17.3),
+                    height: Some(12.4 + (i % 3) as f32 * 0.6),
+                    clip: i % 7 == 0,
+                    margin: Insets {
+                        top: 40.,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let kind = match i % 3 {
+                    // Some text: damaged by its ink (`text_ink`).
+                    0 if i % 2 == 0 => NodeKind::Text {
+                        text: format!("row {i}").into(),
+                        color: Color(0, 0, 0, 255),
+                        font_size: 12.,
+                    },
+                    0 => NodeKind::Rect(Color(1, 2, 3, 255)),
+                    _ => NodeKind::Panel {
+                        layout: Layout::Overlay,
+                        quad: QuadStyle {
+                            fill: Color(9, 200, 9, 255),
+                            radius: 4.,
+                            shadow: (i % 3 == 1).then_some(shadow),
+                            ..Default::default()
+                        },
+                    },
+                };
+                scene.append(column, kind, style)
+            })
+            .collect();
+        let group = scene.append(
+            column,
+            NodeKind::Container(Layout::Row),
+            Style {
+                width: Some(120.),
+                height: Some(30.),
+                ..Default::default()
+            },
+        );
+        for _ in 0..2 {
+            leaves.push(scene.append(
+                group,
+                NodeKind::Rect(Color(200, 9, 9, 255)),
+                Style {
+                    width: Some(50.),
+                    height: Some(20.),
+                    ..Default::default()
+                },
+            ));
+        }
+        // Beside the column, unrelated to what moves: scaled now and then,
+        // which turns every move over to the walks (`transformed`).
+        let badge = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(9, 9, 200, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        (column, group, badge, leaves)
+    }
+
+    /// What a frame of `step` damages, with moved leaves damaged together
+    /// (`leaf`) or by the two subtree walks: frame by frame, the damage and
+    /// where everything is.
+    /// Each frame's damage and where the leaves are.
+    type Frames = Vec<(Vec<Rect>, Vec<Rect>)>;
+
+    /// Also: moves made while something was transformed, and text moves.
+    fn frames(seed: u64, steps: usize, leaf: bool) -> (Frames, [u64; 2], [u64; 2]) {
+        let mut scene = Scene::new(400.5, 16_000.25);
+        scene.leaf_moves_off = !leaf;
+        let (column, group, badge, leaves) = built(&mut scene);
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut next = move |n: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        let mut out = Vec::new();
+        let mut walked = [0; 2];
+        for _ in 0..steps {
+            let moves = match next(6) {
+                // Every leaf: more than the list holds, so the grid takes them.
+                0 => leaves.len(),
+                _ => 1 + next(4) as usize,
+            };
+            for _ in 0..moves {
+                let id = leaves[next(leaves.len() as u64) as usize];
+                walked[0] += (scene.transformed > 0) as u64;
+                walked[1] += matches!(scene.node(id).kind, NodeKind::Text { .. }) as u64;
+                // Within its own gap down the column: apart from its
+                // neighbours' areas, so a frame moving every leaf leaves more
+                // areas than the list holds.
+                let x = next(120) as f32 * 0.37 - 20.;
+                let y = next(60) as f32 * 0.29 - 8.;
+                scene.set_transform(id, Transform { x, y });
+            }
+            match next(10) {
+                0 => scene.set_transform(
+                    group,
+                    Transform {
+                        x: next(30) as f32 * 1.5,
+                        y: 2.25,
+                    },
+                ),
+                1 => {
+                    let mut style = scene.style(column).clone();
+                    style.clip = !style.clip;
+                    scene.set_style(column, style);
+                }
+                2 => {
+                    let id = leaves[next(leaves.len() as u64) as usize];
+                    let mut style = scene.style(id).clone();
+                    let mut options = style.layout_options.as_deref().cloned().unwrap_or_default();
+                    options.visible = Some(options.visible == Some(false));
+                    style.layout_options = Some(Arc::new(options));
+                    scene.set_style(id, style);
+                }
+                3 => {
+                    let id = leaves[next(leaves.len() as u64) as usize];
+                    let effects = Effects {
+                        blur_radius: next(2) as f32 * 4.,
+                        ..Default::default()
+                    };
+                    scene.set_effects(id, effects);
+                }
+                4 => {
+                    // Something filtered: no move takes the leaf path.
+                    let effects = Effects {
+                        filter_blur: next(2) as f32 * 3.,
+                        ..Default::default()
+                    };
+                    scene.set_effects(group, effects);
+                }
+                5 => {
+                    let local = match next(2) {
+                        0 => LocalTransform::IDENTITY,
+                        _ => LocalTransform {
+                            scale: (1.5, 1.5),
+                            ..LocalTransform::IDENTITY
+                        },
+                    };
+                    scene.set_local_transform(badge, local);
+                }
+                _ => {}
+            }
+            // In any order: a leaf's two areas added as one (or one after
+            // the other) can leave the list's rectangles in another order.
+            let mut damage = scene.flush().damage;
+            damage.sort_by(|a, b| {
+                [a.x, a.y, a.width, a.height]
+                    .partial_cmp(&[b.x, b.y, b.width, b.height])
+                    .unwrap()
+            });
+            let bounds = leaves.iter().map(|id| scene.bounds(*id)).collect();
+            out.push((damage, bounds));
+        }
+        (out, scene.leaf_moves, walked)
+    }
+
+    /// Leaves moved by `set_transform` (boxes, panels and text, with the
+    /// grid taking them or not, clipped, hidden, blurred behind, beside a
+    /// moved group, a filtered one and a scaled one) damage, frame by frame,
+    /// the same rectangles to the bit as the two subtree walks did.
+    #[test]
+    fn moved_leaves_damage_what_the_walks_did() {
+        let (mut taken, mut moved) = ([0; 2], [0; 2]);
+        for seed in 0..40 {
+            let (leaf, counted, also) = frames(seed, 30, true);
+            let (walked, none, _) = frames(seed, 30, false);
+            assert_eq!(leaf, walked, "seed {seed}");
+            assert_eq!(none, [0; 2], "the walks' run took no leaf path");
+            taken = [taken[0] + counted[0], taken[1] + counted[1]];
+            moved = [moved[0] + also[0], moved[1] + also[1]];
+        }
+        // Both ways ran: to the list, and to the grid's cells.
+        assert!(taken[1] > 1_000 && taken[0] - taken[1] > 1_000, "{taken:?}");
+        // Moves while something was transformed (walked instead), and
+        // text moved (damaged by its ink).
+        assert!(moved[0] > 100 && moved[1] > 100, "{moved:?}");
+    }
+
+    /// A leaf moved alone is damaged where it was and where it lands, as one
+    /// area when they share a column and overlap.
+    #[test]
+    fn a_leaf_moved_down_a_little_damages_one_area() {
+        let mut scene = Scene::new(400., 300.);
+        let leaf = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(1, 2, 3, 255)),
+            Style {
+                width: Some(40.),
+                height: Some(10.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_transform(leaf, Transform { x: 0., y: 4. });
+        assert_eq!(scene.flush().damage, [Rect::new(0., 0., 40., 14.)]);
+    }
+}
+/// An id for a node outside any scene: `zgx-dom`'s, by its DOM node.
+#[cfg(feature = "dom")]
+impl NodeId {
+    pub(crate) fn outside(index: u32) -> NodeId {
+        NodeId {
+            index,
+            generation: u32::MAX,
+        }
+    }
 }

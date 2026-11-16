@@ -10,14 +10,9 @@
 //! to hand it over late in the refresh, and what follows has no time left,
 //! where what comes before it spends only that wait. A host that doesn't (a headless one) has none of this: its
 //! lists build the rows in view and their overscan, and drop the rest.
+use crate::time::Instant;
 use crate::{reactive::Signal, scene::NodeId};
-use std::{
-    cell::Cell,
-    hash::Hash,
-    ops::Range,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{cell::Cell, hash::Hash, ops::Range, rc::Rc, time::Duration};
 
 /// Viewports of rows built beyond each edge of the view, unless a list says.
 pub(crate) const AHEAD_VIEWPORTS: f32 = 1.;
@@ -391,7 +386,10 @@ impl<K: Eq + Hash + Clone> Kept<K> {
                 self.unasked = true;
             }
         }
-        let pictures = self.unasked && crate::image::ahead_room();
+        // At rest it asks for none, as a list with no spare time: what it let
+        // go of is no longer its to ask for, though room comes back for the
+        // process's decodes ahead while it rests.
+        let pictures = self.unasked && !self.ahead.resting.get() && crate::image::ahead_room();
         ui.list_wants(&self.ahead, next.is_some() || pictures);
         drop(in_view);
         kept.extend(shown);

@@ -1,37 +1,70 @@
 name: Rust
+
+# Every pull request push and every push to main, in four stages:
+#
+#   plan    which of linux, perf, macos and windows the change needs
+#           (.github/ci/plan.py, which has the rules): docs, the site and the
+#           changelog run nothing; code built for one platform alone runs
+#           that platform's job; tests run the three platform jobs; anything
+#           else (the crates, vendor/, Cargo.*, CI itself) runs all four. A
+#           change it can't list runs everything. perf runs on a pull request
+#           only when the change touches what its scenes run, or with the
+#           `ci:perf` label (add it, then re-run); on main with every run.
+#   admit   waits until every runner the run needs is free (.github/ci/admit.py).
+#   jobs    linux, perf, macos and windows, all started together once admitted.
+#   result  "CI result": passes when every job passed or was skipped, fails on
+#           a failure or a cancellation. The one check to require.
+#
+# Beside it: perf-base.yml builds perf's binaries for each push to main, for
+# pull requests to measure against without building their base, and
+# ci-caches.yml keeps the 10 GB of Actions cache for what main restores.
+#
+# Admission is shared with zeronsh/zeron. Both repositories' CI runs on the
+# organization's one pool of hosted runners (20 jobs at once, 5 of them
+# macOS). GitHub starts any queued job when a runner frees up, so under load
+# every run got some of its jobs going and held those runners while the rest
+# queued behind other runs' jobs: hours of queue for everyone. Now a run's
+# `admit` job waits until the runners for the whole run fit in the budget,
+# then all of its jobs start; each runner is released when its job ends. Runs
+# are served first come, first served, across both repositories: the admit
+# job's name carries the run's reservation (`admit [linux=3 windows=1
+# macos=1] #123`), which every waiting run, here and in zeron, reads.
+# zeron's runs list this workflow as a peer by its file name (ci.yml): keep
+# it. admit.py is zeron's scripts/ci/admit.py, vendored unchanged: change it
+# there first (see its header). zeron's docs/reference/ci.md has the details.
+#
+# Labels on a pull request (adding one needs the triage role):
+#   ci:perf      run perf even though the change doesn't touch what it measures
+#   ci:priority  the pull request's runs go to the front of the shared queue
+#   ci:lock      a full run's worth of runners kept for the pull request until
+#                it's merged, closed or unlabelled, or CI_LOCK_HOURS pass
+# (Labels are read when the run starts: re-run after adding one.)
+#
+# Repository variables (all optional), the same as zeron's:
+#   CI_BUDGET_TOTAL      hosted runners all admitted runs may hold at once (20, the org limit)
+#   CI_BUDGET_MACOS      ... macOS runners (5, the org limit)
+#   CI_BUDGET_WINDOWS    ... Windows runners (10, so Linux keeps half)
+#   CI_ADMISSION         off: start every run at once (the kill switch)
+#   CI_DEBOUNCE_SECONDS  a pull request run waits this long for further pushes first (60)
+#   CI_LOCK_HOURS        how long a ci:lock label holds runners (6)
+#   CI_PEERS             the other repositories in the queue (zeronsh/zeron:ci.yml)
+#   CI_SEE_OUTSIDE       off: ignore runs of other workflows (releases, the site)
+# Admission never blocks CI: after 2 hours, or when the API fails, a run starts.
 on:
   push:
     branches: [main]
-    paths:
-      - "**"
-      - "!site/**"
-      - "!website/**"
-      - "!.github/workflows/site.yml"
-      - "!**/*.md"
-      # Markdown compiled as doctests.
-      - "README.md"
-      - "docs/3d.md"
-      - "docs/composition.md"
-      - "docs/i18n.md"
-      - "docs/styling.md"
-      - "docs/window-controls.md"
   pull_request:
-    paths:
-      - "**"
-      - "!site/**"
-      - "!website/**"
-      - "!.github/workflows/site.yml"
-      - "!**/*.md"
-      # Markdown compiled as doctests.
-      - "README.md"
-      - "docs/3d.md"
-      - "docs/composition.md"
-      - "docs/i18n.md"
-      - "docs/styling.md"
-      - "docs/window-controls.md"
-# A newer push to a PR supersedes its running check. On main every run
-# finishes (a full signal per commit, and the caches it saves); a newer
-# push waits, replacing any run still waiting.
+  # Everything, on any branch.
+  workflow_dispatch:
+# A newer push to a PR supersedes its running check (and a waiting one stops
+# waiting). On main every run finishes (a full signal per commit, and the
+# caches and perf binaries it saves); a newer push waits, replacing any run
+# still waiting. perf's base binaries for the commits skipped that way come
+# from perf-base.yml, which builds them for every push to main.
+# A cancelled run still runs its `CI result` job (`if: always()`), and the
+# next run in the group waits for it. If that ever holds new runs up, zeron's
+# answer is a group per run, with ci-supersede.yml force-cancelling the older
+# runs of a pull request (zeronsh/zeron .github/workflows/ci-supersede.yml).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -39,11 +72,83 @@ concurrency:
 env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  # Runners have no GPU, where windows draw on the software raster by
+  # default (`ZGX_RENDERER=auto`): tests and probes test the GPU renderer
+  # (lavapipe, WARP); raster-window and the *-raster probes the raster.
+  ZGX_RENDERER: gpu
 jobs:
+  # Named `plan`: admission (admit.py) leaves a job of that name out of reservations.
+  plan:
+    # ubuntu-24.04, not -latest, as every job here: -latest moved to 26.04
+    # (Mesa 26) on Nov 14, where lavapipe's tests and probes fail (see linux).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      jobs: ${{ steps.plan.outputs.jobs }}
+      reservation: ${{ steps.plan.outputs.reservation }}
+      pr: ${{ steps.plan.outputs.pr }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Planner and admission tests
+        run: python3 -m unittest discover -s .github/ci -p 'test_*.py'
+      - id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I .github/ci/plan.py
+
+  # Skipped when no job runs (only `CI result`, which needs no admission).
+  admit:
+    name: "admit [${{ needs.plan.outputs.reservation }}]${{ needs.plan.outputs.pr != '' && format(' #{0}', needs.plan.outputs.pr) || '' }}"
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
+    # ubuntu-24.04, not -latest, as every job here: -latest moved to 26.04
+    # (Mesa 26) on Nov 14, where lavapipe's tests and probes fail (see linux).
+    runs-on: ubuntu-24.04
+    # GitHub stops a hosted job at 6 hours; admit.py lets the run start after MAX_WAIT_MINUTES.
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read  # ci:priority / ci:lock labels and pull request heads
+      issues: read  # when ci:lock was added
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/ci
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_RESERVATION: ${{ needs.plan.outputs.reservation }}
+          CI_BUDGET_TOTAL: ${{ vars.CI_BUDGET_TOTAL }}
+          CI_BUDGET_MACOS: ${{ vars.CI_BUDGET_MACOS }}
+          CI_BUDGET_WINDOWS: ${{ vars.CI_BUDGET_WINDOWS }}
+          CI_ADMISSION: ${{ vars.CI_ADMISSION }}
+          CI_DEBOUNCE_SECONDS: ${{ vars.CI_DEBOUNCE_SECONDS }}
+          CI_LOCK_HOURS: ${{ vars.CI_LOCK_HOURS }}
+          # The other repository with admitted CI on the same runners: one queue, one budget.
+          # (Read with this token: it's public. Its other workflows, and this repository's,
+          # count as holding what they run; CI_SEE_OUTSIDE=off ignores them.)
+          CI_PEERS: ${{ vars.CI_PEERS || 'zeronsh/zeron:ci.yml' }}
+          CI_SEE_OUTSIDE: ${{ vars.CI_SEE_OUTSIDE }}
+          # The pull request's head as this run tests it: a newer push supersedes the run.
+          CI_PR: ${{ needs.plan.outputs.pr }}
+          CI_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MAX_WAIT_MINUTES: 120
+        run: python3 -I .github/ci/admit.py
+
   # Checks, unit tests, Vulkan rendering and every native Linux probe in one
   # job: the examples the tests build are the probes' fixtures.
   linux:
-    runs-on: ubuntu-latest
+    needs: [plan, admit]
+    if: fromJSON(needs.plan.outputs.jobs).linux
+    # ubuntu-24.04, not -latest: on 26.04 (Mesa 26) the GPU tests and
+    # native probes on lavapipe fail (zink, a SIGSEGV); moved by GitHub on Nov 14.
+    runs-on: ubuntu-24.04
     # A cold cache (a release's version bump changes Cargo.lock) takes about
     # twice a warm one's 21 minutes.
     timeout-minutes: 60
@@ -72,28 +177,12 @@ jobs:
           key: apt-${{ runner.arch }}-${{ steps.apt-key.outputs.month }}-${{ hashFiles('.github/linux-packages.txt') }}
           # A changed package list still starts from the last month's .debs.
           restore-keys: apt-${{ runner.arch }}-
-      # A stalled mirror fails fast and retries rather than holding the job;
-      # the whole install is tried three times before the job gives up.
+      # Three tries, off the Azure mirror when it stops resolving
+      # (.github/apt-install.sh).
       - name: Linux packages
         id: linux-packages
         timeout-minutes: 15
-        run: |
-          sudo rm -f /var/lib/man-db/auto-update
-          if [ -d ~/apt-archives ]; then sudo cp ~/apt-archives/*.deb /var/cache/apt/archives/; fi
-          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
-          for attempt in 1 2 3; do
-            if sudo apt-get update -qq $apt &&
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $apt $(grep -v '^#' .github/linux-packages.txt); then
-              break
-            fi
-            if [ "$attempt" = 3 ]; then
-              echo "::error::apt-get couldn't install .github/linux-packages.txt in three tries"
-              exit 1
-            fi
-            echo "::warning::apt-get failed (try $attempt of 3); trying again"
-            sleep 20
-          done
-          mkdir -p ~/apt-archives && cp /var/cache/apt/archives/*.deb ~/apt-archives/
+        run: sh .github/apt-install.sh $(grep -v '^#' .github/linux-packages.txt)
       - uses: actions/cache/save@v4
         if: steps.apt-cache.outputs.cache-hit != 'true'
         with:
@@ -174,8 +263,97 @@ jobs:
       - run: cargo test -p zgx -p zgx-components -p zgx-desktop -p zgx-workload -p zgx-script --all-targets --features zgx-script/scene3d --locked
       # Terminal sessions on real ptys (openpty, ConPTY): exact cells, input, exits.
       - run: cargo test -p zgx-terminal --locked
+      # Real programs on a real pty, driven by the keys the view sends
+      # (zgx-terminal's ignored `real_programs` tests): vim, less and git
+      # from the image, htop, tmux and fzf from linux-packages.txt, nvim and
+      # lazygit from their releases (24.04's nvim, 0.9, doesn't ask the
+      # terminal what it can do; lazygit isn't packaged), pinned by version
+      # and checksum and kept between runs. A missing program fails its test.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/nvim-0.11.4
+            ~/.local/lazygit-0.44.1
+          key: terminal-programs-nvim-0.11.4-lazygit-0.44.1-linux-x86_64
+      - name: Terminal programs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # fetch DIR REPO TAG ASSET SHA256: the asset checked, then unpacked.
+          fetch() {
+            if [ ! -d "$1" ]; then
+              mkdir -p "$(dirname "$1")"
+              scripts/fetch_release.sh "$2" "$3" "$4" "$1.tar.gz"
+              echo "$5  $1.tar.gz" | sha256sum --check --strict -
+              mkdir -p "$1.part"
+              tar xzf "$1.tar.gz" -C "$1.part"
+              mv "$1.part" "$1"
+              rm "$1.tar.gz"
+            fi
+          }
+          nvim="$HOME/.local/nvim-0.11.4"
+          lazygit="$HOME/.local/lazygit-0.44.1"
+          fetch "$nvim" neovim/neovim v0.11.4 nvim-linux-x86_64.tar.gz \
+            a74740047e73b2b380d63a474282814063d10650cd6cc95efa16d1713c7e616c
+          fetch "$lazygit" jesseduffield/lazygit v0.44.1 lazygit_0.44.1_Linux_x86_64.tar.gz \
+            84682f4ad5a449d0a3ffbc8332200fe8651aee9dd91dcd8d87197ba6c2450dbc
+          ZGX_TUI_PATH="$nvim/nvim-linux-x86_64/bin:$lazygit" \
+            cargo test -p zgx-terminal --lib --locked real_programs -- --ignored
       # The optional effects package: every effect drawn, on each job's backend.
       - run: cargo test -p zgx-fx --locked
+      # zgx-dom: views as browser DOM, on wasm32. Its lints (zgx's `dom`
+      # plumbing with them), the table benchmark built, and its tests in
+      # headless Chrome: the image's Chrome and chromedriver, and the
+      # wasm-bindgen-test-runner of the wasm-bindgen Cargo.lock pins, kept
+      # between runs.
+      - id: wasm-bindgen
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/wasm-bindgen-${{ steps.wasm-bindgen.outputs.version }}
+          key: wasm-bindgen-cli-${{ steps.wasm-bindgen.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+      - name: zgx-dom on wasm32
+        env:
+          WASM_BINDGEN: ${{ steps.wasm-bindgen.outputs.version }}
+        run: |
+          rustup target add wasm32-unknown-unknown
+          root="$HOME/.local/wasm-bindgen-$WASM_BINDGEN"
+          if [ ! -x "$root/bin/wasm-bindgen-test-runner" ]; then
+            cargo install wasm-bindgen-cli --version "$WASM_BINDGEN" --locked --root "$root"
+          fi
+          cargo clippy -p zgx-dom --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+          cargo build -p zgx-dom --example bench --target wasm32-unknown-unknown --release --locked
+          CHROMEDRIVER="$(command -v chromedriver || echo "$CHROMEWEBDRIVER/chromedriver")" \
+            CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$root/bin/wasm-bindgen-test-runner" \
+            cargo test -p zgx-dom --target wasm32-unknown-unknown --locked
+      # Luau apps in the browser (zgx-dom's `luau`): Luau's C++ built with
+      # wasi-sdk (`luau-env.sh`), kept between runs and fetched with
+      # retries; its tests in release, as a debug Luau VM takes too long to
+      # load and run in a browser.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/wasi-sdk-34.0
+          key: wasi-sdk-34.0-${{ runner.os }}-${{ runner.arch }}
+      - name: Luau on wasm32
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WASM_BINDGEN: ${{ steps.wasm-bindgen.outputs.version }}
+        run: |
+          sdk="$HOME/.local/wasi-sdk-34.0"
+          if [ ! -x "$sdk/bin/clang" ]; then
+            scripts/fetch_release.sh WebAssembly/wasi-sdk wasi-sdk-34 wasi-sdk-34.0-x86_64-linux.tar.gz "$sdk.tar.gz"
+            mkdir -p "$sdk"
+            tar xzf "$sdk.tar.gz" -C "$sdk" --strip-components=1
+          fi
+          export WASI_SDK="$sdk"
+          . crates/zgx-dom/luau-env.sh
+          cargo clippy -p zgx-dom --features luau --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+          CHROMEDRIVER="$(command -v chromedriver || echo "$CHROMEWEBDRIVER/chromedriver")" \
+            CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$HOME/.local/wasm-bindgen-$WASM_BINDGEN/bin/wasm-bindgen-test-runner" \
+            cargo test --release -p zgx-dom --features luau --test luau --target wasm32-unknown-unknown --locked
       # zgx-script's tests with all its features, as an app built by zgx-run
       # has them (scene3d, i18n, gltf, inspect): ICU's plural rules change
       # what the i18n lint finds, and each feature may add lazy `ui`
@@ -312,8 +490,14 @@ jobs:
   # Exact instruction counts (cachegrind) of the CPU-only headless scenes
   # against the PR's base, as a PR comment; more than +1% fails. On main,
   # against the commit before (no failure), which also keeps its cache.
+  # On a pull request only when the change touches what the scenes run, or
+  # with the `ci:perf` label (.github/ci/plan.py); on main with every run.
   perf:
-    runs-on: ubuntu-latest
+    needs: [plan, admit]
+    if: fromJSON(needs.plan.outputs.jobs).perf
+    # ubuntu-24.04, as perf-base.yml's: the gate compares counts made on one
+    # image, and the linux job's is pinned (-latest moved to 26.04 on Nov 14).
+    runs-on: ubuntu-24.04
     # With the base's binaries not cached, both sides build: the head's took
     # 19 minutes and the base's was cut at 26 (Nov 7, as scenes grew); the
     # inlining check adds a MIR build of three crates.
@@ -321,6 +505,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: read  # main's kept binaries (Actions cache entries)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -338,13 +523,7 @@ jobs:
           restore-keys: apt-perf-${{ runner.arch }}-
       - name: Packages
         timeout-minutes: 10
-        run: |
-          sudo rm -f /var/lib/man-db/auto-update
-          if [ -d ~/apt-archives ]; then sudo cp ~/apt-archives/*.deb /var/cache/apt/archives/; fi
-          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
-          sudo apt-get update -qq $apt
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $apt valgrind cmake pkg-config fonts-dejavu-core libdbus-1-dev libfontconfig1-dev libwayland-dev libxcb1-dev libxkbcommon-dev libxrandr-dev
-          mkdir -p ~/apt-archives && cp /var/cache/apt/archives/*.deb ~/apt-archives/
+        run: sh .github/apt-install.sh valgrind cmake pkg-config fonts-dejavu-core libdbus-1-dev libfontconfig1-dev libwayland-dev libxcb1-dev libxkbcommon-dev libxrandr-dev
       - uses: actions/cache/save@v4
         if: steps.apt-cache.outputs.cache-hit != 'true'
         with:
@@ -416,12 +595,31 @@ jobs:
         continue-on-error: true
         with:
           path: ${{ runner.temp }}/gate-bin
-          key: gate-bin-${{ github.sha }}
+          key: gate-bin-u24-${{ github.sha }}
       - run: rm -rf "$RUNNER_TEMP/gate-bin"
+      # The base's binaries as main kept them (perf-base.yml, or main's own
+      # perf job): the base's own, or else those of the newest kept commit
+      # that differs from it in nothing perf builds (a docs-only push keeps
+      # none), stamped as the base's. None found, and the gate builds the base.
+      - name: Base binaries kept on main
+        id: kept
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.base.outputs.sha }}
+        run: python3 .github/ci/gate_base.py pick "$BASE" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
+        if: steps.kept.outputs.key != ''
         with:
           path: ${{ runner.temp }}/gate-bin
-          key: gate-bin-${{ steps.base.outputs.sha }}
+          key: ${{ steps.kept.outputs.key }}
+      - name: The kept binaries stand for the base's
+        if: steps.kept.outputs.from != '' && steps.kept.outputs.from != steps.base.outputs.sha
+        continue-on-error: true
+        env:
+          FROM: ${{ steps.kept.outputs.from }}
+          BASE: ${{ steps.base.outputs.sha }}
+        run: python3 .github/ci/gate_base.py adopt "$RUNNER_TEMP/gate-bin" "$FROM" "$BASE"
       - name: Instruction counts
         env:
           ZGX_GATE_TARGET: target/perf-gate
@@ -491,17 +689,21 @@ jobs:
           if [ "$status" != 0 ]; then exit "$status"; fi
           exit "$inline"
   macos:
+    needs: [plan, admit]
+    if: fromJSON(needs.plan.outputs.jobs).macos
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Also here: a change to macOS-only code runs this job without the Linux one.
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test -p zgx -p zgx-components -p zgx-desktop -p zgx-workload --all-targets --locked
       # Text in every script, shaped in the system's own fonts.
@@ -576,6 +778,8 @@ jobs:
   # Compile everything and run the core unit tests; native Windows probes and
   # the GPU suite run on developer machines.
   windows:
+    needs: [plan, admit]
+    if: fromJSON(needs.plan.outputs.jobs).windows
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -584,10 +788,14 @@ jobs:
         with:
           fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Also here: a change to Windows-only code runs this job without the Linux one.
+      - run: cargo fmt --all -- --check
       # Clippy compiles what `cargo check` would, and lints the Windows-only
       # code Linux and macOS never build; WebView2 (off by default) with it.
       - run: cargo clippy --workspace --all-targets --features zgx-desktop/webview2 --locked -- -D warnings
@@ -616,6 +824,18 @@ jobs:
       - run: "cargo test -p zgx-script --test state --test tooling --locked -- upload:: test_cli:: reference_docs::"
       # Terminal sessions on real ptys (openpty, ConPTY): exact cells, input, exits.
       - run: cargo test -p zgx-terminal --locked
+      # Real programs through ConPTY, from the image (zgx-terminal's ignored
+      # `real_programs` tests, built by the step above): PowerShell 7 with
+      # PSReadLine, cmd and Git Bash with less. A missing program fails its
+      # test; the count proves all three ran.
+      - name: Programs through ConPTY
+        shell: bash
+        run: |
+          t=session::real_programs_tests
+          cargo test -p zgx-terminal --lib --locked -- --ignored --exact \
+            $t::powershell_runs_completes_and_recalls $t::cmd_runs_commands $t::git_bash_runs_and_pages \
+            2>&1 | tee programs.txt
+          grep -q "test result: ok. 3 passed" programs.txt
       # The swap chain's alpha (opaque windows aren't blended by DWM, #513)
       # and the event loop's wake by an event handle (#478): Windows only.
       - run: cargo test -p zgx-desktop --test opaque_swap_chain --test proxy_wake --test early_context --locked
@@ -628,6 +848,9 @@ jobs:
       # one at a time: run together on the runner's three cores, five busy
       # tests kept the watchdog's thread off a core 130 ms (a runaway
       # stopped at 157 ms of CPU), as an app's few threads never do.
+      # `zgx test` leaves nothing in the temp directory, and Ctrl-Break (a
+      # console interrupt) mid-run removes what it made first.
+      - run: cargo test -p zgx-script --test test_runner_temp --locked
       - run: cargo test -p zgx-script --test state --locked -- --test-threads=1 script::runaway script::a_script_short_of_its_budget script::garbage_from_builtins script::copies_of_state script::a_script_keeping_nodes
       # The vendored accesskit_windows' tests of zgx's patches (UIA's
       # HeadingLevel, and a grid cell named by its text for Narrator;
@@ -667,12 +890,60 @@ jobs:
       # Direct3D 11 (the `d3d11` feature, on WARP) draws what Direct3D 12
       # does, byte for byte: the suite's scenes and every ready-made shader
       # fill and layer shader, each compiled cold by FXC in its child
-      # (`d3d11_parity`), optimized as apps ship them; and its ahead-compiled
-      # shaders are what naga writes now.
-      - run: cargo test -p zgx-gpu --features d3d11 --test d3d11_parity --test d3d11_left_out --release --locked
+      # (`d3d11_parity`, with a `LOCALAPPDATA` of its own, run first); and
+      # its ahead-compiled shaders are what naga writes now (next step).
+      # Then every other zgx-gpu test drawn with Direct3D 11 throughout
+      # (`ZGX_D3D11`, read once a process; the d3d11_* tests set it
+      # themselves), so what it can't draw shows here and not silently.
+      # Each skip has its reason beside it; drop the skip with its reason.
+      # Unoptimized, as the steps above, and one build for both: built
+      # with the release profile's LTO, the eighty test binaries took past
+      # the job's hour. (Rust neither reassociates floats nor contracts
+      # them into FMAs when optimizing, and the shaders compile the same,
+      # so parity checks an unoptimized build as strictly.)
+      - name: zgx-gpu's tests drawn with Direct3D 11
+        shell: bash
+        run: |
+          skips=(
+            a_child_fxc_cannot_survive_fails_that_shader_alone           # Direct3D 12's FXC child process
+            an_apps_shaders_built_through_a_child_draw_as_wgpu_builds_them  # Direct3D 12's FXC child process
+            a_width_within_its_reach_breaks_its_lines_as_it_did          # fails without D3D11 too (#2124, #1813)
+            a_page_pushed_and_popped_again_and_again_gives_its_image_textures_back  # fails on WARP without D3D11 (#2124)
+            a_long_text_draws_only_the_lines_in_its_clip                 # fails on WARP without D3D11 (#2124)
+            naturally_measured_streaming_rows_reflow_with_damage_and_stable_anchor  # fails on WARP without D3D11 (#2124)
+            a_long_column_s_damaged_frames_are_full_frames               # fails on WARP without D3D11 (#2124)
+            a_node_mounted_and_gone_while_a_layered_list_moves_leaves_nothing  # fails on WARP without D3D11 (#2124)
+            atlas_icons_survive_the_atlas_filling_up                     # fails on WARP without D3D11 (#2124)
+            a_frame_kept_before_a_scroll_patches_after_it_as_drawn_afresh  # its first scrolled frame differs on D3D11 (#2154)
+          )
+          args=()
+          for skip in "${skips[@]}"; do args+=(--skip "$skip"); done
+          d3d11=() targets=(--lib)
+          for test in crates/zgx-gpu/tests/*.rs; do
+            name=$(basename "$test" .rs)
+            case $name in
+              d3d11_*) d3d11+=(--test "$name") ;;
+              *) targets+=(--test "$name") ;;
+            esac
+          done
+          LOCALAPPDATA="$RUNNER_TEMP\\zgx-cold-d3d11" cargo test -p zgx-gpu --features d3d11 --locked "${d3d11[@]}"
+          ZGX_D3D11=1 cargo test -p zgx-gpu --features d3d11 --locked "${targets[@]}" -- "${args[@]}"
+      # Its ahead-compiled shaders (dxbc/) are FXC's bytecode of naga's HLSL
+      # today; stale ones are kept for a machine without FXC to take (and
+      # checked when the parity above failed: stale shaders fail it).
+      - name: Direct3D 11 shaders compiled ahead
+        if: ${{ !cancelled() }}
+        run: cargo test -p zgx-gpu --features d3d11 --lib --locked -- d3d11_frame
         env:
-          LOCALAPPDATA: ${{ runner.temp }}\zgx-cold-d3d11
-      - run: cargo test -p zgx-gpu --features d3d11 --lib --locked -- d3d11_frame
+          ZGX_SHADER_OUT: ${{ runner.temp }}\zgx-d3d11-dxbc
+      - name: Keep the Direct3D 11 shaders compiled afresh
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-dxbc
+          retention-days: 7
+          if-no-files-found: ignore
+          path: ${{ runner.temp }}\zgx-d3d11-dxbc
       # zgx-video's tests, as the linux and macOS jobs run them, with
       # ffmpeg (without it, the tests of what it encodes pass by skipping).
       # On a pull request only when it changes what zgx-video compiles:
@@ -711,3 +982,23 @@ jobs:
           ffmpeg -version > /dev/null
           ffprobe -version > /dev/null
           cargo test -p zgx-video --locked
+
+  # One check for all of the above, to require on main: passes when every job
+  # passed or was skipped (the plan didn't need it), fails on a failure or a
+  # cancellation, the plan's and admission's included. Counted in the run's
+  # reservation (plan.py): one Linux runner.
+  result:
+    name: CI result
+    needs: [plan, admit, linux, perf, macos, windows]
+    if: always()
+    # ubuntu-24.04, not -latest, as every job here: -latest moved to 26.04
+    # (Mesa 26) on Nov 14, where lavapipe's tests and probes fail (see linux).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c 'import json,sys; [print(k.ljust(8), v["result"]) for k, v in json.load(sys.stdin).items()]'
+          test "$FAILED" = false

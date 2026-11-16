@@ -510,6 +510,9 @@ pub(crate) struct Shaders {
     pub layer: Option<Arc<zgx::decoration::FillShader>>,
     /// `layer_params`: the layer shader's sixteen values, as four vec4s.
     pub layer_params: Option<[[f32; 4]; 4]>,
+    /// Its parameters given as theme colours: the engine's drive resolves
+    /// them (`ShaderDrive::tokens`), and follows the theme.
+    pub layer_tokens: [Option<zgx::theme::TokenId>; 4],
     /// `layer_bleed`: how far past the box the layer shader paints.
     pub layer_bleed: Option<f32>,
     /// `layer_reach`: how far past that its `zgx_backdrop` reads.
@@ -526,6 +529,46 @@ pub(crate) struct GlassSpec {
     pub radius: Option<Source>,
     /// Each corner's own (`{ tl, tr, br, bl }` or four numbers).
     pub corners: Option<Source>,
+}
+/// `ui.map`, made the first time a script names it.
+pub(crate) fn install_map(lua: &Lua, ui: &Table) -> mlua::Result<()> {
+    ui.set(
+        "map",
+        lua.create_function(|lua, (state, opts): (mlua::Value, Table)| {
+            let source = expect_readable(&state, "ui.map's source")?;
+            let env = env(lua)?;
+            let end = |value: mlua::Value, what: &str| -> mlua::Result<MapEnd> {
+                if let Some(state) = state_of(&value) {
+                    return Ok(MapEnd::State(state));
+                }
+                match value {
+                    mlua::Value::Integer(n) => Ok(MapEnd::Num(n as f64)),
+                    mlua::Value::Number(n) => Ok(MapEnd::Num(n)),
+                    mlua::Value::Function(f) => Ok(MapEnd::State(computed(lua, &env, f))),
+                    other => Err(mlua::Error::runtime(format!(
+                        "ui.map's {what} ends are numbers, states or functions, not {}",
+                        other.type_name()
+                    ))),
+                }
+            };
+            let range = |what: &str| -> mlua::Result<[MapEnd; 2]> {
+                let Some(range) = opts.get::<Option<Table>>(what)? else {
+                    return Err(mlua::Error::runtime(format!(
+                        "ui.map needs `{what} = {{ start, end }}`"
+                    )));
+                };
+                Ok([end(range.get(1)?, what)?, end(range.get(2)?, what)?])
+            };
+            let spec = MapSpec {
+                source,
+                from: range("from")?,
+                to: range("to")?,
+                clamp: opts.get::<Option<bool>>("clamp")?.unwrap_or(false),
+            };
+            lua.create_userdata(MapUd(Rc::new(spec)))
+        })?,
+    )?;
+    Ok(())
 }
 /// `ui.glass`, made the first time a script names it.
 pub(crate) fn install_glass(lua: &Lua, ui: &Table) -> mlua::Result<()> {
@@ -1710,6 +1753,8 @@ pub(crate) enum Source {
     State(Signal<Value>),
     Computed(Function),
     Anim(Rc<Anim>),
+    /// `ui.map`: a number mapped from a state in Rust.
+    Map(Rc<MapSpec>),
     /// Set by `variants = …` chosen by state: what the choice sets now.
     Variant(Rc<crate::variants::Selection>, Prop),
 }
@@ -2043,6 +2088,8 @@ pub(crate) struct Env {
     pub meter: Option<Rc<crate::meter::Meter>>,
     /// The images the host sets (`host:` sources): pictures scripts take.
     pub assets: Rc<crate::lower::Assets>,
+    /// What a load writes to state that outlives it, while one runs.
+    pub journal: Rc<crate::journal::Journal>,
 }
 /// What a script adds to a slot: the slot, who added it (`ui.slot`'s
 /// `from`) and the node.
@@ -2207,6 +2254,65 @@ pub(crate) struct Provided(pub std::collections::HashMap<Rc<str>, (Weak<Vm>, mlu
 pub(crate) struct NodeUd(pub Rc<Node>);
 impl UserData for NodeUd {}
 pub(crate) struct AnimUd(pub Rc<Anim>);
+/// `ui.map`'s value: a number a state holds, mapped from one range to
+/// another (`from` to `to`) in Rust, so a style that follows it runs no
+/// script as the state changes (a scrollbar thumb's `top` following an
+/// offset). Each end is a number, a state or a function, kept current as
+/// what it reads changes (`computed`).
+pub(crate) struct MapSpec {
+    pub source: Signal<Value>,
+    pub from: [MapEnd; 2],
+    pub to: [MapEnd; 2],
+    pub clamp: bool,
+}
+/// One end of a `ui.map` range.
+pub(crate) enum MapEnd {
+    Num(f64),
+    State(Signal<Value>),
+}
+impl MapEnd {
+    /// Its value now, followed by the reading effect; `None` if it isn't a
+    /// finite number.
+    fn get(&self) -> Option<f64> {
+        let value = match self {
+            MapEnd::Num(v) => *v,
+            MapEnd::State(state) => state.with(|v| v.as_f64())?,
+        };
+        value.is_finite().then_some(value)
+    }
+}
+impl MapSpec {
+    /// The mapped value now: `to`'s start where the source sits at `from`'s
+    /// start, its end at `from`'s end, in a line between, held within `to`
+    /// with `clamp`. A range of no width (or any end not a finite number)
+    /// gives `to`'s start, or 0: a finite value, never NaN.
+    pub(crate) fn value(&self) -> f32 {
+        let at = self.source.with(|v| v.as_f64()).filter(|v| v.is_finite());
+        let [a, b] = [self.from[0].get(), self.from[1].get()];
+        let [c, d] = [self.to[0].get(), self.to[1].get()];
+        let Some(start) = c else {
+            return 0.;
+        };
+        let (Some(at), Some(a), Some(b), Some(d)) = (at, a, b, d) else {
+            return start as f32;
+        };
+        let width = b - a;
+        if width == 0. || !width.is_finite() {
+            return start as f32;
+        }
+        let mut t = (at - a) / width;
+        if self.clamp {
+            t = t.clamp(0., 1.);
+        }
+        let value = start + t * (d - start);
+        match value.is_finite() {
+            true => value as f32,
+            false => start as f32,
+        }
+    }
+}
+pub(crate) struct MapUd(pub Rc<MapSpec>);
+impl UserData for MapUd {}
 impl UserData for AnimUd {}
 pub(crate) struct ActionUd(pub Action);
 impl UserData for ActionUd {}
@@ -2221,9 +2327,15 @@ pub(crate) fn node_ud(lua: &Lua, mut node: Node) -> mlua::Result<mlua::AnyUserDa
     if node.owner.upgrade().is_some_and(|vm| vm.locate.get()) {
         node.source = location(lua);
     }
+    // Written into its place: a node is hundreds of bytes, which `Rc::new`
+    // moves once more on the way.
+    let mut held = Rc::new_uninit();
+    Rc::get_mut(&mut held).expect("just made").write(node);
+    // SAFETY: written just above.
+    let held = unsafe { held.assume_init() };
     // Every `ui.*` call makes one: without the memory limit's protected
     // call around each (see vendor/mlua/ZGX_PATCH.md).
-    lua.create_userdata_relaxed(NodeUd(Rc::new(node)))
+    lua.create_userdata_relaxed(NodeUd(held))
 }
 /// The script line calling the `ui` function running now: `app.luau:12`.
 fn location(lua: &Lua) -> Option<Rc<str>> {
@@ -2945,6 +3057,12 @@ fn source_linted(
         mlua::Value::UserData(ud) if ud.is::<AnimUd>() => {
             Ok(Source::Anim(ud.borrow::<AnimUd>()?.0.clone()))
         }
+        mlua::Value::UserData(ud) if ud.is::<MapUd>() => match ty {
+            Ty::Num | Ty::Len => Ok(Source::Map(ud.borrow::<MapUd>()?.0.clone())),
+            _ => Err(mlua::Error::runtime(format!(
+                "`{name}` doesn't take a number: ui.map gives one"
+            ))),
+        },
         other => {
             let raw = crate::design::is_raw(&other);
             // A colour written out, the commonest string a style takes, is
@@ -3194,7 +3312,9 @@ pub(crate) fn array_items(table: &Table) -> mlua::Result<Vec<mlua::Value>> {
         if let mlua::Value::Integer(i) = key
             && i >= 1
         {
-            items.push((i, value));
+            // An `i32` in the browser (Luau's integer on wasm32).
+            #[allow(clippy::unnecessary_cast)]
+            items.push((i as i64, value));
         }
         Ok(())
     })?;
@@ -3233,7 +3353,9 @@ fn child_items(table: &Table) -> mlua::Result<Vec<(i64, Child)>> {
         if let mlua::Value::Integer(i) = key.to_value()?
             && i >= 1
         {
-            items.push((i, Child::of(&value)?));
+            // An `i32` in the browser (Luau's integer on wasm32).
+            #[allow(clippy::unnecessary_cast)]
+            items.push((i as i64, Child::of(&value)?));
         }
         Ok(())
     })?;
@@ -4125,7 +4247,9 @@ fn fill_from(
                 mlua::Value::Integer(1) if let Some(text) = text.as_deref_mut() => {
                     text.content = value.to_value()?;
                 }
-                mlua::Value::Integer(i) if i >= 1 => items.push((i, Child::of(&value)?)),
+                // An `i32` in the browser (Luau's integer on wasm32).
+                #[allow(clippy::unnecessary_cast)]
+                mlua::Value::Integer(i) if i >= 1 => items.push((i as i64, Child::of(&value)?)),
                 _ => {}
             }
             return Ok(());
@@ -4278,8 +4402,13 @@ fn fill_from(
                         shaders.drive.get_or_insert_default().layer_params_of = Some(f.clone());
                     }
                     _ => {
-                        shaders.layer_params =
-                            Some(shader_params(lua, &value, "layer_params", None)?);
+                        let params =
+                            shader_params(lua, &value, "layer_params", Some(&mut shaders.layer_tokens))?;
+                        shaders.layer_params = Some(params);
+                        // A layer's theme colours are the drive's to keep up.
+                        if shaders.layer_tokens.iter().any(Option::is_some) {
+                            shaders.drive.get_or_insert_default();
+                        }
                     }
                 }
             }
@@ -6564,7 +6693,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             }
             // A shader that does not compile is the script's error, shown
             // with its line, not a plain fill.
-            zgx_gpu::check_fill_shader(&source)
+            crate::gpu::check_fill_shader(&source)
                 .map_err(|e| mlua::Error::runtime(format!("ui.shader: {e}")))?;
             let key = (source, fps.map(f32::to_bits));
             let shader = SHADERS.with(|shaders| {
@@ -6575,7 +6704,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                         // Compiled from now, off the frame, so the first
                         // frame drawing it need not wait for it.
                         let shader = zgx::decoration::FillShader::new(key.0.clone(), fps);
-                        zgx_gpu::warm_fill_shader(&shader);
+                        crate::gpu::warm_fill_shader(&shader);
                         shader
                     })
                     .clone()
@@ -6592,7 +6721,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             };
             if let Some(inputs) = opts.as_ref().map(shader_inputs).transpose()?.flatten() {
                 // A running effect of its own: textures aren't shared.
-                zgx_gpu::check_layer_inputs(&source, &inputs)
+                crate::gpu::check_layer_inputs(&source, &inputs)
                     .map_err(|e| mlua::Error::runtime(format!("ui.layer_shader: {e}")))?;
                 let shader = zgx::decoration::FillShader::with_inputs(source, fps, inputs);
                 zgx::decoration::declare_layer_shader(&shader);
@@ -6607,7 +6736,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             }
             // A shader that does not compile is the script's error, shown
             // with its line, not a layer composited as painted.
-            zgx_gpu::check_layer_shader(&source)
+            crate::gpu::check_layer_shader(&source)
                 .map_err(|e| mlua::Error::runtime(format!("ui.layer_shader: {e}")))?;
             let key = (source, fps.map(f32::to_bits));
             let shader = LAYER_SHADERS.with(|shaders| {
@@ -6695,7 +6824,11 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             {
                 meter.room(initial.weight())?;
             }
+            let made = env.journal.active() && env.store.get(&key).is_none();
             let signal = env.store.state(&key, initial);
+            if made {
+                env.journal.made_state(&env.store, &key);
+            }
             if let Some(meter) = &env.meter {
                 meter.set(&signal, signal.with_untracked(Value::weight));
             }
@@ -6717,7 +6850,12 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             {
                 meter.room(initial.weight())?;
             }
+            let made = env.journal.active() && env.persist.get(&env.persist_as, &key).is_none();
             let signal = env.persist.state(&env.persist_as, &key, initial);
+            if made {
+                env.journal
+                    .made_persist(&env.persist, &env.persist_as, &key);
+            }
             if let Some(meter) = &env.meter {
                 meter.set(&signal, signal.with_untracked(Value::weight));
             }
@@ -6730,7 +6868,11 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             let env = env(lua)?;
             env.permits(&env.exposed_shared, &key, "ui.shared")?;
             let plugin = matches!(*env.grants, crate::Grants::Only(_));
+            let made = env.journal.active() && env.shared.get(&key).is_none();
             let state = State::new(env.shared.shared(&key, initial, plugin));
+            if made {
+                env.journal.made_state(&env.shared, &key);
+            }
             if plugin && env.read_only_shared.borrow().contains(&key) {
                 let read = crate::value::ReadState(state, key.as_str().into());
                 return lua.create_userdata(read);
@@ -6869,7 +7011,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 let vm = env.vm.clone();
                 let done = std::cell::RefCell::new(done);
                 let elapsed_cell = std::cell::Cell::new(0f64);
-                let began = std::time::Instant::now();
+                let began = crate::time::Instant::now();
                 let (speed_from, shown_from) = (
                     velocity.get(),
                     state
@@ -7032,7 +7174,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         "now",
         lua.create_function(|_, ()| {
             Ok(zgx::clock::system_now()
-                .duration_since(std::time::UNIX_EPOCH)
+                .duration_since(crate::time::SystemTime::UNIX_EPOCH)
                 .map_or(0., |d| d.as_secs_f64() * 1000.))
         })?,
     )?;

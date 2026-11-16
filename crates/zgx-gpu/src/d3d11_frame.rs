@@ -20,8 +20,11 @@
 //! CPU wrote, and canvases' polyline strokes and filled areas; and shader
 //! fills and layer shaders not reading the backdrop, their pixel stage
 //! compiled off the frame (`Device::start_app_shader`) from the module
-//! Direct3D 12's is. A frame needing more fails, naming
-//! what it lacks: there is no Direct3D 12 to fall back to.
+//! Direct3D 12's is, with the passes and tagged boxes a layer shader reads
+//! pictures and GPU views a layer shader reads (`Chain`; the views painted
+//! on the views' own device, `crate::view_host`). A
+//! frame needing more fails, naming what it lacks: there is no Direct3D 12
+//! to fall back to.
 //!
 //! Layer effects (content blurs and masks, `crate::effects`) draw their
 //! passes into the effect atlas here, as on Direct3D 12, with effects.wgsl.
@@ -43,12 +46,13 @@ use windows::{
         Graphics::{
             Direct3D::{
                 D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
-                D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             },
             Direct3D11::*,
             Dxgi::{
                 Common::{
-                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32_TYPELESS,
+                    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_TYPELESS,
                     DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC,
                 },
                 CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_MINIMUM_POWER,
@@ -89,6 +93,14 @@ const IMAGE_EFFECT_FS: &[u8] = include_bytes!("dxbc/image_effects_zgx_image_effe
 /// `crate::blend_source`): its backdrop in `POINTS`'s register, which no
 /// blended draw reads points from.
 const BLEND_FS: &[u8] = include_bytes!("dxbc/blend_zgx_blended.dxbc");
+/// blur.wgsl's stages, with `crate::BLUR_MIX` (the backdrop blur, `Frame::blur`).
+const BLUR_VS: &[u8] = include_bytes!("dxbc/blur_vs.dxbc");
+const BLUR_REDUCE: &[u8] = include_bytes!("dxbc/blur_fs_reduce.dxbc");
+const BLUR_REDUCE4: &[u8] = include_bytes!("dxbc/blur_fs_reduce4.dxbc");
+const BLUR_ACROSS: &[u8] = include_bytes!("dxbc/blur_fs_across.dxbc");
+const BLUR_DOWN: &[u8] = include_bytes!("dxbc/blur_fs_down.dxbc");
+const BLUR_FS: &[u8] = include_bytes!("dxbc/blur_fs.dxbc");
+const BLUR_MIX_FS: &[u8] = include_bytes!("dxbc/blur_fs_mix.dxbc");
 
 /// Registers the HLSL is written with (`translate`): the sampled texture
 /// (the atlas, or the shown buffer for copies) in t0, the clip regions in
@@ -99,6 +111,17 @@ const REGIONS: u32 = 1;
 const POINTS: u32 = 2;
 /// A layer effect's mask (effects.wgsl's `mask`), its source in `TEXTURE`.
 const MASK: u32 = 1;
+/// A layer shader's inputs (passes.rs), in its passes and its composite
+/// alike: their sampler in s1, the tagged boxes in t8 and each input's
+/// texture after them, clear of every register draw.wgsl and blend.wgsl
+/// bind; a pass's uniforms (`ZgxPass`) in b1.
+const INPUT_SAMPLER: u32 = 1;
+const INPUTS: u32 = 8;
+const PASS_UNIFORMS: u32 = 1;
+/// The textures a shader's inputs can bind: the slots past the boxes'.
+const MOST_INPUTS: u32 = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - INPUTS - 1;
+/// The widest and tallest texture a pass draws into (feature level 11_0's).
+pub(crate) const MOST_TEXELS: u32 = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 
 fn failed(what: &str) -> impl Fn(windows::core::Error) -> GpuError + '_ {
     move |error| GpuError(format!("Direct3D 11 {what}: {error}"))
@@ -142,12 +165,17 @@ enum Bound {
 pub(crate) enum AppShader {
     Fill,
     Filter,
+    /// A layer's composite through a layer shader reading the backdrop
+    /// (glass, `Shading::FilterBlend`): drawn over a copy of the target under
+    /// it (`Frame::blended`).
+    FilterBlend,
 }
 impl AppShader {
     fn what(self) -> &'static str {
         match self {
             Self::Fill => "shader fill",
             Self::Filter => "layer shader",
+            Self::FilterBlend => "layer shader reading the backdrop",
         }
     }
 }
@@ -178,9 +206,16 @@ fn start_app_shader(
     shader: &zgx::decoration::FillShader,
     kind: AppShader,
 ) -> crate::compile::Compiled<Vec<u8>> {
+    // A layer shader with inputs declares them first, at `INPUTS` (as
+    // Direct3D 12's module, `passes::composite_source`).
+    let filter = || match shader.inputs() {
+        Some(inputs) => crate::passes::composite_source(shader, inputs),
+        None => crate::filter_source(shader.source()),
+    };
     let (source, entry) = match kind {
         AppShader::Fill => (crate::fill_source(shader.source()), "zgx_fill"),
-        AppShader::Filter => (crate::filter_source(shader.source()), "zgx_filter"),
+        AppShader::Filter => (filter(), "zgx_filter"),
+        AppShader::FilterBlend => (filter(), "zgx_filter_blended"),
     };
     let id = shader.id();
     crate::compile::Compiled::Pending(crate::compile::spawn(move || {
@@ -203,6 +238,83 @@ struct Pipeline {
     pixel: ID3D11PixelShader,
     layout: ID3D11InputLayout,
     blend: ID3D11BlendState,
+}
+
+/// The backdrop blur's stages (blur.wgsl, `crate::BlurPipelines`): one
+/// vertex stage, three passes into its atlas replacing, and its draw back
+/// over the target, replacing or mixed by dual-source blending.
+struct BlurPipelines {
+    vertex: ID3D11VertexShader,
+    reduce: ID3D11PixelShader,
+    /// A factor-8 reduce's first half (`fs_reduce4`), into the halves.
+    halves: ID3D11PixelShader,
+    across: ID3D11PixelShader,
+    down: ID3D11PixelShader,
+    vertical: ID3D11PixelShader,
+    mix: ID3D11PixelShader,
+    replace: ID3D11BlendState,
+    /// out = blur * amount + target * (1 - amount), as Direct3D 12's mix.
+    mixed: ID3D11BlendState,
+    /// naga's special constants (b0): the draw's first instance, written
+    /// before each draw (`Frame::blur_draw`).
+    index: ID3D11Buffer,
+}
+
+impl BlurPipelines {
+    fn new(device: &ID3D11Device) -> Option<Self> {
+        let pixel = |code: &[u8]| {
+            let mut shader = None;
+            // SAFETY: DXBC compiled by FXC (`translated_hlsl_matches`).
+            unsafe { device.CreatePixelShader(code, None, Some(&mut shader)) }.ok()?;
+            shader
+        };
+        let mut vertex = None;
+        // SAFETY: As above.
+        unsafe { device.CreateVertexShader(BLUR_VS, None, Some(&mut vertex)) }.ok()?;
+        let blend = |on: bool| {
+            let mut targets = [D3D11_RENDER_TARGET_BLEND_DESC::default(); 8];
+            targets[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: on.into(),
+                SrcBlend: D3D11_BLEND_ONE,
+                DestBlend: D3D11_BLEND_INV_SRC1_COLOR,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_INV_SRC1_ALPHA,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            let desc = D3D11_BLEND_DESC {
+                AlphaToCoverageEnable: false.into(),
+                IndependentBlendEnable: false.into(),
+                RenderTarget: targets,
+            };
+            let mut state = None;
+            // SAFETY: A plain blend description.
+            unsafe { device.CreateBlendState(&desc, Some(&mut state)) }.ok()?;
+            state
+        };
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            ..Default::default()
+        };
+        let mut index = None;
+        // SAFETY: A plain 16-byte constant buffer.
+        unsafe { device.CreateBuffer(&desc, None, Some(&mut index)) }.ok()?;
+        Some(Self {
+            index: index?,
+            vertex: vertex?,
+            reduce: pixel(BLUR_REDUCE)?,
+            halves: pixel(BLUR_REDUCE4)?,
+            across: pixel(BLUR_ACROSS)?,
+            down: pixel(BLUR_DOWN)?,
+            vertical: pixel(BLUR_FS)?,
+            mix: pixel(BLUR_MIX_FS)?,
+            replace: blend(false)?,
+            mixed: blend(true)?,
+        })
+    }
 }
 
 /// A clamped sampler of `filter`, or none if Direct3D makes none.
@@ -236,6 +348,9 @@ pub(crate) struct Device {
     /// Image effects' pixel stage (`Shading::ImageEffect`), made when an
     /// image first draws with one (`None`: Direct3D made none).
     image_effect: std::cell::OnceCell<Option<ID3D11PixelShader>>,
+    /// The backdrop blur's stages (`Frame::blur`), made when a frame first
+    /// blurs (`None`: Direct3D made none).
+    blur: std::cell::OnceCell<Option<BlurPipelines>>,
     /// Blended layers' pixel stage (`Shading::Blend`), made when one first
     /// draws (`None`: Direct3D made none).
     blend: std::cell::OnceCell<Option<ID3D11PixelShader>>,
@@ -427,6 +542,7 @@ impl Device {
             pipelines,
             effect_pipelines,
             image_effect: std::cell::OnceCell::new(),
+            blur: std::cell::OnceCell::new(),
             blend: std::cell::OnceCell::new(),
             rasterizer,
             sampler,
@@ -509,12 +625,35 @@ impl Device {
         height: u32,
         target: bool,
     ) -> Result<Surface, GpuError> {
+        self.surface_as(width, height, target, DXGI_FORMAT_B8G8R8A8_UNORM)
+    }
+    /// A factor-8 reduce's halves, `width` by `height` texels (twice the
+    /// atlas's), RGBA16F as the atlas.
+    pub(crate) fn blur_halves(&self, width: u32, height: u32) -> Result<Surface, GpuError> {
+        self.surface_as(width, height, true, DXGI_FORMAT_R16G16B16A16_FLOAT)
+    }
+    /// The backdrop blur's atlas pair, `width` by `height` texels.
+    pub(crate) fn blur_atlas(&self, width: u32, height: u32) -> Result<[Surface; 2], GpuError> {
+        Ok([
+            self.surface_as(width, height, true, DXGI_FORMAT_R16G16B16A16_FLOAT)?,
+            self.surface_as(width, height, true, DXGI_FORMAT_R16G16B16A16_FLOAT)?,
+        ])
+    }
+    /// As `surface`, in `format` (the backdrop blur's atlas: RGBA16F, as
+    /// Direct3D 12's `BLUR_FORMAT`).
+    pub(crate) fn surface_as(
+        &self,
+        width: u32,
+        height: u32,
+        target: bool,
+        format: DXGI_FORMAT,
+    ) -> Result<Surface, GpuError> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -622,6 +761,41 @@ impl Device {
         }
     }
 
+    /// `cells` of `from` (x, y, width and height, then where each goes)
+    /// copied into `to`: the glyph atlas shrunk at idle
+    /// (`crate::GpuRenderer::shrink_atlas`), its glyphs kept.
+    pub(crate) fn copy_cells(
+        &self,
+        from: &Surface,
+        to: &Surface,
+        cells: impl Iterator<Item = (u32, u32, u32, u32, u32, u32)>,
+    ) {
+        for (x, y, width, height, to_x, to_y) in cells {
+            let area = D3D11_BOX {
+                left: x,
+                top: y,
+                front: 0,
+                right: x + width,
+                bottom: y + height,
+                back: 1,
+            };
+            // SAFETY: Each cell lies inside `from`, and its place inside
+            // `to` (`pack_cells`), both of the atlas's format.
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &to.texture,
+                    0,
+                    to_x,
+                    to_y,
+                    0,
+                    &from.texture,
+                    0,
+                    Some(&area),
+                );
+            }
+        }
+    }
+
     /// Scroll `copies` within `target`, through `spare` (the target's size):
     /// as wgpu's path copies them before its pass, when no shown surface
     /// draws them.
@@ -726,6 +900,14 @@ impl Device {
         }
     }
 
+    /// `target` cleared to transparent: a fade band's texture, before its
+    /// pass (`crate::GpuRenderer::render_d3d11`), as `encode_band` clears it.
+    pub(crate) fn clear(&self, target: &Surface) {
+        let rtv = target.rtv.as_ref().expect("a render target");
+        // SAFETY: A live render target view of this device.
+        unsafe { self.context.ClearRenderTargetView(rtv, &[0.; 4]) };
+    }
+
     pub(crate) fn begin<'a>(
         &'a self,
         state: &'a State,
@@ -773,6 +955,8 @@ impl Device {
             scissor: None,
             nearest: false,
             points: state.points.as_ref().map(|(_, points, _)| points.clone()),
+            regions: regions.clone(),
+            inputs: 0,
         }
     }
 }
@@ -964,6 +1148,325 @@ impl Surface {
     }
 }
 
+/// A layer shader's passes and boxes on Direct3D 11: passes.rs's `Chain`,
+/// as Direct3D 11 has it, in a renderer's `State` by shader id. Its passes
+/// draw on the immediate context ahead of the frame sampling them
+/// (`GpuRenderer::run_passes_d3d11`), which binds `bound` at `INPUTS`.
+pub(crate) struct Chain {
+    passes: Vec<Pass>,
+    /// The pictures it reads by name, uploaded once as passes.rs's are.
+    pictures: Vec<Surface>,
+    /// The GPU views it reads by name.
+    pub(crate) views: Vec<ChainView>,
+    /// Bound where a pass reads itself and keeps no last result.
+    nothing: Surface,
+    rects: (ID3D11Buffer, ID3D11ShaderResourceView),
+    /// One step's `ZgxPass`, written before each draw.
+    uniforms: ID3D11Buffer,
+    /// What the layer shader binds at `INPUTS`: the boxes, the passes'
+    /// latest, the pictures and the views.
+    pub(crate) bound: Option<Vec<Option<ID3D11ShaderResourceView>>>,
+    pub(crate) rects_held: Vec<(zgx::scene::Rect, [f32; 4])>,
+    /// The shader's time when it last ran, and frames so far.
+    pub(crate) last: Option<f32>,
+    pub(crate) frames: u32,
+    /// The pass-time it last ran at (passes.rs `Chain::last_frame`).
+    pub(crate) last_frame: u64,
+}
+/// A GPU view a layer shader reads (`GpuView::id`), and the texture its
+/// painter draws into each frame, made at the box's size: the views'
+/// device's, shared with Direct3D 11 (`crate::view_host`).
+pub(crate) struct ChainView {
+    pub(crate) view: u64,
+    pub(crate) size: (u32, u32),
+    pub(crate) made: Option<(wgpu::Texture, Surface)>,
+}
+struct Pass {
+    /// Its vertex and pixel stages' DXBC, compiling or compiled, and the
+    /// shaders made from them once ready (`Some(None)`: Direct3D made none).
+    compiled: crate::compile::Compiled<(Vec<u8>, Vec<u8>)>,
+    stages: Option<Option<(ID3D11VertexShader, ID3D11PixelShader)>>,
+    format: DXGI_FORMAT,
+    /// One texture, or two to flip between. `surfaces[current]` is its
+    /// last result.
+    surfaces: Vec<Surface>,
+    current: usize,
+    size: (u32, u32),
+    /// It has drawn since its textures were made (a `once` pass's end).
+    drawn: bool,
+}
+
+impl Chain {
+    /// A chain for `passes` (each pass's module, `passes::pass_source`, and
+    /// its format), `pictures` and `views`, its stages compiling off the
+    /// frame unless `here`, with `rect_bytes` of boxes, zeroed.
+    pub(crate) fn new(
+        device: &Device,
+        passes: Vec<(String, zgx::decoration::PassFormat)>,
+        pictures: &[(String, std::sync::Arc<zgx::image::ImageData>)],
+        views: &[(String, u64)],
+        rect_bytes: usize,
+        here: bool,
+    ) -> Result<Self, GpuError> {
+        let pictures = (pictures.iter())
+            .map(|(_, image)| {
+                let (width, height) = (image.width(), image.height());
+                let surface =
+                    device.surface_as(width, height, false, DXGI_FORMAT_R8G8B8A8_UNORM)?;
+                device.write(&surface, (0, 0, width, height), &image.pixels_now());
+                Ok(surface)
+            })
+            .collect::<Result<_, GpuError>>()?;
+        let passes = passes
+            .into_iter()
+            .map(|(source, format)| {
+                let slot = crate::compile::start(here, move || {
+                    if !crate::fill_validates(&source) {
+                        return None;
+                    }
+                    let stages = translate(&source, Module::Pass).and_then(|(hlsl, names)| {
+                        let vertex = fxc(&hlsl, &names, "zgx_pass_vertex", "vs_5_0")?;
+                        Ok((vertex, fxc(&hlsl, &names, "zgx_pass_fragment", "ps_5_0")?))
+                    });
+                    stages
+                        .map_err(|error| {
+                            eprintln!(
+                                "zgx: a shader's pass doesn't compile for Direct3D 11: {error}"
+                            )
+                        })
+                        .ok()
+                });
+                Pass {
+                    compiled: crate::compile::Compiled::Pending(slot),
+                    stages: None,
+                    format: match format {
+                        zgx::decoration::PassFormat::Rgba8 => DXGI_FORMAT_R8G8B8A8_UNORM,
+                        zgx::decoration::PassFormat::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    },
+                    surfaces: Vec::new(),
+                    current: 0,
+                    size: (0, 0),
+                    drawn: false,
+                }
+            })
+            .collect();
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: 112,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            ..Default::default()
+        };
+        let mut uniforms = None;
+        // SAFETY: A plain constant buffer description.
+        unsafe { device.device.CreateBuffer(&desc, None, Some(&mut uniforms)) }
+            .map_err(failed("pass uniforms"))?;
+        Ok(Self {
+            passes,
+            pictures,
+            views: (views.iter())
+                .map(|(_, view)| ChainView {
+                    view: *view,
+                    size: (0, 0),
+                    made: None,
+                })
+                .collect(),
+            nothing: device.surface_as(1, 1, false, DXGI_FORMAT_R8G8B8A8_UNORM)?,
+            rects: raw_buffer(&device.device, rect_bytes, Some(&vec![0; rect_bytes]))?,
+            uniforms: uniforms
+                .ok_or_else(|| GpuError("Direct3D 11 made no pass uniforms".into()))?,
+            bound: None,
+            rects_held: Vec::new(),
+            last: None,
+            frames: 0,
+            last_frame: 0,
+        })
+    }
+
+    /// Whether every pass can draw (`Some(false)`: one didn't compile), or
+    /// `None` while one compiles, unless it `wait`s for them.
+    pub(crate) fn ready(&mut self, device: &Device, wait: bool) -> Option<bool> {
+        let mut compiling = false;
+        for pass in &mut self.passes {
+            match pass.compiled.ready(wait) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => compiling = true,
+            }
+        }
+        if compiling {
+            return None;
+        }
+        for pass in &mut self.passes {
+            let stages = pass.stages.get_or_insert_with(|| {
+                let (vertex_code, pixel_code) = pass.compiled.get().expect("ready");
+                let (mut vertex, mut pixel) = (None, None);
+                // SAFETY: DXBC FXC compiled for shader model 5.0 from the
+                // HLSL `translate` writes with the inputs' registers.
+                let made = unsafe {
+                    (device.device)
+                        .CreateVertexShader(vertex_code, None, Some(&mut vertex))
+                        .and_then(|()| {
+                            (device.device).CreatePixelShader(pixel_code, None, Some(&mut pixel))
+                        })
+                };
+                if let Err(error) = made {
+                    eprintln!("zgx: Direct3D 11 made no shader for a pass: {error}");
+                }
+                vertex.zip(pixel)
+            });
+            if stages.is_none() {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Pass `at`'s textures for `size`, two where it keeps its last result
+    /// (`both`), made anew if it hasn't them: cleared, as wgpu's.
+    pub(crate) fn sized(
+        &mut self,
+        device: &Device,
+        at: usize,
+        size: (u32, u32),
+        both: bool,
+    ) -> Result<(), GpuError> {
+        let pass = &mut self.passes[at];
+        if pass.size == size && !pass.surfaces.is_empty() {
+            return Ok(());
+        }
+        pass.surfaces = (0..if both { 2 } else { 1 })
+            .map(|_| device.surface_as(size.0, size.1, true, pass.format))
+            .collect::<Result<_, _>>()?;
+        pass.current = 0;
+        pass.size = size;
+        pass.drawn = false;
+        Ok(())
+    }
+
+    /// Pass `at`'s texels, and whether it has drawn since they were made.
+    pub(crate) fn size(&self, at: usize) -> (u32, u32) {
+        self.passes[at].size
+    }
+    pub(crate) fn drawn(&self, at: usize) -> bool {
+        self.passes[at].drawn
+    }
+
+    /// The boxes' bytes (`zgx_rects`), at most the buffer's.
+    pub(crate) fn write_rects(&self, device: &Device, bytes: &[u8]) {
+        let area = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: bytes.len() as u32,
+            bottom: 1,
+            back: 1,
+        };
+        // SAFETY: `bytes` into a buffer at least as large (passes.rs keeps
+        // the boxes to `MOST_RECTS`, which it was made for).
+        unsafe {
+            device.context.UpdateSubresource(
+                &self.rects.0,
+                0,
+                Some(&area),
+                bytes.as_ptr().cast(),
+                0,
+                0,
+            )
+        };
+    }
+
+    /// What binds at `INPUTS`: the boxes, then each pass's latest result,
+    /// but `writing`'s own texture where it keeps no last result, then the
+    /// pictures and the views (passes.rs `Chain::bind_inputs`).
+    fn inputs(&self, writing: Option<usize>) -> Vec<Option<ID3D11ShaderResourceView>> {
+        let nothing = || self.nothing.srv.clone();
+        let mut bound = vec![Some(self.rects.1.clone())];
+        for (index, pass) in self.passes.iter().enumerate() {
+            bound.push(match Some(index) == writing && pass.surfaces.len() < 2 {
+                true => nothing(),
+                false => (pass.surfaces.get(pass.current)).map_or_else(nothing, |s| s.srv.clone()),
+            });
+        }
+        bound.extend(self.pictures.iter().map(|picture| picture.srv.clone()));
+        bound.extend((self.views.iter()).map(|view| match &view.made {
+            Some((_, surface)) => surface.srv.clone(),
+            None => nothing(),
+        }));
+        bound
+    }
+
+    /// One step of pass `at` with `block` its `ZgxPass`: a triangle over its
+    /// target (the texture it doesn't read, when it flips), cleared first,
+    /// replacing; then its result is the one it drew.
+    pub(crate) fn draw(&mut self, device: &Device, at: usize, block: &[f32; 28]) {
+        let inputs = self.inputs(Some(at));
+        let pass = &self.passes[at];
+        let Some(Some((vertex, pixel))) = &pass.stages else {
+            return;
+        };
+        let target = &pass.surfaces[if pass.surfaces.len() > 1 {
+            1 - pass.current
+        } else {
+            0
+        }];
+        let rtv = target.rtv.clone().expect("a render target");
+        let context = &device.context;
+        // Replacing, as a pass's pipeline writes (no blending).
+        let replace = &device.pipelines[Bound::FullClear as usize].blend;
+        // SAFETY: Live objects of this device, bound to its context; the
+        // target is no texture it samples (`inputs` binds another, or
+        // `nothing`), and what it last sampled is unbound before the target
+        // is (a texture may be read one step and drawn into the next).
+        unsafe {
+            context.UpdateSubresource(&self.uniforms, 0, None, block.as_ptr().cast(), 0, 0);
+            context.PSSetShaderResources(INPUTS, Some(&vec![None; inputs.len()]));
+            context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            context.ClearRenderTargetView(&rtv, &[0.; 4]);
+            context.RSSetState(&device.rasterizer);
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.,
+                TopLeftY: 0.,
+                Width: target.width as f32,
+                Height: target.height as f32,
+                MinDepth: 0.,
+                MaxDepth: 1.,
+            }]));
+            context.RSSetScissorRects(Some(&[RECT {
+                left: 0,
+                top: 0,
+                right: target.width as i32,
+                bottom: target.height as i32,
+            }]));
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(vertex, None);
+            context.PSSetShader(pixel, None);
+            context.OMSetBlendState(replace, None, u32::MAX);
+            context.PSSetConstantBuffers(PASS_UNIFORMS, Some(&[Some(self.uniforms.clone())]));
+            context.PSSetSamplers(INPUT_SAMPLER, Some(&[Some(device.sampler.clone())]));
+            context.PSSetShaderResources(INPUTS, Some(&inputs));
+            context.Draw(3, 0);
+        }
+        let pass = &mut self.passes[at];
+        if pass.surfaces.len() > 1 {
+            pass.current = 1 - pass.current;
+        }
+        pass.drawn = true;
+    }
+
+    /// The frame's passes drawn: their target and textures unbound (the
+    /// frame samples them), and what the layer shader binds made.
+    pub(crate) fn end(&mut self, device: &Device) {
+        let bound = self.inputs(None);
+        // SAFETY: Unbinds what `draw` bound.
+        unsafe {
+            device.context.OMSetRenderTargets(None, None);
+            (device.context).PSSetShaderResources(INPUTS, Some(&vec![None; bound.len()]));
+        }
+        self.bound = Some(bound);
+    }
+}
+
 /// A renderer's own Direct3D 11 state: its vertex buffers, clip regions,
 /// viewport, glyph atlas and (offscreen) retained target.
 pub(crate) struct State {
@@ -973,6 +1476,9 @@ pub(crate) struct State {
     regions: Option<(ID3D11Buffer, ID3D11ShaderResourceView, usize)>,
     /// The frame's polyline points, the buffer's size.
     points: Option<(ID3D11Buffer, ID3D11ShaderResourceView, usize)>,
+    /// The backdrop blur batches' records, two parts each (`set_blur_records`):
+    /// kept from frame to frame, grown as they must be, as `points` is.
+    pub(crate) blur_records: Vec<Option<(ID3D11Buffer, ID3D11ShaderResourceView, usize)>>,
     /// What `regions` holds: most frames clip with the last one's, and
     /// write nothing.
     last_regions: Vec<u8>,
@@ -996,10 +1502,23 @@ pub(crate) struct State {
     /// A copy of the target under blended layers (`Frame::blended`), of the
     /// last target's size that had one.
     pub(crate) backdrop: Option<Surface>,
+    /// A popup's copy of what its window last drew under it
+    /// (`crate::GpuRenderer::set_backdrop`), which its blurs reduce from.
+    pub(crate) popup_backdrop: Option<Surface>,
+    /// The backdrop blur's atlas pair (`Frame::blur`), RGBA16F at the size
+    /// the batches' plans want, as Direct3D 12's `BlurScratch`.
+    pub(crate) blur_atlas: Option<[Surface; 2]>,
+    /// A factor-8 reduce's halves, where a batch has such a slot, at the
+    /// size of Direct3D 12's `GpuRenderer::blur_halves` (fitted to the
+    /// batches, not twice the whole atlas).
+    pub(crate) blur_halves: Option<Surface>,
     /// The effect atlas's scratch twin and blank mask (`crate::effects`),
     /// under the shell's scratch texture they stand with; the atlas itself
     /// is among `textures`, which its composites sample.
     pub(crate) effects: Option<(wgpu::Texture, Surface, Surface)>,
+    /// Layer shaders' passes and boxes by shader id (passes.rs), dropped
+    /// with their shaders (`GpuRenderer::drop_unheld_shaders`).
+    pub(crate) chains: rustc_hash::FxHashMap<u64, Chain>,
 }
 
 impl State {
@@ -1024,6 +1543,7 @@ impl State {
             ring: Ring::default(),
             regions: None,
             points: None,
+            blur_records: Vec::new(),
             last_regions: Vec::new(),
             atlas: None,
             target: None,
@@ -1031,7 +1551,11 @@ impl State {
             layers: Default::default(),
             textures: Default::default(),
             backdrop: None,
+            popup_backdrop: None,
+            blur_atlas: None,
+            blur_halves: None,
             effects: None,
+            chains: Default::default(),
         })
     }
 
@@ -1073,6 +1597,54 @@ impl State {
         Ok(())
     }
 
+    /// Blur batch `batch`'s records, part `part` (`crate::BlurRecord`s or
+    /// `crate::SlotRecord`s as bytes), as the raw buffer blur.wgsl reads:
+    /// written into the buffer kept for them, made or grown first if it
+    /// must be. Each batch and part has its own (a frame's batches write
+    /// none twice); the next frame's write comes after this frame's draws
+    /// on the immediate context (`UpdateSubresource` on a default buffer,
+    /// never mapped), so they read what this frame wrote.
+    pub(crate) fn set_blur_records(
+        &mut self,
+        batch: usize,
+        part: usize,
+        bytes: &[u8],
+    ) -> Result<ID3D11ShaderResourceView, GpuError> {
+        let index = batch * 2 + part;
+        let len = bytes.len().max(16).next_multiple_of(16);
+        if self.blur_records.len() <= index {
+            self.blur_records.resize_with(index + 1, || None);
+        }
+        let slot = &mut self.blur_records[index];
+        if slot.as_ref().is_none_or(|(_, _, capacity)| *capacity < len) {
+            let capacity = len.next_power_of_two().max(256);
+            let (buffer, view) = raw_buffer(&self.device.device, capacity, None)?;
+            *slot = Some((buffer, view, capacity));
+        }
+        let (buffer, view, _) = slot.as_ref().expect("made above");
+        if !bytes.is_empty() {
+            let area = D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: bytes.len() as u32,
+                bottom: 1,
+                back: 1,
+            };
+            // SAFETY: `bytes.len()` bytes into a buffer at least as large.
+            unsafe {
+                self.device.context.UpdateSubresource(
+                    buffer,
+                    0,
+                    Some(&area),
+                    bytes.as_ptr().cast(),
+                    0,
+                    0,
+                )
+            };
+        }
+        Ok(view.clone())
+    }
     /// The frame's viewport and clip regions (`crate::Region`s as bytes).
     pub(crate) fn set_frame(&mut self, viewport: [f32; 4], regions: &[u8]) -> Result<(), GpuError> {
         let context = &self.device.context;
@@ -1351,36 +1923,273 @@ pub(crate) struct Frame<'a> {
     /// The frame's polyline points, bound again after a blended draw takes
     /// their register for its backdrop.
     points: Option<ID3D11ShaderResourceView>,
+    /// The frame's clip regions, bound again after a backdrop blur takes
+    /// their register (`blur_draw`).
+    regions: ID3D11ShaderResourceView,
+    /// The most a layer shader's inputs bound at `INPUTS` (`inputs`), all
+    /// unbound as the frame ends: a pass draws into them next.
+    inputs: usize,
+}
+
+/// A slot of the backdrop blur's atlas (`Frame::blur`): its texels, and
+/// whether it is blurred (else a copy of an area, drawn only reducing).
+pub(crate) struct BlurSlot {
+    pub(crate) texels: Scissor,
+    pub(crate) blurred: bool,
+    /// Its place in the halves, twice its texels, where it reduces by 8.
+    pub(crate) halves: Option<Scissor>,
 }
 
 impl Frame<'_> {
-    /// A blended layer's composite (`Shading::Blend`), `instances` within
-    /// `rect` of `target`: the target under it copied to `backdrop` (of the
-    /// target's size), then drawn with blend.wgsl's pixel stage reading it,
-    /// replacing the target's pixels, as Direct3D 12's blend pipeline does.
-    /// Its layer's texture is the one bound (`texture`). Whether it drew.
-    pub(crate) fn blended(
+    /// A batch of backdrop filters blurred into `atlas`, as Direct3D 12's
+    /// `GpuRenderer::blur` draws them: reduced from `target` into the first
+    /// atlas, across into the second, then down into the first again (over
+    /// the copies it holds where `copies`), each slot under its texels'
+    /// scissor; `blurs` and `slots` the batch's records. A popup's blurs
+    /// reduce from its window's frame (`backdrop`) and its copies from its
+    /// own target, as Direct3D 12's do. Whether it could (its stages made).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn blur(
         &mut self,
         target: &Surface,
-        backdrop: &Surface,
-        rect: Scissor,
-        instances: std::ops::Range<u32>,
+        backdrop: Option<&Surface>,
+        atlas: &[Surface; 2],
+        halves: Option<&Surface>,
+        records: [&ID3D11ShaderResourceView; 2],
+        slots: &[BlurSlot],
+        copies: bool,
     ) -> bool {
         let device = self.device;
-        let pixel = device.blend.get_or_init(|| {
-            let mut shader = None;
-            // SAFETY: DXBC compiled by FXC (`translated_hlsl_matches`).
-            unsafe {
-                device
-                    .device
-                    .CreatePixelShader(BLEND_FS, None, Some(&mut shader))
-            }
-            .ok()?;
-            shader
-        });
-        let Some(pixel) = pixel else {
+        let Some(blur) = device
+            .blur
+            .get_or_init(|| BlurPipelines::new(&device.device))
+            .as_ref()
+        else {
             return false;
         };
+        let srv = |surface: &Surface| surface.srv.clone().expect("sampled");
+        // A factor-8 slot's reduce first sums its 4x4 squares into the
+        // halves (`fs_reduce4`), which the reduce then reads (blur.wgsl).
+        let halves = halves.filter(|_| slots.iter().any(|slot| slot.halves.is_some()));
+        if let Some(halves) = halves {
+            let draws = (slots.iter().enumerate())
+                .filter_map(|(k, slot)| slot.halves.map(|place| (k as u32, place)));
+            self.blur_draw(
+                blur,
+                halves,
+                false,
+                &blur.halves,
+                &blur.replace,
+                [&srv(backdrop.unwrap_or(target)), &srv(&atlas[1])],
+                records,
+                draws,
+            );
+        }
+        let passes = [
+            (
+                &blur.reduce,
+                srv(backdrop.unwrap_or(target)),
+                srv(halves.unwrap_or(&atlas[1])),
+                &atlas[0],
+                backdrop.is_some(),
+                false,
+            ),
+            (
+                &blur.across,
+                srv(&atlas[0]),
+                srv(&atlas[0]),
+                &atlas[1],
+                true,
+                false,
+            ),
+            (
+                &blur.down,
+                srv(&atlas[1]),
+                srv(&atlas[1]),
+                &atlas[0],
+                true,
+                copies,
+            ),
+        ];
+        for (pixel, source, other, into, blurred_only, keep) in passes {
+            let draws = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.texels.2 > 0 && slot.texels.3 > 0)
+                .filter(|(_, slot)| !blurred_only || slot.blurred)
+                .map(|(k, slot)| (k as u32, slot.texels));
+            self.blur_draw(
+                blur,
+                into,
+                keep,
+                pixel,
+                &blur.replace,
+                [&source, &other],
+                records,
+                draws,
+            );
+        }
+        // A popup's copies ("originals"): its own target, reduced over the
+        // blurs' averages.
+        if backdrop.is_some() && copies {
+            let draws = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.texels.2 > 0 && slot.texels.3 > 0 && !slot.blurred)
+                .map(|(k, slot)| (k as u32, slot.texels));
+            let (source, other) = (srv(target), srv(&atlas[1]));
+            self.blur_draw(
+                blur,
+                &atlas[0],
+                true,
+                &blur.reduce,
+                &blur.replace,
+                [&source, &other],
+                records,
+                draws,
+            );
+        }
+        true
+    }
+    /// A batch blurred into `atlas` (`blur`) drawn back over `target` under
+    /// each draw's scissor (its filter's index and output): replacing what
+    /// is there, or mixed over it (`mixed`, dual-source blending).
+    pub(crate) fn blur_back(
+        &mut self,
+        target: &Surface,
+        atlas: &Surface,
+        records: [&ID3D11ShaderResourceView; 2],
+        draws: &[(u32, Scissor)],
+        mixed: bool,
+    ) -> bool {
+        let device = self.device;
+        let Some(blur) = device.blur.get().and_then(Option::as_ref) else {
+            return false;
+        };
+        let source = atlas.srv.clone().expect("sampled");
+        let (pixel, blend) = match mixed {
+            true => (&blur.mix, &blur.mixed),
+            false => (&blur.vertical, &blur.replace),
+        };
+        self.blur_draw(
+            blur,
+            target,
+            true,
+            pixel,
+            blend,
+            [&source, &source],
+            records,
+            draws.iter().copied(),
+        );
+        true
+    }
+    /// Draws of a backdrop blur's stage into `into` (cleared first unless
+    /// `keep`): each its instance index (b0) and scissor, a triangle over
+    /// the whole target. The frame's own bindings come back after (`rebind`).
+    #[allow(clippy::too_many_arguments)]
+    fn blur_draw(
+        &mut self,
+        blur: &BlurPipelines,
+        into: &Surface,
+        keep: bool,
+        pixel: &ID3D11PixelShader,
+        blend: &ID3D11BlendState,
+        textures: [&ID3D11ShaderResourceView; 2],
+        records: [&ID3D11ShaderResourceView; 2],
+        draws: impl Iterator<Item = (u32, Scissor)>,
+    ) {
+        let context = &self.device.context;
+        let rtv = into.rtv.clone().expect("a render target");
+        // SAFETY: Live objects of this device, bound to its context; what
+        // is drawn into is never one of the textures it samples.
+        unsafe {
+            context.PSSetShaderResources(0, Some(&[None, None, None, None]));
+            context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.,
+                TopLeftY: 0.,
+                Width: into.width as f32,
+                Height: into.height as f32,
+                MinDepth: 0.,
+                MaxDepth: 1.,
+            }]));
+            if !keep {
+                context.ClearRenderTargetView(&rtv, &[0.; 4]);
+            }
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&blur.vertex, None);
+            context.PSSetShader(pixel, None);
+            context.OMSetBlendState(blend, None, u32::MAX);
+            context.VSSetConstantBuffers(0, Some(&[Some(blur.index.clone())]));
+            context.PSSetConstantBuffers(0, Some(&[Some(blur.index.clone())]));
+            context.PSSetShaderResources(
+                0,
+                Some(&[
+                    Some(textures[0].clone()),
+                    Some(textures[1].clone()),
+                    Some(records[0].clone()),
+                    Some(records[1].clone()),
+                ]),
+            );
+            for (index, (x, y, width, height)) in draws {
+                // naga's special constants: first vertex, first instance.
+                let constants = [0_i32, index as i32, 0, 0];
+                context.UpdateSubresource(&blur.index, 0, None, constants.as_ptr().cast(), 0, 0);
+                context.RSSetScissorRects(Some(&[RECT {
+                    left: x as i32,
+                    top: y as i32,
+                    right: (x + width) as i32,
+                    bottom: (y + height) as i32,
+                }]));
+                context.DrawInstanced(3, 1, 0, 0);
+            }
+            context.PSSetShaderResources(0, Some(&[None, None, None, None]));
+        }
+        self.scissor = None;
+        self.current = None;
+    }
+    /// The frame's own bindings again after a backdrop blur took them
+    /// (`blur`, `blur_back`): its target and viewport, its quads, the
+    /// viewport's constants, its regions and points, its sampler. The
+    /// caller binds its texture again (the glyph atlas, `texture`).
+    pub(crate) fn rebind(&mut self, state: &State, target: &Surface, vertices: &ID3D11Buffer) {
+        let context = &self.device.context;
+        let rtv = target.rtv.clone().expect("a render target");
+        // SAFETY: As `Device::begin` binds them.
+        unsafe {
+            context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.,
+                TopLeftY: 0.,
+                Width: target.width as f32,
+                Height: target.height as f32,
+                MinDepth: 0.,
+                MaxDepth: 1.,
+            }]));
+            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context.IASetVertexBuffers(
+                0,
+                1,
+                Some(&Some(vertices.clone())),
+                Some(&(size_of::<crate::Quad>() as u32)),
+                Some(&0),
+            );
+            context.VSSetConstantBuffers(0, Some(&[Some(state.viewport.clone())]));
+            context.PSSetConstantBuffers(0, Some(&[Some(state.viewport.clone())]));
+            context.PSSetShaderResources(REGIONS, Some(&[Some(self.regions.clone())]));
+            if let Some(points) = &self.points {
+                context.PSSetShaderResources(POINTS, Some(&[Some(points.clone())]));
+            }
+            context.PSSetSamplers(0, Some(&[Some(self.device.sampler.clone())]));
+        }
+        self.nearest = false;
+        self.scissor = None;
+        self.current = None;
+    }
+    /// What the target holds within `rect` copied to `backdrop` (of the
+    /// target's size), for the blended draws after it (`blended`) to read.
+    pub(crate) fn copy_backdrop(&mut self, target: &Surface, backdrop: &Surface, rect: Scissor) {
         let (x, y, width, height) = rect;
         let region = D3D11_BOX {
             left: x,
@@ -1393,8 +2202,10 @@ impl Frame<'_> {
         // SAFETY: Two textures of one size and format, the box within both;
         // the backdrop is bound to no stage while it is written.
         unsafe {
-            device.context.PSSetShaderResources(POINTS, Some(&[None]));
-            device.context.CopySubresourceRegion(
+            self.device
+                .context
+                .PSSetShaderResources(POINTS, Some(&[None]));
+            self.device.context.CopySubresourceRegion(
                 &backdrop.texture,
                 0,
                 x,
@@ -1405,6 +2216,45 @@ impl Frame<'_> {
                 Some(&region),
             );
         }
+    }
+    /// A blended layer's composite, `instances` within `rect`, over the
+    /// copy of the target under it in `backdrop` (`copy_backdrop`): with
+    /// blend.wgsl's pixel stage (`Shading::Blend`), or the layer shader
+    /// `glass` reading it (`Shading::FilterBlend`, compiled), replacing the
+    /// target's pixels as Direct3D 12's blend pipelines do. Its layer's
+    /// texture is the one bound (`texture`). Whether it drew.
+    pub(crate) fn blended(
+        &mut self,
+        glass: Option<u64>,
+        backdrop: &Surface,
+        rect: Scissor,
+        instances: std::ops::Range<u32>,
+    ) -> bool {
+        let device = self.device;
+        let pixel = match glass {
+            None => device
+                .blend
+                .get_or_init(|| {
+                    let mut shader = None;
+                    // SAFETY: DXBC compiled by FXC (`translated_hlsl_matches`).
+                    unsafe {
+                        device
+                            .device
+                            .CreatePixelShader(BLEND_FS, None, Some(&mut shader))
+                    }
+                    .ok()?;
+                    shader
+                })
+                .clone(),
+            Some(id) => device
+                .app_shaders
+                .borrow()
+                .get(&(id, AppShader::FilterBlend))
+                .and_then(|entry| entry.pixel.clone()?),
+        };
+        let Some(pixel) = pixel else {
+            return false;
+        };
         // Replacing (no blending), with the full pipeline's vertex stage
         // and layout.
         self.bind(Bound::FullClear);
@@ -1413,7 +2263,7 @@ impl Frame<'_> {
         // SAFETY: A pixel stage reading what the full vertex stage writes
         // (draw.wgsl's `Out`), and its backdrop, in the registers it binds.
         unsafe {
-            device.context.PSSetShader(pixel, None);
+            device.context.PSSetShader(&pixel, None);
             device
                 .context
                 .PSSetShaderResources(POINTS, Some(std::slice::from_ref(&backdrop.srv)));
@@ -1468,6 +2318,21 @@ impl Frame<'_> {
                 .context
                 .PSSetSamplers(0, Some(&[Some(sampler.clone())]));
         }
+    }
+    /// What a layer shader with inputs reads (`chain`'s passes' latest and
+    /// its boxes) bound for the draws after, if its passes have run.
+    pub(crate) fn inputs(&mut self, chain: &Chain) {
+        let Some(bound) = &chain.bound else {
+            return;
+        };
+        // SAFETY: Live views of this device, which no draw of this frame
+        // draws into, and its sampler, in the registers the composite reads.
+        unsafe {
+            let context = &self.device.context;
+            context.PSSetShaderResources(INPUTS, Some(bound));
+            context.PSSetSamplers(INPUT_SAMPLER, Some(&[Some(self.device.sampler.clone())]));
+        }
+        self.inputs = self.inputs.max(bound.len());
     }
     pub(crate) fn texture(&mut self, view: &ID3D11ShaderResourceView) {
         // SAFETY: A live view, in the register both modules read it from.
@@ -1586,8 +2451,8 @@ impl Frame<'_> {
     /// presenting flushes it. Then `Ring::submitted`.
     pub(crate) fn end(self) {
         // SAFETY: Unbinds the target, which a resize or readback may next
-        // release or copy, and the texture sampled, which may be a layer
-        // the next frame draws into.
+        // release or copy, and the textures sampled, which may be a layer
+        // the next frame draws into, or a pass's.
         unsafe {
             self.device.context.OMSetRenderTargets(None, None);
             self.device
@@ -1596,15 +2461,19 @@ impl Frame<'_> {
             self.device
                 .context
                 .VSSetShaderResources(TEXTURE, Some(&[None]));
+            if self.inputs > 0 {
+                (self.device.context).PSSetShaderResources(INPUTS, Some(&vec![None; self.inputs]));
+            }
         }
     }
 }
 
 /// A WGSL module as HLSL for shader model 5.0 (Direct3D 11's feature level
 /// 11_0), with zgx's registers: `TEXTURE`, `REGIONS`, the viewport in b0
-/// and the sampler in s0. naga writes samplers through Direct3D 12's
+/// and the sampler in s0 (a layer shader's inputs at `INPUTS`, their
+/// sampler in `INPUT_SAMPLER`). naga writes samplers through Direct3D 12's
 /// sampler heap, which shader model 5.0 has none of: its declarations are
-/// replaced with the plain sampler the module binds.
+/// replaced with the plain samplers the module binds.
 /// Which of zgx's WGSL modules `translate` writes: its bindings' registers.
 #[derive(Clone, Copy, PartialEq)]
 enum Module {
@@ -1614,18 +2483,27 @@ enum Module {
     Copy,
     /// effects.wgsl: its source in `TEXTURE`, its mask in `MASK`.
     Effects,
+    /// blur.wgsl (with `crate::BLUR_MIX`): its source and original textures
+    /// in t0 and t1, its filters' and slots' records in t2 and t3.
+    Blur,
+    /// A layer shader's pass (`passes::pass_source`): its inputs (group 0)
+    /// where the composite binds them, its uniforms in `PASS_UNIFORMS`.
+    Pass,
 }
 
 fn translate(source: &str, module_kind: Module) -> Result<(String, Vec<(String, String)>), String> {
     use naga::back::hlsl;
     use wgpu::naga;
     let module = naga::front::wgsl::parse_str(source).map_err(|e| e.to_string())?;
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::default(),
-    )
-    .validate(&module)
-    .map_err(|e| e.to_string())?;
+    // blur.wgsl's mix blends by its second source (`crate::BLUR_MIX`), which
+    // Direct3D 11 has at feature level 11_0.
+    let capabilities = match module_kind {
+        Module::Blur => naga::valid::Capabilities::DUAL_SOURCE_BLENDING,
+        _ => naga::valid::Capabilities::default(),
+    };
+    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
+        .validate(&module)
+        .map_err(|e| e.to_string())?;
     let target = |register| hlsl::BindTarget {
         space: 0,
         register,
@@ -1633,23 +2511,51 @@ fn translate(source: &str, module_kind: Module) -> Result<(String, Vec<(String, 
     };
     let binding = |group, binding| naga::ResourceBinding { group, binding };
     let mut binding_map = hlsl::BindingMap::new();
+    // A layer shader's inputs (passes.rs `declarations`) in `group`: the
+    // sampler's index in the heap's table (replaced below), the boxes, then
+    // each texture.
+    let inputs = |binding_map: &mut hlsl::BindingMap, group| {
+        binding_map.insert(binding(group, 0), target(INPUT_SAMPLER));
+        binding_map.insert(binding(group, 1), target(INPUTS));
+        for index in 0..MOST_INPUTS {
+            binding_map.insert(binding(group, 2 + index), target(INPUTS + 1 + index));
+        }
+    };
     let copies = module_kind == Module::Copy;
-    if copies {
-        binding_map.insert(binding(0, 0), target(TEXTURE));
-    } else {
-        binding_map.insert(binding(0, 1), target(TEXTURE));
-        // The sampler's index in the heap's table (replaced below).
-        binding_map.insert(binding(0, 2), target(0));
-        if module_kind == Module::Effects {
-            binding_map.insert(binding(1, 0), target(MASK));
-        } else {
-            binding_map.insert(binding(1, 0), target(0));
-            binding_map.insert(binding(1, 1), target(REGIONS));
-            binding_map.insert(binding(2, 0), target(POINTS));
+    match module_kind {
+        Module::Copy => {
+            binding_map.insert(binding(0, 0), target(TEXTURE));
+        }
+        Module::Pass => {
+            inputs(&mut binding_map, 0);
+            binding_map.insert(binding(1, 0), target(PASS_UNIFORMS));
+        }
+        Module::Blur => {
+            for slot in 0..4 {
+                binding_map.insert(binding(0, slot), target(slot));
+            }
+            // The sampler's index in the heap's table (replaced below).
+            binding_map.insert(binding(0, 4), target(0));
+        }
+        Module::Draw | Module::Effects => {
+            binding_map.insert(binding(0, 1), target(TEXTURE));
+            // The sampler's index in the heap's table (replaced below).
+            binding_map.insert(binding(0, 2), target(0));
+            if module_kind == Module::Effects {
+                binding_map.insert(binding(1, 0), target(MASK));
+            } else {
+                binding_map.insert(binding(1, 0), target(0));
+                binding_map.insert(binding(1, 1), target(REGIONS));
+                binding_map.insert(binding(2, 0), target(POINTS));
+                inputs(&mut binding_map, crate::passes::GROUP);
+            }
         }
     }
     let mut sampler_buffer_binding_map = hlsl::SamplerIndexBufferBindingMap::new();
-    sampler_buffer_binding_map.insert(hlsl::SamplerIndexBufferKey { group: 0 }, target(15));
+    // (Its declarations are replaced below, every group's alike.)
+    for group in [0, crate::passes::GROUP] {
+        sampler_buffer_binding_map.insert(hlsl::SamplerIndexBufferKey { group }, target(15));
+    }
     // As wgpu's Direct3D 12 backend writes them (wgpu-hal dx12 device.rs).
     let options = hlsl::Options {
         shader_model: hlsl::ShaderModel::V5_0,
@@ -1657,6 +2563,10 @@ fn translate(source: &str, module_kind: Module) -> Result<(String, Vec<(String, 
         sampler_buffer_binding_map,
         restrict_indexing: true,
         force_loop_bounding: true,
+        // blur.wgsl's draws pick their slot or filter by instance index,
+        // which Direct3D's SV_InstanceID counts from 0 whatever the draw's
+        // first instance: naga adds that from b0 (`BlurPipelines::index`).
+        special_constants_binding: (module_kind == Module::Blur).then(|| target(0)),
         ..Default::default()
     };
     let mut hlsl = String::new();
@@ -1669,39 +2579,59 @@ fn translate(source: &str, module_kind: Module) -> Result<(String, Vec<(String, 
         .zip(reflection.entry_point_names)
         .map(|(entry, name)| Ok((entry.name.clone(), name.map_err(|e| e.to_string())?)))
         .collect::<Result<Vec<_>, String>>()?;
+    // naga writes its special constants (the blur's first instance, b0) as
+    // shader model 5.1's `ConstantBuffer<T>`, which FXC's 5.0 doesn't know:
+    // the same constants as a `cbuffer` holding them, read alike.
+    let hlsl = hlsl.replace(
+        "ConstantBuffer<NagaConstants> _NagaConstants: register(b0);",
+        "cbuffer NagaConstantsBuffer : register(b0) { NagaConstants _NagaConstants; }",
+    );
     if copies {
         return Ok((hlsl, names));
     }
-    // The sampler heap, its comparison twin and group 0's index table go;
-    // the sampler read from them is bound itself.
+    // The sampler heap, its comparison twin and each group's index table go;
+    // each sampler read from them is bound itself, in the register its
+    // index names.
     let mut out = String::new();
-    let mut replaced = 0;
+    let (mut heaps, mut tables, mut samplers) = (0, 0, 0);
     for line in hlsl.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("SamplerState nagaSamplerHeap[")
             || trimmed.starts_with("SamplerComparisonState nagaComparisonSamplerHeap[")
-            || trimmed.starts_with("StructuredBuffer<uint> nagaGroup0SamplerIndexArray")
         {
-            replaced += 1;
+            heaps += 1;
             continue;
         }
-        // `static const SamplerState tex_sampler = nagaSamplerHeap[…];`
-        // (draw.wgsl's; effects.wgsl's is `linear`).
-        if let Some(name) = trimmed
+        if trimmed.starts_with("StructuredBuffer<uint> nagaGroup")
+            && trimmed.contains("SamplerIndexArray")
+        {
+            tables += 1;
+            continue;
+        }
+        // `static const SamplerState tex_sampler = nagaSamplerHeap[
+        // nagaGroup0SamplerIndexArray[0]];` (draw.wgsl's; effects.wgsl's is
+        // `linear`, a shader's inputs' `zgx_input_sampler`).
+        if let Some((name, register)) = trimmed
             .strip_prefix("static const SamplerState ")
             .and_then(|rest| rest.split_once(" = nagaSamplerHeap["))
-            .map(|(name, _)| name)
+            .and_then(|(name, index)| {
+                let (_, register) = index.split_once('[')?;
+                let (register, _) = register.split_once(']')?;
+                Some((name, register.parse::<u32>().ok()?))
+            })
         {
-            replaced += 1;
-            out.push_str(&format!("SamplerState {name} : register(s0);\n"));
+            samplers += 1;
+            out.push_str(&format!("SamplerState {name} : register(s{register});\n"));
             continue;
         }
         out.push_str(line);
         out.push('\n');
     }
-    if replaced != 4 || out.contains("nagaSamplerHeap") || out.contains("SamplerIndexArray") {
+    let written = heaps == 2 && tables >= 1 && samplers >= tables;
+    if !written || out.contains("nagaSamplerHeap") || out.contains("SamplerIndexArray") {
         return Err(format!(
-            "naga's sampler heap is not written as expected ({replaced} of 4 lines replaced)"
+            "naga's sampler heap is not written as expected \
+             ({heaps} heaps, {tables} index tables and {samplers} samplers replaced)"
         ));
     }
     Ok((out, names))
@@ -1715,6 +2645,18 @@ fn translate(source: &str, module_kind: Module) -> Result<(String, Vec<(String, 
 /// modules), else here.
 fn fragment(source: &str, entry: &str) -> Result<Vec<u8>, String> {
     let (hlsl, names) = translate(source, Module::Draw)?;
+    fxc(&hlsl, &names, entry, "ps_5_0")
+}
+
+/// The DXBC of `entry` (a WGSL name, among `names`) of `translate`'s `hlsl`
+/// for `target` (`ps_5_0`, or a pass's `vs_5_0`), compiled as `fragment`
+/// says.
+fn fxc(
+    hlsl: &str,
+    names: &[(String, String)],
+    entry: &str,
+    target: &str,
+) -> Result<Vec<u8>, String> {
     let name = names
         .iter()
         .find(|(wgsl, _)| wgsl == entry)
@@ -1730,9 +2672,9 @@ fn fragment(source: &str, entry: &str) -> Result<Vec<u8>, String> {
         .get()
         .map_or(cfg!(debug_assertions), |&(_, debug)| debug);
     let job = crate::fxc_child::Job {
-        source: &hlsl,
+        source: hlsl,
         entry_point: name,
-        target: "ps_5_0",
+        target,
         flags: STRICTNESS | if debug { DEBUG_SKIP_OPTIMIZATION } else { 0 },
     };
     if crate::fxc_child::available() {
@@ -1805,6 +2747,69 @@ mod tests {
         assert!(name.contains("Basic Render Driver"), "{name}");
     }
 
+    /// A layer shader's pass and its composite are written with its inputs'
+    /// registers (the composite's own clear of them), and FXC compiles
+    /// every stage drawn from them.
+    #[test]
+    fn a_shader_with_passes_reads_its_inputs_where_they_are_bound() {
+        use zgx::decoration::{FillShader, PassFormat, PassSize, ShaderInputs, ShaderPass};
+        let pass = |name: &str, source: &str| ShaderPass {
+            name: name.into(),
+            source: source.into(),
+            size: PassSize::Pixels(4, 4),
+            format: PassFormat::Rgba16Float,
+            feedback: true,
+            steps: 1,
+            once: false,
+        };
+        let inputs = ShaderInputs {
+            passes: vec![
+                pass(
+                    "state",
+                    "fn run(input: PassInput) -> vec4<f32> { return zgx_state(input.uv) + 1.0; }",
+                ),
+                pass(
+                    "shown",
+                    "fn run(input: PassInput) -> vec4<f32> {
+                        return zgx_state_texel(vec2(0)) + vec4(f32(zgx_rect_count()));
+                    }",
+                ),
+            ],
+            geometry: Some(1),
+            ..Default::default()
+        };
+        let shader = FillShader::with_inputs(
+            "fn layer(input: LayerInput) -> vec4<f32> {
+                return zgx_shown(vec2(0.5)) + vec4(zgx_rect_distance(input.p, 0u));
+            }",
+            None,
+            inputs.clone(),
+        );
+        let bound = [
+            "SamplerState zgx_input_sampler : register(s1);",
+            "ByteAddressBuffer zgx_rects : register(t8);",
+            ": register(t9);",
+            ": register(t10);",
+        ];
+        let source = crate::passes::pass_source(&inputs.passes[1].source, &inputs);
+        let (hlsl, names) = translate(&source, Module::Pass).unwrap();
+        for line in bound.iter().chain(&["cbuffer zgx_pass : register(b1)"]) {
+            assert!(hlsl.contains(line), "{line} in\n{hlsl}");
+        }
+        fxc(&hlsl, &names, "zgx_pass_vertex", "vs_5_0").unwrap();
+        fxc(&hlsl, &names, "zgx_pass_fragment", "ps_5_0").unwrap();
+        let source = crate::passes::composite_source(&shader, &inputs);
+        let (hlsl, _) = translate(&source, Module::Draw).unwrap();
+        for line in bound
+            .iter()
+            .chain(&["SamplerState tex_sampler : register(s0);"])
+        {
+            assert!(hlsl.contains(line), "{line} in\n{hlsl}");
+        }
+        fragment(&source, "zgx_filter").unwrap();
+        fragment(&source, "zgx_filter_blended").unwrap();
+    }
+
     #[test]
     fn translated_hlsl_matches() {
         let bless = std::env::var_os("ZGX_BLESS").is_some_and(|v| v != "0");
@@ -1815,6 +2820,24 @@ mod tests {
                  `ZGX_BLESS=1 cargo test -p zgx-gpu --features d3d11 --lib translated_hlsl`"
             )
         };
+        // With `ZGX_SHADER_OUT`, each stale file is written there as well
+        // (CI's Windows job keeps them, for a machine without FXC to take),
+        // and the test fails once, naming them all.
+        let out = std::env::var_os("ZGX_SHADER_OUT").map(std::path::PathBuf::from);
+        let mut stale_files: Vec<String> = Vec::new();
+        let mut keep = |file: &str, bytes: &[u8]| {
+            if let Some(out) = &out {
+                let path = out.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            stale_files.push(stale(file));
+        };
+        let blur = format!(
+            "enable dual_source_blending;\n{}\n{}",
+            include_str!("blur.wgsl"),
+            crate::BLUR_MIX
+        );
         for (wgsl, module, name, entries) in [
             (
                 include_str!("draw.wgsl"),
@@ -1864,6 +2887,20 @@ mod tests {
                     ("fs_polyline", "ps_5_0", POLYLINE_FS),
                 ][..],
             ),
+            (
+                blur.as_str(),
+                Module::Blur,
+                "blur",
+                &[
+                    ("vs", "vs_5_0", BLUR_VS),
+                    ("fs_reduce", "ps_5_0", BLUR_REDUCE),
+                    ("fs_reduce4", "ps_5_0", BLUR_REDUCE4),
+                    ("fs_across", "ps_5_0", BLUR_ACROSS),
+                    ("fs_down", "ps_5_0", BLUR_DOWN),
+                    ("fs", "ps_5_0", BLUR_FS),
+                    ("fs_mix", "ps_5_0", BLUR_MIX_FS),
+                ][..],
+            ),
         ] {
             let (hlsl, names) = translate(wgsl, module).unwrap();
             let file = format!("{name}.hlsl");
@@ -1871,7 +2908,9 @@ mod tests {
                 std::fs::write(dir.join(&file), &hlsl).unwrap();
             } else {
                 let kept = std::fs::read_to_string(dir.join(&file)).unwrap_or_default();
-                assert!(kept == hlsl, "{}", stale(&file));
+                if kept != hlsl {
+                    keep(&file, hlsl.as_bytes());
+                }
             }
             for &(entry, target, kept) in entries {
                 let (_, hlsl_name) = names
@@ -1883,10 +2922,11 @@ mod tests {
                 let file = format!("dxbc/{name}_{entry}.dxbc");
                 if bless {
                     std::fs::write(dir.join(&file), &code).unwrap();
-                } else {
-                    assert!(kept == &code[..], "{}", stale(&file));
+                } else if kept != &code[..] {
+                    keep(&file, &code);
                 }
             }
         }
+        assert!(stale_files.is_empty(), "{}", stale_files.join("\n"));
     }
 }

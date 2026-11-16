@@ -44,3 +44,33 @@ what one taking characters is given.
 With `zgx-alacritty-terminal` 0.26.4 writing a run at once
 (`Term::input_str`), `terminal` went from 730.4 M to 665.3 M instructions
 (−8.9%), and `terminal-pictures` −0.19%.
+
+## XTGETTCAP gathered and asked for
+
+`src/ansi.rs`: a DCS string `+q` (XTGETTCAP, a program asking the terminal
+for terminfo capabilities by name, as nvim does for direct colour where
+`COLORTERM` isn't set) is gathered as it arrives, up to 1,024 bytes, and given to
+`Handler::request_termcap(&[u8])` as it ends: the names, each hex encoded,
+split by `;`. By default it does nothing; other DCS strings, and one longer
+than that, go unanswered as before. `termcap_requests_reach_the_handler_whole`
+checks a request split across reads, a sixel image, DECRQSS and an empty and
+a long request beside it. Version 0.15.1.
+
+## XTVERSION asked
+
+`CSI > q` (or `CSI > 0 q`, XTVERSION) calls `Handler::report_version`, by
+default nothing; `version_requests_reach_the_handler` checks another
+parameter asks nothing and DECSCUSR still sets the cursor. Version 0.15.2.
+
+## A cell's size asked
+
+`CSI 16 t` calls `Handler::cell_size_pixels`, by default nothing;
+`cell_size_requests_reach_the_handler` checks it beside `14 t` and `18 t`.
+Version 0.15.3.
+
+## DECRQSS gathered and asked for
+
+A DCS string `$q` (DECRQSS) is gathered as XTGETTCAP's is and given to
+`Handler::report_setting(&[u8])` as it ends: the setting's final bytes (`m`,
+` q`, `r`). `setting_requests_reach_the_handler_whole` checks one split
+across reads and XTGETTCAP's beside it. Version 0.15.4.

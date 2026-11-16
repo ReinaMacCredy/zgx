@@ -7,6 +7,7 @@
 //! The host turns it on (`Ui::set_elastic_scrolling`) and reports a trackpad
 //! gesture's phases (`InputEvent::ScrollGesture`); a mouse wheel's notches,
 //! and scrolling an app does, never stretch. Off, nothing here runs.
+use crate::time::Instant;
 use crate::{
     input::{DispatchResult, InputEvent, ScrollGesture, SwipeStep},
     reactive::Signal,
@@ -16,7 +17,6 @@ use crate::{
 use std::{
     cell::Cell,
     rc::{Rc, Weak},
-    time::Instant,
 };
 
 /// How much push a point of stretch takes. Measured on an `NSScrollView`, and
@@ -334,7 +334,9 @@ pub(crate) fn before_scroll(ui: &Ui, event: InputEvent) -> Option<InputEvent> {
     {
         let mut state = ui.elastic_state().borrow_mut();
         if state.fingers {
-            let now = Instant::now();
+            // The interface's time, as the spring's: a virtual clock's
+            // too, or a push's speed would be the wall clock's.
+            let now = crate::clock::now();
             state.speed[0].scrolled(delta_x, now);
             state.speed[1].scrolled(delta_y, now);
         }

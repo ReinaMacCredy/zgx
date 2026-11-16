@@ -726,3 +726,227 @@ fn pictures_in_rows_built_ahead_decode_before_they_show() {
     spare(&ui);
     assert!(decoded(9), "row 9's picture: {:?}", decoded_names());
 }
+
+/// Set, a decode `held_picture` makes goes on.
+static HELD_GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once `held_picture` has begun: the decoding thread is busy with it.
+static HELD_BEGUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A 300 by 300 picture that decodes once `HELD_GO` is set (or after ten
+/// seconds), holding the decoding thread till then.
+fn held_picture(_: &[u8]) -> Result<std::sync::Arc<[u8]>, String> {
+    use std::sync::atomic::Ordering;
+    HELD_BEGUN.store(true, Ordering::Relaxed);
+    let until = Instant::now() + Duration::from_secs(10);
+    while !HELD_GO.load(Ordering::Relaxed) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok([90, 120, 200, 255].repeat(300 * 300).into())
+}
+/// Until `done` says so, or ten seconds.
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < until, "{what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A list whose last row built ahead found no room for its pictures (the
+/// process's decodes ahead were all waiting) asks for no spare time at rest
+/// once room comes back: what it let go of is no longer its to ask for.
+#[test]
+fn at_rest_a_list_asks_no_spare_time_when_room_for_pictures_comes_back() {
+    use std::sync::{Arc, atomic::Ordering};
+    use zgx::image::{AHEAD_MOST, ImageData, ahead_room};
+    let _alone = pictures_alone();
+    wait_until("a decode ahead left over", ahead_room);
+    let mut ui = hosted();
+    let (offset, _rows) = fixed(&mut ui, 10_000);
+    spare(&ui);
+    for to in [100., 200., 300.] {
+        scroll_to(&ui, &offset, to);
+        spare(&ui);
+    }
+    // No room ahead: one decode holds the decoding thread, `AHEAD_MOST` wait.
+    HELD_GO.store(false, Ordering::Relaxed);
+    HELD_BEGUN.store(false, Ordering::Relaxed);
+    let held: Vec<Arc<ImageData>> = (0..=AHEAD_MOST)
+        .map(|i| {
+            let file: Arc<[u8]> = format!("held {i}").into_bytes().into();
+            Arc::new(ImageData::kept(300, 300, file, held_picture).unwrap())
+        })
+        .collect();
+    let first = held[0].decode_ahead((300, 300)).expect("asked ahead");
+    wait_until("the held decode to begin", || {
+        HELD_BEGUN.load(Ordering::Relaxed)
+    });
+    let waiting: Vec<_> = held[1..]
+        .iter()
+        .map(|image| image.decode_ahead((300, 300)))
+        .collect();
+    assert!(waiting.iter().all(Option::is_some), "all asked ahead");
+    assert!(!ahead_room());
+    // Its last row built ahead: no room to ask for its pictures.
+    scroll_to(&ui, &offset, 400.);
+    spare(&ui);
+    // Room comes back while it rests.
+    HELD_GO.store(true, Ordering::Relaxed);
+    wait_until("room ahead again", ahead_room);
+    ui.release_kept_rows().unwrap();
+    assert!(!ui.spare_work_wanted(), "nothing wakes it at rest");
+    drop((first, waiting));
+}
+
+/// A list scrolled by the view around it (`virtualize_in_ancestor`), its rows
+/// of their own heights, builds ahead as that view scrolls, as one that
+/// scrolls itself does: its view's moves are a scroll's, not rows settling.
+#[test]
+fn a_list_scrolled_by_the_view_around_it_builds_ahead_too() {
+    let mut ui = hosted();
+    let panel = ui.signal(0.);
+    let rows = Rows::default();
+    let built = rows.clone();
+    let heights = VariableHeights::new(&ui.runtime, 1000, 20.);
+    ui.mount(
+        scroll(panel.clone()).w(400.).h(100.).child(
+            column().w_full().child(
+                variable_virtual_list(
+                    ui.signal(0.),
+                    heights,
+                    0,
+                    |i| i,
+                    move |_, i, cx| built.row(i, 20., cx),
+                )
+                .virtualize_in_ancestor()
+                .w_full(),
+            ),
+        ),
+    );
+    ui.prepare_frame();
+    moves(&ui, &panel);
+    let mut at_first = rows.take();
+    at_first.dedup();
+    assert!(at_first.len() < 12, "the view's rows: {at_first:?}");
+    spare(&ui);
+    let ahead = rows.take();
+    assert!(
+        ahead
+            .iter()
+            .max()
+            .is_some_and(|last| (*last as f32 + 1.) * 20. >= 200.),
+        "a viewport beyond the view, built in spare time: {ahead:?}"
+    );
+    // Within what was built, the frame builds nothing.
+    scroll_to(&ui, &panel, 90.);
+    assert_eq!(
+        rows.take(),
+        Vec::<usize>::new(),
+        "built by the scroll's frame"
+    );
+}
+
+/// A list scrolled by the view around it, that view moving while the rows
+/// it shows stay the same: its pass does nothing (it asks no row's key).
+/// Rows coming into view, or rows' heights changing, run it again.
+#[test]
+fn a_list_scrolled_by_the_view_around_it_skips_passes_that_show_the_same_rows() {
+    let mut ui = Ui::new(400., 100.);
+    let panel = ui.signal(0.);
+    let rows = Rows::default();
+    let built = rows.clone();
+    let asked = Rc::new(Cell::new(0_usize));
+    let counted = asked.clone();
+    let heights = VariableHeights::new(&ui.runtime, 1000, 20.);
+    let resized = heights.clone();
+    ui.mount(
+        scroll(panel.clone()).w(400.).h(100.).child(
+            column().w_full().child(
+                variable_virtual_list(
+                    ui.signal(0.),
+                    heights,
+                    0,
+                    move |i| {
+                        counted.set(counted.get() + 1);
+                        i
+                    },
+                    move |_, i, cx| built.row(i, 20., cx),
+                )
+                .virtualize_in_ancestor()
+                .w_full(),
+            ),
+        ),
+    );
+    ui.prepare_frame();
+    // Rows 0 to 5 show (row 5 in part).
+    scroll_to(&ui, &panel, 2.);
+    rows.take();
+    asked.set(0);
+    for to in [3., 4., 5., 6.] {
+        scroll_to(&ui, &panel, to);
+    }
+    assert_eq!(asked.get(), 0, "passes over the same rows");
+    assert_eq!(rows.take(), Vec::<usize>::new());
+    // Row 6 comes into view.
+    scroll_to(&ui, &panel, 30.);
+    assert!(asked.get() > 0);
+    assert_eq!(rows.take(), vec![6]);
+    // Row 6 grows, pushing row 7 past the view: a pass, the same rows.
+    asked.set(0);
+    resized.set_height(6, 40.).unwrap();
+    ui.prepare_frame();
+    assert!(asked.get() > 0, "a height changed");
+    // And row 0's place in view still built as the view comes back.
+    scroll_to(&ui, &panel, 0.);
+    assert!(rows.take().contains(&0));
+}
+
+/// A list scrolled by the view around it keeps an anchor with no position
+/// (NaN): scrolled, its heights changed, its window resized and the list
+/// mounted again, its own offset stays where it was, finite, and it builds
+/// the rows that view shows.
+#[test]
+fn a_list_scrolled_by_the_view_around_it_keeps_a_finite_place() {
+    let mut ui = hosted();
+    let heights = VariableHeights::new(&ui.runtime, 1000, 20.);
+    for _ in 0..2 {
+        let panel = ui.signal(0.);
+        let own = ui.signal(0.);
+        let rows = Rows::default();
+        let built = rows.clone();
+        let tree = ui.mount(
+            scroll(panel.clone()).w_full().h_full().child(
+                column().w_full().child(
+                    variable_virtual_list(
+                        own.clone(),
+                        heights.clone(),
+                        0,
+                        |i| i,
+                        move |_, i, cx| built.row(i, 20., cx),
+                    )
+                    .virtualize_in_ancestor()
+                    .w_full(),
+                ),
+            ),
+        );
+        ui.prepare_frame();
+        scroll_to(&ui, &panel, 300.);
+        // Rows 0 to 4 grow: rows settle, the view stays at 300.
+        heights.set_heights(&[(0, 40.), (1, 40.), (2, 40.), (3, 40.), (4, 40.)]);
+        ui.prepare_frame();
+        ui.scene.borrow_mut().resize(400., 200.);
+        ui.prepare_frame();
+        spare(&ui);
+        assert_eq!(own.get(), 0., "its own offset, untouched");
+        let all = rows.take();
+        // 300 to 500 shows rows 10 to 19 (rows 0 to 4 are 40 tall).
+        assert!(
+            all.contains(&10) && all.contains(&19),
+            "the rows shown: {all:?}"
+        );
+        assert!(own.get().is_finite());
+        tree.unmount();
+        ui.prepare_frame();
+        ui.scene.borrow_mut().resize(400., 100.);
+        heights.set_heights(&[(0, 20.), (1, 20.), (2, 20.), (3, 20.), (4, 20.)]);
+    }
+}

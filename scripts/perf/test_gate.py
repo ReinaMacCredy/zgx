@@ -148,5 +148,115 @@ class FairTests(unittest.TestCase):
         self.assertNotIn('--fair-sched=yes', commands[1])
 
 
+class ReadsTests(unittest.TestCase):
+    def test_a_scene_naming_a_setting_runs_only_where_its_bench_reads_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkout = pathlib.Path(root)
+            examples = checkout / 'crates' / 'zgx-terminal' / 'examples'
+            examples.mkdir(parents=True)
+            bench = examples / 'terminal_bench.rs'
+            env = {'LINES': '1000', 'PER_FRAME': '1', 'READS': 'PER_FRAME'}
+            bench.write_text('std::env::var("LINES")')
+            self.assertFalse(gate.runs_scene(checkout, env, 'zgx-terminal', 'terminal_bench'))
+            bench.write_text('std::env::var("LINES"); std::env::var("PER_FRAME")')
+            self.assertTrue(gate.runs_scene(checkout, env, 'zgx-terminal', 'terminal_bench'))
+            # Without `READS`, as every other scene: run.
+            bench.write_text('')
+            self.assertTrue(gate.runs_scene(checkout, {'LINES': '1000'}, 'zgx-terminal', 'terminal_bench'))
+
+    def test_the_trickling_terminal_is_new_to_a_bench_without_per_frame(self):
+        name, package, example, env = next(s for s in gate.SCENES if s[0] == 'terminal-slow')
+        self.assertEqual(env['READS'], 'PER_FRAME')
+        self.assertTrue(gate.runs_scene(gate.ROOT, env, package, example))
+
+
+class AllocationsTests(unittest.TestCase):
+    """The allocations table: per a scene's tick, frame or op, a scene whose
+    allocator bypasses glibc said to be uncounted, and the counter preloaded
+    after `same_run.so` in a native run of its own."""
+
+    def counts(self, allocations, reallocations=0, bytes_=0, peak=0):
+        return {'allocations': allocations, 'reallocations': reallocations, 'frees': allocations,
+                'bytes': bytes_, 'peak': peak}
+
+    def test_a_scene_with_ticks_is_reported_per_tick(self):
+        env = {'ZGX_MODE': 'scroll', 'TICKS': '300'}
+        self.assertEqual(gate.unit_of(env), ('TICKS', 300))
+        self.assertIsNone(gate.unit_of({'APP': 'mail'}))
+        # 33 more a tick over 300 ticks: +33.0 a tick.
+        rows = [('heavy-scroll', env, self.counts(30_000, 300, 900_000, 5_000),
+                 self.counts(39_900, 600, 1_200_000, 5_064))]
+        line = gate.allocation_lines(rows)[-1]
+        self.assertIn('| heavy-scroll | tick | 100.0 | 133.0 | +33.0 (+33.00%) | +1.0 | +1,000 | +64 |', line)
+
+    def test_a_scene_without_a_length_is_reported_per_run(self):
+        rows = [('app-mail', {'APP': 'mail'}, self.counts(50_000), self.counts(50_010))]
+        self.assertIn('| app-mail | run | 50,000.0 | 50,010.0 | +10.0 (+0.02%) |', gate.allocation_lines(rows)[-1])
+
+    def test_an_allocator_bypassing_glibc_is_not_read_as_zero(self):
+        rows = [('heavy-both', {'TICKS': '300'}, self.counts(12), self.counts(12))]
+        self.assertIn('not counted: its allocator bypasses glibc', gate.allocation_lines(rows)[-1])
+
+    def test_a_failed_run_and_a_new_scene_say_so(self):
+        failed = [('mount', {}, {'failed': True}, self.counts(5_000))]
+        self.assertIn('the run failed', gate.allocation_lines(failed)[-1])
+        new = [('mount', {}, None, self.counts(5_000))]
+        self.assertIn('| mount | run | (new) | 5,000.0 |', gate.allocation_lines(new)[-1])
+
+    def test_the_counter_runs_natively_after_same_run(self):
+        with tempfile.TemporaryDirectory() as root:
+            work = pathlib.Path(root)
+            seen = {}
+
+            def run(command, env=None, **_):
+                seen['command'], seen['env'] = command, env
+                pathlib.Path(env['ZGX_ALLOC_COUNT_OUT']).write_text('100 2 98 4096 2048\n')
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+            with patch.object(gate, 'WORK', work), \
+                    patch.object(gate, 'same_run', return_value=work / 'same_run.so'), \
+                    patch.object(gate, 'count_allocs', return_value=work / 'count_allocs.so'), \
+                    patch.object(gate, 'WARM', {work / 'bench'}), \
+                    patch.object(gate.subprocess, 'run', side_effect=run):
+                counts = gate.allocations(work / 'bench', {'TICKS': '3'}, None)
+        self.assertEqual(seen['command'], [str(work / 'bench')])
+        self.assertEqual(seen['env']['LD_PRELOAD'], f'{work / "same_run.so"} {work / "count_allocs.so"}')
+        self.assertEqual(counts, {'allocations': 100, 'reallocations': 2, 'frees': 98, 'bytes': 4096,
+                                  'peak': 2048})
+
+
+
+class OutputTests(unittest.TestCase):
+    """The output table: the same paint and damage, or the first flush
+    where paint or damage parts, and what a scene without a fingerprint
+    says."""
+
+    def test_the_same_output_reads_same(self):
+        frames = [('a1', 'd1'), ('a2', 'd2')]
+        self.assertEqual(gate.output_of('x', frames, list(frames)), 'same output: paint and damage (2 flushes)')
+
+    def test_paint_parting_is_reported_at_its_flush(self):
+        before = [('a1', 'd1'), ('a2', 'd2'), ('a3', 'd3')]
+        after = [('a1', 'd1'), ('a2', 'd2'), ('b3', 'd3')]
+        self.assertEqual(gate.output_of('x', before, after), 'output differs from flush 2 (of 3)')
+
+    def test_same_paint_with_other_damage_says_so(self):
+        before = [('a1', 'd1'), ('a2', 'd2')]
+        after = [('a1', 'd1'), ('a2', 'e2')]
+        self.assertEqual(gate.output_of('x', before, after), 'same paint; damage differs from flush 1 (of 2)')
+
+    def test_a_harness_flush_compares_paint_alone(self):
+        before = [('a1', '-'), ('a2', '-')]
+        self.assertEqual(gate.output_of('x', before, list(before)), 'same output: paint (2 flushes)')
+
+    def test_unhooked_failed_and_new_scenes_say_so(self):
+        self.assertEqual(gate.output_of('video', [], []), gate.UNPRINTED['video'])
+        self.assertIn('not hooked', gate.output_of('some-scene', [], []))
+        self.assertEqual(gate.output_of('x', 'failed', [('a', 'd')]), 'the run failed')
+        self.assertEqual(gate.output_of('x', [('a', 'd')], None), 'the run failed')
+        self.assertEqual(gate.output_of('x', None, [('a', 'd')]), '(new) 1 flushes')
+        self.assertEqual(gate.output_of('x', [('a', 'd')], [('a', 'd'), ('b', 'e')]), 'flush count differs (1 vs 2)')
+
+
 if __name__ == '__main__':
     unittest.main()
