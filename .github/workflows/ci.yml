@@ -79,8 +79,8 @@ env:
 jobs:
   # Named `plan`: admission (admit.py) leaves a job of that name out of reservations.
   plan:
-    # ubuntu-24.04, not -latest, as every job here: -latest moved to 26.04
-    # (Mesa 26) on Nov 14, where lavapipe's tests and probes fail (see linux).
+    # ubuntu-24.04, not -latest: -latest moves with GitHub's images (to 26.04
+    # on Nov 14); only linux, whose tests and probes run there, follows it.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -107,8 +107,8 @@ jobs:
     name: "admit [${{ needs.plan.outputs.reservation }}]${{ needs.plan.outputs.pr != '' && format(' #{0}', needs.plan.outputs.pr) || '' }}"
     needs: plan
     if: needs.plan.outputs.any == 'true'
-    # ubuntu-24.04, not -latest, as every job here: -latest moved to 26.04
-    # (Mesa 26) on Nov 14, where lavapipe's tests and probes fail (see linux).
+    # ubuntu-24.04, not -latest: -latest moves with GitHub's images (to 26.04
+    # on Nov 14); only linux, whose tests and probes run there, follows it.
     runs-on: ubuntu-24.04
     # GitHub stops a hosted job at 6 hours; admit.py lets the run start after MAX_WAIT_MINUTES.
     timeout-minutes: 330
@@ -146,12 +146,15 @@ jobs:
   linux:
     needs: [plan, admit]
     if: fromJSON(needs.plan.outputs.jobs).linux
-    # ubuntu-24.04, not -latest: on 26.04 (Mesa 26) the GPU tests and
-    # native probes on lavapipe fail (zink, a SIGSEGV); moved by GitHub on Nov 14.
-    runs-on: ubuntu-24.04
-    # A cold cache (a release's version bump changes Cargo.lock) takes about
-    # twice a warm one's 21 minutes.
-    timeout-minutes: 60
+    # The image users' Linux desktops have (Mesa 26, libwayland 1.24, Sway
+    # 1.11, Orca 50), named, not -latest: a move is a change of its own. The
+    # perf job stays on 24.04, its gate's base binaries built there.
+    runs-on: ubuntu-26.04
+    # A cold cache (a release's version bump changes Cargo.lock, a new image
+    # its keys) takes about three times a warm one's 21 minutes: on 26.04's
+    # first run, 57 before the native probes. Pull requests never save the
+    # cache, so a change to its keys runs cold until it merges.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
       # Room on the disk: this job's target/ reaches about 40 GB, more than
@@ -174,9 +177,10 @@ jobs:
         id: apt-cache
         with:
           path: ~/apt-archives
-          key: apt-${{ runner.arch }}-${{ steps.apt-key.outputs.month }}-${{ hashFiles('.github/linux-packages.txt') }}
-          # A changed package list still starts from the last month's .debs.
-          restore-keys: apt-${{ runner.arch }}-
+          key: apt-u26-${{ runner.arch }}-${{ steps.apt-key.outputs.month }}-${{ hashFiles('.github/linux-packages.txt') }}
+          # A changed package list still starts from the last month's .debs
+          # of the same image.
+          restore-keys: apt-u26-${{ runner.arch }}-
       # Three tries, off the Azure mirror when it stops resolving
       # (.github/apt-install.sh).
       - name: Linux packages
@@ -190,6 +194,8 @@ jobs:
           key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - uses: Swatinem/rust-cache@v2
         with:
+          # Built against 26.04's system libraries (WebKitGTK, GTK).
+          key: u26
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Benchmark sampler failure evidence
@@ -229,6 +235,9 @@ jobs:
           fi
           "$dir/stylua" --check .
       - run: cargo clippy --workspace --all-targets --features zgx-desktop/webkitgtk --locked -- -D warnings
+      # Web views' own unit tests (the webkitgtk feature, off by default), on
+      # a display of their own: one makes GTK windows.
+      - run: xvfb-run -a cargo test -p zgx-desktop --features webkitgtk --lib --locked -- 'native_host::webkitgtk::'
       # Feature gating stays honest: the crates build without their defaults,
       # on the oldest Rust they claim (`rust-version`): a check this job
       # makes anyway, so the minimum costs only the toolchain's download.
@@ -240,9 +249,11 @@ jobs:
       # Lints too: code only a default feature uses (the component
       # library's) is left out with it, not left unused.
       - run: cargo clippy -p zgx-script --no-default-features --all-targets --locked -- -D warnings
-      # zgx-script's best-practice lint over every example script.
+      # zgx-script's best-practice lint over every example script. The CLI
+      # lints and checks with the rules and definitions of the features it
+      # is built with: those the examples use (the sounds example's).
       - name: Script lint
-        run: cargo run -q -p zgx-script --bin zgx --locked -- lint crates/zgx-script/examples crates/zgx-desktop/examples crates/zgx-fx/examples/gallery
+        run: cargo run -q -p zgx-script --bin zgx --locked --features audio-effects,audio-streams -- lint crates/zgx-script/examples crates/zgx-desktop/examples crates/zgx-fx/examples/gallery
       # Every example script type checks (luau-lsp, the shipped ui/anime
       # types); zgx-script's check tests run with it too.
       - name: Script type check
@@ -257,7 +268,25 @@ jobs:
             chmod +x "$dir/luau-lsp"
           fi
           echo "LUAU_LSP=$dir/luau-lsp" >> "$GITHUB_ENV"
-          LUAU_LSP="$dir/luau-lsp" cargo run -q -p zgx-script --bin zgx --locked -- check crates/zgx-script/examples crates/zgx-desktop/examples crates/zgx-fx/examples/gallery
+          LUAU_LSP="$dir/luau-lsp" cargo run -q -p zgx-script --bin zgx --locked --features audio-effects,audio-streams -- check crates/zgx-script/examples crates/zgx-desktop/examples crates/zgx-fx/examples/gallery
+      # Every Linux test runs on a loader with Vulkan-Loader#1866's fix:
+      # older ones (26.04's is 1.4.341) crash in vkSetDebugUtilsObjectNameEXT
+      # when devices are made on several threads at once, and zgx-gpu leaves
+      # its debug layer off on them; on this one the tests keep it.
+      # The loader is built from pinned revisions, so it is kept between
+      # runs until the script changes.
+      - uses: actions/cache@v4
+        id: vulkan-loader
+        if: ${{ !cancelled() && steps.linux-packages.outcome == 'success' }}
+        with:
+          path: ~/zgx-vulkan-loader/build/loader
+          key: vulkan-loader-u26-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_vulkan_loader.sh') }}
+      - name: Build private patched Vulkan loader
+        if: ${{ !cancelled() && steps.linux-packages.outcome == 'success' && steps.vulkan-loader.outputs.cache-hit != 'true' }}
+        run: scripts/build_vulkan_loader.sh ~/zgx-vulkan-loader
+      - name: Use the private Vulkan loader
+        if: ${{ !cancelled() && steps.linux-packages.outcome == 'success' }}
+        run: printf 'LD_LIBRARY_PATH=%s/zgx-vulkan-loader/build/loader\n' "$HOME" >> "$GITHUB_ENV"
       # With 3D scenes (zgx-script's `scene3d`, off by default; the Windows
       # and macOS jobs test without it).
       - run: cargo test -p zgx -p zgx-components -p zgx-desktop -p zgx-workload -p zgx-script --all-targets --features zgx-script/scene3d --locked
@@ -300,8 +329,24 @@ jobs:
             84682f4ad5a449d0a3ffbc8332200fe8651aee9dd91dcd8d87197ba6c2450dbc
           ZGX_TUI_PATH="$nvim/nvim-linux-x86_64/bin:$lazygit" \
             cargo test -p zgx-terminal --lib --locked real_programs -- --ignored
+      # The terminal's parser and screen forks, outside the workspace: their
+      # own tests (the random differentials of runs against characters one
+      # at a time, cells cleared and written, extras freed) on every change.
+      - run: cargo test --manifest-path vendor/vte/Cargo.toml --target-dir target --locked
+      - run: cargo test --manifest-path vendor/alacritty-terminal/Cargo.toml --target-dir target --locked
       # The optional effects package: every effect drawn, on each job's backend.
       - run: cargo test -p zgx-fx --locked
+      # The mixer offline, against its references, sample for sample; then
+      # its decoders (AAC is an error here: no platform decoder yet). No test
+      # opens a sound device, and `device` (cpal) needs ALSA headers.
+      - run: cargo test -p zgx-audio --locked
+      - run: cargo test -p zgx-audio --features vorbis,mp3,opus,aac,hrtf --locked
+      # zgx-desktop's `audio` (the default output opened at the first
+      # sound) and zgx-run's: built and linted, and their tests, none of
+      # which plays a sound or opens a device.
+      - run: cargo clippy -p zgx-desktop -p zgx-run --features zgx-desktop/audio,zgx-run/audio-all --all-targets --locked -- -D warnings
+      - run: "cargo test -p zgx-desktop --features audio --lib --locked -- audio::"
+      - run: cargo test -p zgx-run --features audio-all --locked
       # zgx-dom: views as browser DOM, on wasm32. Its lints (zgx's `dom`
       # plumbing with them), the table benchmark built, and its tests in
       # headless Chrome: the image's Chrome and chromedriver, and the
@@ -325,6 +370,12 @@ jobs:
             cargo install wasm-bindgen-cli --version "$WASM_BINDGEN" --locked --root "$root"
           fi
           cargo clippy -p zgx-dom --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+          # zgx-audio in the browser: a pulled engine, no threads and no
+          # clock, run there (in Node) so a thread or an Instant on its
+          # path fails here rather than in a page.
+          cargo clippy -p zgx-audio --target wasm32-unknown-unknown --features vorbis,mp3,opus,hrtf --lib --test web --locked -- -D warnings
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$root/bin/wasm-bindgen-test-runner" \
+            cargo test -p zgx-audio --target wasm32-unknown-unknown --features vorbis,mp3,opus,hrtf --test web --locked
           cargo build -p zgx-dom --example bench --target wasm32-unknown-unknown --release --locked
           CHROMEDRIVER="$(command -v chromedriver || echo "$CHROMEWEBDRIVER/chromedriver")" \
             CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$root/bin/wasm-bindgen-test-runner" \
@@ -353,7 +404,19 @@ jobs:
           cargo clippy -p zgx-dom --features luau --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
           CHROMEDRIVER="$(command -v chromedriver || echo "$CHROMEWEBDRIVER/chromedriver")" \
             CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$HOME/.local/wasm-bindgen-$WASM_BINDGEN/bin/wasm-bindgen-test-runner" \
-            cargo test --release -p zgx-dom --features luau --test luau --target wasm32-unknown-unknown --locked
+            cargo test --release -p zgx-dom --features luau --test luau --test fetch --test luau_memory --target wasm32-unknown-unknown --locked
+          # Luau's `audio` on the audio worklet: clippy and its tests, with every
+          # part on. A context runs only after a trusted press, and a test's
+          # click() isn't one: Chrome is told to let it (no other args are
+          # given to Chrome here; webdriver.json is each machine's own).
+          echo '{"goog:chromeOptions":{"args":["--autoplay-policy=no-user-gesture-required"]}}' > crates/zgx-dom/webdriver.json
+          cargo clippy -p zgx-dom --features audio-effects,audio-vorbis,audio-mp3,audio-opus,audio-streams --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+          # The audio tests wait out real sound (holds, stalls, a context
+          # suspending between tests): past the runner's 20 s for a whole run.
+          CHROMEDRIVER="$(command -v chromedriver || echo "$CHROMEWEBDRIVER/chromedriver")" \
+            CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$HOME/.local/wasm-bindgen-$WASM_BINDGEN/bin/wasm-bindgen-test-runner" \
+            WASM_BINDGEN_TEST_TIMEOUT=120 \
+            cargo test --release -p zgx-dom --features audio --test audio --target wasm32-unknown-unknown --locked -- --nocapture
       # zgx-script's tests with all its features, as an app built by zgx-run
       # has them (scene3d, i18n, gltf, inspect): ICU's plural rules change
       # what the i18n lint finds, and each feature may add lazy `ui`
@@ -376,22 +439,6 @@ jobs:
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      # Concurrent device tests need Vulkan-Loader#1866; older distro loaders
-      # can crash inside vkSetDebugUtilsObjectNameEXT. Keep debug/validation on.
-      # The loader is built from pinned revisions, so it is kept between
-      # runs until the script changes.
-      - uses: actions/cache@v4
-        id: vulkan-loader
-        if: ${{ !cancelled() && steps.linux-packages.outcome == 'success' }}
-        with:
-          path: ~/zgx-vulkan-loader/build/loader
-          key: vulkan-loader-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_vulkan_loader.sh') }}
-      - name: Build private patched Vulkan loader
-        if: ${{ !cancelled() && steps.linux-packages.outcome == 'success' && steps.vulkan-loader.outputs.cache-hit != 'true' }}
-        run: scripts/build_vulkan_loader.sh ~/zgx-vulkan-loader
-      - name: Use the private Vulkan loader
-        if: ${{ !cancelled() && steps.linux-packages.outcome == 'success' }}
-        run: printf 'LD_LIBRARY_PATH=%s/zgx-vulkan-loader/build/loader\n' "$HOME" >> "$GITHUB_ENV"
       # The GPU tests below draw on lavapipe, Mesa's software Vulkan. Without
       # it every one of them panics ("No suitable graphics adapter found"),
       # which hides the cause: say it once, here. They run after an earlier
@@ -496,7 +543,7 @@ jobs:
     needs: [plan, admit]
     if: fromJSON(needs.plan.outputs.jobs).perf
     # ubuntu-24.04, as perf-base.yml's: the gate compares counts made on one
-    # image, and the linux job's is pinned (-latest moved to 26.04 on Nov 14).
+    # image, and its base binaries were built there (gate-bin-u24).
     runs-on: ubuntu-24.04
     # With the base's binaries not cached, both sides build: the head's took
     # 19 minutes and the base's was cut at 26 (Nov 7, as scenes grew); the
@@ -521,9 +568,13 @@ jobs:
           path: ~/apt-archives
           key: apt-perf-${{ runner.arch }}-${{ steps.apt-key.outputs.month }}
           restore-keys: apt-perf-${{ runner.arch }}-
+      # mesa-vulkan-drivers and libvulkan1: lavapipe, a software Vulkan, so
+      # the gate's output check draws the 3D cells' frames and reads them back
+      # (world_bench, ZGX_FINGERPRINT alone; its counted runs draw on wgpu's
+      # no-op backend and load no Vulkan).
       - name: Packages
         timeout-minutes: 10
-        run: sh .github/apt-install.sh valgrind cmake pkg-config fonts-dejavu-core libdbus-1-dev libfontconfig1-dev libwayland-dev libxcb1-dev libxkbcommon-dev libxrandr-dev
+        run: sh .github/apt-install.sh valgrind cmake pkg-config fonts-dejavu-core libdbus-1-dev libfontconfig1-dev libwayland-dev libxcb1-dev libxkbcommon-dev libxrandr-dev mesa-vulkan-drivers libvulkan1
       - uses: actions/cache/save@v4
         if: steps.apt-cache.outputs.cache-hit != 'true'
         with:
@@ -709,8 +760,21 @@ jobs:
       # Text in every script, shaped in the system's own fonts.
       - run: cargo test -p zgx-gpu --test text_scripts --test editor_selection --locked
       - run: cargo test -p zgx-fx --locked
+      # The mixer offline; its decoders (AAC through AudioToolbox) and the
+      # device host, which builds CoreAudio's but opens no output.
+      - run: cargo test -p zgx-audio --locked
+      - run: cargo test -p zgx-audio --features device,vorbis,mp3,opus,aac,hrtf --locked
+      # zgx-desktop's `audio` (the default output opened at the first
+      # sound) and zgx-run's: built and linted, and their tests, none of
+      # which plays a sound or opens a device.
+      - run: cargo clippy -p zgx-desktop -p zgx-run --features zgx-desktop/audio,zgx-run/audio-all --all-targets --locked -- -D warnings
+      - run: "cargo test -p zgx-desktop --features audio --lib --locked -- audio::"
+      - run: cargo test -p zgx-run --features audio-all --locked
       # Terminal sessions on real ptys (openpty, ConPTY): exact cells, input, exits.
       - run: cargo test -p zgx-terminal --locked
+      # HTML and its text through the system pasteboard (ignored locally:
+      # it replaces the clipboard of whoever runs it).
+      - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::html_and_its_text_round_trip_through_the_system_clipboard -- --ignored --exact
       # The soak (an app used for a while holds what it did), on Metal.
       - run: cargo test -p zgx-script --test soak --locked
       - run: cargo test -p zgx-run --test audit --locked
@@ -806,6 +870,14 @@ jobs:
       # Text in every script, shaped in the system's own fonts.
       - run: cargo test -p zgx-gpu --test text_scripts --test editor_selection --locked
       - run: cargo test -p zgx-fx --locked
+      - run: cargo test -p zgx-audio --locked
+      - run: cargo test -p zgx-audio --features device,vorbis,mp3,opus,aac,hrtf --locked
+      # zgx-desktop's `audio` (the default output opened at the first
+      # sound) and zgx-run's: built and linted, and their tests, none of
+      # which plays a sound or opens a device.
+      - run: cargo clippy -p zgx-desktop -p zgx-run --features zgx-desktop/audio,zgx-run/audio-all --all-targets --locked -- -D warnings
+      - run: "cargo test -p zgx-desktop --features audio --lib --locked -- audio::"
+      - run: cargo test -p zgx-run --features audio-all --locked
       # Menus, popovers and tooltips in Windows' shapes there (WinUI's).
       - run: "cargo test -p zgx --test overlays --locked -- composition_menu::a_menu_takes_its_platforms_shape"
       # Focus drawn as Windows' focus visual there (outside the control,
@@ -822,6 +894,9 @@ jobs:
       # file and line the CLI names, and the reference's examples written
       # out with their plugins (`-- file: … (granted …)`).
       - run: "cargo test -p zgx-script --test state --test tooling --locked -- upload:: test_cli:: reference_docs::"
+      # HTML (CF_HTML's fragment) and its text through the system clipboard
+      # (ignored locally: it replaces the clipboard of whoever runs it).
+      - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::html_and_its_text_round_trip_through_the_system_clipboard -- --ignored --exact
       # Terminal sessions on real ptys (openpty, ConPTY): exact cells, input, exits.
       - run: cargo test -p zgx-terminal --locked
       # Real programs through ConPTY, from the image (zgx-terminal's ignored
@@ -991,8 +1066,8 @@ jobs:
     name: CI result
     needs: [plan, admit, linux, perf, macos, windows]
     if: always()
-    # ubuntu-24.04, not -latest, as every job here: -latest moved to 26.04
-    # (Mesa 26) on Nov 14, where lavapipe's tests and probes fail (see linux).
+    # ubuntu-24.04, not -latest: -latest moves with GitHub's images (to 26.04
+    # on Nov 14); only linux, whose tests and probes run there, follows it.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -222,6 +222,7 @@ impl EngineTerminal {
                 font_size: options.font_size.unwrap_or(FONT_SIZE),
                 cell_width: 0.,
                 cell_height: 0.,
+                line_height: 0.,
             }),
             generation: Cell::new(0),
             font: RefCell::new(font),
@@ -909,6 +910,7 @@ impl Engine {
             None,
             &self.font.borrow(),
         );
+        let line_height = height;
         let (width, height) = match scene.pixel_scale() {
             0. => (width / 10., height.ceil()),
             scale => (
@@ -918,6 +920,7 @@ impl Engine {
         };
         metrics.cell_width = width;
         metrics.cell_height = height;
+        metrics.line_height = line_height;
         if metrics != self.metrics.get() {
             self.metrics.set(metrics);
             self.generation.set(self.generation.get().wrapping_add(1));
@@ -1247,8 +1250,8 @@ impl Engine {
         let uri = self
             .with_session(|session| {
                 let term = session.term();
-                term.grid()[point]
-                    .hyperlink()
+                term.grid()[point.line]
+                    .hyperlink(point.column)
                     .map(|link| link.uri().to_owned())
             })
             .flatten();

@@ -123,6 +123,10 @@ SCENES = [
     ('micro-vscroll-fixed', 'zgx-desktop', 'micro_bench', {'SCENE': 'vscroll-fixed', 'OPS': '300', 'WARMUP': '50', 'RENDER': '0'}),
     ('micro-vscroll-variable', 'zgx-desktop', 'micro_bench', {'SCENE': 'vscroll-variable', 'OPS': '300', 'WARMUP': '50',
                                                               'RENDER': '0'}),
+    # A long text area scrolled a little a frame, as a wheel or a trackpad
+    # does (editor_scroll_bench): 2,000 lines of code, 12 points a step, laid
+    # out with the lines coming into view shaped and nothing drawn.
+    ('editor-scroll', 'zgx-desktop', 'editor_scroll_bench', {'FRAMES': '300'}),
     # The same three written in Luau, through ScriptHost (a binary of its
     # own: micro_bench links no script engine).
     ('micro-state-luau', 'zgx-desktop', 'micro_luau_bench', {'SCENE': 'state', 'OPS': '300', 'WARMUP': '50',
@@ -215,6 +219,15 @@ SCENES = [
     ('layout-drag', 'zgx', 'layout_drag_bench', {}),
     # A pointer moving over a deep page with hover styles, undrawn.
     ('pointer-move', 'zgx', 'pointer_bench', {}),
+    # A sidebar of 500 rows beside it, one with a raised badge, the pointer
+    # moving down the rows: a raised node anywhere takes every hit test by the
+    # walk keeping paint order, which must search a long column of rows as
+    # the plain walk does, not look at each.
+    ('pointer-move-raised', 'zgx', 'pointer_bench', {'SIDEBAR': '500'}),
+    # The pointer over the page beside a sidebar of 500 rows with icons (an
+    # app's folder tree): an image or SVG in a subtree must not keep the hit
+    # test from skipping it where the pointer isn't.
+    ('pointer-move-icons', 'zgx', 'pointer_bench', {'SIDEBAR': '500', 'ICONS': '1'}),
     # Effects' CPU work through the whole renderer, drawn by wgpu's no-op
     # backend: a scene of boxes as they are, then the same with an animated
     # layer shader painting past its box, and with one reading what's behind
@@ -229,6 +242,10 @@ SCENES = [
     # size, bounds and visibility: the world geometry those observers and the
     # lists read, and the paint walk of the strip and band each frame draws.
     ('scroll-glass', 'zgx-3d', 'scroll_glass_bench', {'ZGX_GPU_NOOP': '1', 'FRAMES': '120'}),
+    # The same with the pointer resting over the list, as a person's does
+    # while they scroll: what it is over found again as rows move under it.
+    ('scroll-glass-pointer', 'zgx-3d', 'scroll_glass_bench',
+     {'ZGX_GPU_NOOP': '1', 'FRAMES': '120', 'POINTER': '1'}),
     # A video's frames (zgx-video's `examples/bench`): its script, animations,
     # timers and shader clock stepped on a virtual clock (`zgx::clock`), each
     # frame drawn whole by wgpu's no-op backend. What making video costs;
@@ -243,6 +260,13 @@ SCENES = [
     ('app-mail', 'zgx-script', 'list_state_bench', {'APP': 'mail', 'REPS': '2'}),
     # A list with an estimate (`ui.list { estimate = … }`): it runs per row.
     ('list-estimate', 'zgx-script', 'estimate_bench', {}),
+    # A library table scrolled 600 points at a time: the rows that come into
+    # view mount (Luau builders, each `ui.switch`/`ui.show`'s shown branch,
+    # styles, layout, text), as an app's library of papers does.
+    ('library-scroll', 'zgx-script', 'library_scroll_bench', {}),
+    # The same table with its branches as functions (`ui.switch`'s cases,
+    # `ui.show`'s rarely shown content): built only when they show.
+    ('library-scroll-lazy', 'zgx-script', 'library_scroll_lazy_bench', {}),
     # New text mounting, cold: a word's first shape.
     ('mount-text', 'zgx-script', 'mount_text_bench', {}),
     # An app's cold start: a chat feed decoded from the script's source into
@@ -684,10 +708,10 @@ def unit_of(env):
 FINGERPRINT = os.environ.get('ZGX_GATE_FINGERPRINT', '1') != '0'
 # Scenes whose bench gives no fingerprint yet, and why: said so in the table.
 UNPRINTED = {
-    'video': 'not hooked: the video stage keeps its scene to itself',
-    '3d-textured': 'not hooked: a 3D world drawn without a scene',
-    '3d-mixed': 'not hooked: a 3D world drawn without a scene',
 }
+# Scenes whose frames are drawn and read back for their fingerprint (no
+# scene to hash): with no adapter that draws, they write none.
+READ_BACK = {'3d-textured', '3d-mixed'}
 
 
 def fingerprint(binary, env, checkout):
@@ -717,6 +741,8 @@ def output_of(name, before, after):
     if after is None or before == 'failed':
         return 'the run failed'
     if not after:
+        if name in READ_BACK:
+            return 'no fingerprint: no adapter draws here to read its frames back'
         return UNPRINTED.get(name, 'no fingerprint: the bench is not hooked')
     if before is None:
         return f'(new) {len(after)} flushes'

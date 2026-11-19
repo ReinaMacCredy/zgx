@@ -28,7 +28,7 @@ use std::{
     task::{Poll, Waker},
     time::Duration,
 };
-use zgx::{compose::ViewHandle, inspect::Inspector, widgets::Ui};
+use zgx::{compose::ViewHandle, inspect::Inspector, platform::PlatformService, widgets::Ui};
 
 /// What a session answers with: at once, or once a wait is over.
 pub enum Reply {
@@ -51,6 +51,132 @@ struct Parts {
     marks: std::cell::RefCell<std::collections::HashMap<String, u64>>,
 }
 
+/// `route`'s answer: where pointer input at `(x, y)` goes, a native view
+/// (a page, a terminal) or zgx's interface, the step that decided it
+/// (`PlaneSplit::route_explained`), and the native views under the point
+/// with every node each is registered at and whether that node shows: one
+/// page registered at two nodes is shown by only one of them.
+fn route_report(
+    ui: &Ui,
+    natives: Option<&zgx::native_view::NativeViews>,
+    x: f32,
+    y: f32,
+) -> (String, Value) {
+    use zgx::native_view::{PointerRoute, RouteWhy};
+    let at = format!("{x:.0},{y:.0}");
+    let Some(natives) = natives else {
+        return (
+            format!("{at}: the interface (this window has no native views)"),
+            Value::record([
+                ("route", Value::from("ui")),
+                ("why", Value::from("no native views")),
+            ]),
+        );
+    };
+    let n = |node: zgx::scene::NodeId| format!("@{}", driver::number(node));
+    let split = natives.split();
+    let scene = ui.scene.borrow();
+    let (route, why) = split.route_explained(&scene, &ui.input, x, y);
+    let because = match why {
+        RouteWhy::NoNativeViews => "this window shows no native views".to_string(),
+        RouteWhy::Busy => "the input state was busy (mid-dispatch)".to_string(),
+        RouteWhy::NothingHit => "nothing there takes input".to_string(),
+        RouteWhy::Overlay(node) => format!("{} is drawn over the native view there", n(node)),
+        RouteWhy::Listener(node) => format!("{} in front listens for it", n(node)),
+        RouteWhy::Disabled(node) => format!("{} is disabled", n(node)),
+        RouteWhy::NotShown(node) => format!("{} isn't shown", n(node)),
+        RouteWhy::OutsideScope { native, scope } => format!(
+            "{} is outside the active modal scope, {} (a dialog or menu still open, or one never closed)",
+            n(native),
+            n(scope)
+        ),
+        RouteWhy::Native(node) => format!("{} takes it", n(node)),
+    };
+    let goes = match route {
+        PointerRoute::Native(node) => format!("the native view {}", n(node)),
+        PointerRoute::Ui => "the interface".to_string(),
+    };
+    let mut lines = vec![format!("{at}: {goes}: {because}")];
+    // The native views whose box holds the point, and where each is registered.
+    let views = natives.views();
+    let mut under = Vec::new();
+    for placement in split.natives() {
+        let Some(r) = placement.visible() else {
+            continue;
+        };
+        if !(x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height) {
+            continue;
+        }
+        let Some((_, content)) = views.iter().find(|(node, _)| *node == placement.node) else {
+            continue;
+        };
+        let at: Vec<(zgx::scene::NodeId, bool)> = views
+            .iter()
+            .filter(|(_, other)| other.same(content))
+            .map(|(node, _)| (*node, scene.contains(*node) && scene.layout_visible(*node)))
+            .collect();
+        let listed = at
+            .iter()
+            .map(|(node, shown)| {
+                format!(
+                    "{} ({})",
+                    n(*node),
+                    if *shown { "shown" } else { "not shown" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "  {} {}: registered at {listed}",
+            content.label(),
+            n(placement.node)
+        ));
+        if at.len() > 1 {
+            lines.push(format!(
+                "  one {} registered at {} nodes: its host shows it in one of them, so clicks on the others reach nothing",
+                content.label(),
+                at.len()
+            ));
+        }
+        under.push(Value::record([
+            ("node", Value::Num(driver::number(placement.node) as f64)),
+            ("content", Value::from(content.label().as_str())),
+            (
+                "registered",
+                Value::List(
+                    at.iter()
+                        .map(|(node, shown)| {
+                            Value::record([
+                                ("node", Value::Num(driver::number(*node) as f64)),
+                                ("shown", Value::Bool(*shown)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]));
+    }
+    let data = Value::record([
+        (
+            "route",
+            Value::from(match route {
+                PointerRoute::Native(_) => "native",
+                PointerRoute::Ui => "ui",
+            }),
+        ),
+        (
+            "node",
+            match route {
+                PointerRoute::Native(node) => Value::Num(driver::number(node) as f64),
+                PointerRoute::Ui => Value::Nil,
+            },
+        ),
+        ("why", Value::from(because.as_str())),
+        ("under", Value::List(under.into())),
+    ]);
+    (lines.join("\n"), data)
+}
+
 fn ok(text: String, data: Value) -> String {
     Value::record([
         ("ok", Value::Bool(true)),
@@ -59,6 +185,108 @@ fn ok(text: String, data: Value) -> String {
     ])
     .to_json()
 }
+/// `clipboard`: what the window's clipboard holds (its text, HTML, image
+/// and files), or with `action` `set`, put `text` and `html` there (either
+/// alone; both as a rich copy), the picture at `image` (a file) or `files`
+/// (paths, as a file manager copies them; an app's own clipboard only). An
+/// off-screen session's is its own (`ZGX_CLIPBOARD=memory`), so a QA script
+/// sets it and then presses ⌘V (`key`), the app pasting it as a person's
+/// paste: through the editor's `on_paste`.
+async fn clipboard(platform: Option<PlatformService>, request: &Value) -> String {
+    let Some(platform) = platform else {
+        return failed("no clipboard here: it needs a desktop window");
+    };
+    let field = |name: &str| request.field(name).map(|v| v.to_string());
+    if field("action").as_deref() == Some("set") {
+        let (text, html) = (field("text"), field("html"));
+        // Files, as a file manager copies them: a list, or one path.
+        let files: Vec<std::path::PathBuf> = match request.field("files") {
+            Some(Value::List(files)) => files.iter().map(|f| f.to_string().into()).collect(),
+            Some(file @ Value::Str(_)) => vec![file.to_string().into()],
+            _ => Vec::new(),
+        };
+        if !files.is_empty() {
+            let count = files.len();
+            return match platform.0.set_clipboard_files(files) {
+                true => ok(
+                    format!(
+                        "the clipboard holds {count} file{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    Value::Nil,
+                ),
+                false => failed(
+                    "the clipboard didn't take the files: only a clipboard of the app's own \
+                     (ZGX_CLIPBOARD=memory) does",
+                ),
+            };
+        }
+        if let Some(path) = field("image") {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => return failed(format!("{path}: {e}")),
+            };
+            let image = match zgx_gpu::assets::decode_image(&bytes) {
+                Ok(image) => image,
+                Err(e) => return failed(format!("{path}: {e}")),
+            };
+            let (width, height) = (image.width(), image.height());
+            return match platform.0.set_clipboard_image(image).await {
+                true => ok(
+                    format!("the clipboard holds a {width}x{height} image"),
+                    Value::Nil,
+                ),
+                false => failed("the clipboard didn't take the image"),
+            };
+        }
+        let written = match (text, html) {
+            (Some(text), Some(html)) => platform.0.set_clipboard_rich_text(text, html),
+            (None, Some(html)) => platform.0.set_clipboard_rich_text(String::new(), html),
+            (Some(text), None) => platform.0.set_clipboard_text(text),
+            (None, None) => {
+                return failed("clipboard set takes `text`, `html`, `image` or `files`");
+            }
+        };
+        return match written {
+            true => ok("set the clipboard".into(), Value::Nil),
+            false => failed("the clipboard didn't take it"),
+        };
+    }
+    let (text, html) = (platform.0.clipboard_text(), platform.0.clipboard_html());
+    let image = platform.0.clipboard_image().await;
+    let size = image
+        .as_ref()
+        .map(|i| format!("{}x{}", i.width(), i.height()));
+    let files: Vec<String> = (platform.0.clipboard_files().iter())
+        .map(|f| f.display().to_string())
+        .collect();
+    let line = |name: &str, value: &Option<String>| match value {
+        Some(value) => format!("{name}: {value:?}"),
+        None => format!("{name}: none"),
+    };
+    ok(
+        [
+            line("text", &text),
+            line("html", &html),
+            line("image", &size),
+            match files.is_empty() {
+                true => "files: none".to_string(),
+                false => format!("files: {files:?}"),
+            },
+        ]
+        .join("\n"),
+        Value::record([
+            ("text", text.as_deref().map_or(Value::Nil, Value::from)),
+            ("html", html.as_deref().map_or(Value::Nil, Value::from)),
+            ("image", size.as_deref().map_or(Value::Nil, Value::from)),
+            (
+                "files",
+                Value::List(files.iter().map(|f| Value::from(f.as_str())).collect()),
+            ),
+        ]),
+    )
+}
+
 fn failed(error: impl Into<String>) -> String {
     let error: String = error.into();
     Value::record([
@@ -560,6 +788,8 @@ const HELP: &str = "commands (one JSON object a line, `cmd` and its fields):
   set     name value                             set a named state (value is JSON)
   click   target                                 press and release at its middle
   hover   target|x,y                             move the pointer there, as a hand does
+  route   target|x,y                             where a click there goes, a native view (a page) or the
+                                                 UI, and what decided it (an overlay, a listener, a scope)
   right-click target|x,y                         click the context button there (a context menu opens)
   drag    target|x,y to                          drag with the primary button; `to` is a target or x,y
   type    target text                            click it, then type text
@@ -837,6 +1067,10 @@ impl Session {
                 driver::click_at(&mut ui, b);
                 (format!("clicked @{}", driver::number(node)), Value::Nil)
             }),
+            "route" => point_of(&ui, "target").map(|(x, y)| {
+                let natives = self.0.inspector.as_ref().and_then(|i| i.native_views());
+                route_report(&ui, natives.as_ref(), x, y)
+            }),
             "hover" => point_of(&ui, "target").map(|at| {
                 driver::hover_at(&mut ui, at);
                 (format!("pointer at {:.0},{:.0}", at.0, at.1), Value::Nil)
@@ -859,8 +1093,130 @@ impl Session {
                     Value::Nil,
                 ))
             })(),
+            // Files dragged in from a file manager, as the desktop host
+            // hears them (`zgx::outside_drag`): hovering, dropped (a
+            // `FileDrop` each, then `FilesDrop`, Linux's order; macOS and
+            // Windows deliver `FilesDrop` after a queue), or gone.
+            "files" => (|| {
+                let action = text("action").ok_or("files takes `hover`, `drop` or `leave`")?;
+                let files: Vec<std::path::PathBuf> = match field("files") {
+                    Some(Value::List(files)) => {
+                        files.iter().map(|f| f.to_string().into()).collect()
+                    }
+                    Some(file @ Value::Str(_)) => vec![file.to_string().into()],
+                    _ => Vec::new(),
+                };
+                match action.as_str() {
+                    "leave" => {
+                        ui.dispatch(zgx::input::InputEvent::FileHoverCancelled);
+                        Ok(("the files' drag left".to_string(), Value::Nil))
+                    }
+                    "hover" | "drop" => {
+                        let (x, y) = point_of(&ui, "at")?;
+                        if files.is_empty() {
+                            return Err(format!("files {action} takes one path or more"));
+                        }
+                        let count = files.len();
+                        if action == "hover" {
+                            for path in files {
+                                ui.dispatch(zgx::input::InputEvent::FileHover { x, y, path });
+                            }
+                            return Ok((format!("{count} files over {x:.0},{y:.0}"), Value::Nil));
+                        }
+                        let taken = zgx::outside_drag::drop_files(x, y, files.into(), |event| {
+                            Some(Ok::<_, std::convert::Infallible>(
+                                ui.dispatch(event).default_prevented,
+                            ))
+                        })
+                        .unwrap_or(false);
+                        Ok((
+                            format!(
+                                "{count} files dropped at {x:.0},{y:.0}: {}",
+                                if taken { "taken" } else { "not taken" }
+                            ),
+                            Value::record([("taken", Value::Bool(taken))]),
+                        ))
+                    }
+                    other => Err(format!(
+                        "files takes `hover`, `drop` or `leave`, not `{other}`"
+                    )),
+                }
+            })(),
+            // Text dragged in from another app (a browser's selection), as
+            // the desktop host hears it: over the point, then let go there
+            // (or, `hover_only`, over it and gone, for a destination's
+            // highlight).
+            "text-drop" => (|| {
+                let (x, y) = point_of(&ui, "at")?;
+                let over = zgx::outside_drag::text_over(&ui, x, y);
+                if field("hover_only").is_some_and(|v| v.truthy()) {
+                    zgx::outside_drag::text_out(&ui);
+                    return Ok((
+                        format!(
+                            "text over {x:.0},{y:.0}: {}",
+                            if over {
+                                "would drop"
+                            } else {
+                                "nothing takes it"
+                            }
+                        ),
+                        Value::record([("over", Value::Bool(over))]),
+                    ));
+                }
+                let dropped = text("text").ok_or("text-drop takes a `text`")?;
+                let html = text("html");
+                let taken = zgx::outside_drag::text_dropped(&ui, x, y, &dropped, html.as_deref());
+                Ok((
+                    format!(
+                        "text dropped at {x:.0},{y:.0}: {}",
+                        if taken { "taken" } else { "not taken" }
+                    ),
+                    Value::record([("over", Value::Bool(over)), ("taken", Value::Bool(taken))]),
+                ))
+            })(),
+            // What zgx reads as the system's preference, set in this process
+            // alone (never the system's own setting).
+            "prefers" => (|| {
+                let name = text("name").ok_or("prefers takes `reduced-motion`")?;
+                if name != "reduced-motion" {
+                    return Err(format!("prefers knows `reduced-motion`, not `{name}`"));
+                }
+                let set = match text("value").as_deref() {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    Some("system") => None,
+                    _ => return Err("prefers reduced-motion takes `on`, `off` or `system`".into()),
+                };
+                ui.theme().override_reduced_motion(set);
+                let now = ui.theme().system_preferences().reduced_motion;
+                Ok((
+                    format!(
+                        "reduced motion {} ({})",
+                        if now { "on" } else { "off" },
+                        if set.is_some() {
+                            "set here; the system's own is unchanged"
+                        } else {
+                            "the system's"
+                        }
+                    ),
+                    Value::record([("reduced_motion", Value::Bool(now))]),
+                ))
+            })(),
             "type" => (|| {
                 let typed = text("text").ok_or("type takes a `text`")?;
+                // Where focus is, with the caret and selection as they
+                // are: a click would move them.
+                if field("no_click").is_some_and(|v| v.truthy()) {
+                    if field("target").is_some() {
+                        return Err("type --no-click types where focus is: give no target".into());
+                    }
+                    let focused = ui.input.focused().ok_or("nothing has focus to type into")?;
+                    ui.dispatch(zgx::input::InputEvent::Text(typed));
+                    return Ok((
+                        format!("typed into @{}", driver::number(focused)),
+                        Value::Nil,
+                    ));
+                }
                 // No target: as a keyboard, at whatever holds the keys, each
                 // key's press first and its text only if no one took the
                 // press, as a window hears them.
@@ -892,19 +1248,20 @@ impl Session {
                     return Ok((format!("pressed {keys} alone"), Value::Nil));
                 }
                 let (key, modifiers) = driver::parse_keys(&keys)?;
-                let paste = matches!(&key, zgx::input::Key::Character(c) if c.eq_ignore_ascii_case("v"))
-                    && (if cfg!(target_os = "macos") { modifiers.meta } else { modifiers.control })
-                    && !modifiers.alt
-                    && !modifiers.shift;
-                let taken = driver::press_taken(&mut ui, key, modifiers);
-                // What the window does with a paste no handler took.
-                if paste
-                    && !taken
-                    && let Some(editor) = ui.focused_editor()
+                // ⌘C, ⌘X, ⌘V nothing in the view took go to the clipboard
+                // as a window's do (`Ui::clipboard_shortcut`): an editor's
+                // `on_paste` hears a paste driven from here too.
+                let taken = ui.dispatch(zgx::input::InputEvent::KeyDown {
+                    key: key.clone(),
+                    modifiers,
+                    repeat: false,
+                });
+                if !taken.default_prevented
+                    && let Some(platform) = self.0.host.0.platform.borrow().clone()
                 {
-                    let text = self.0.host.0.platform.borrow().as_ref().and_then(|p| p.0.clipboard_text());
-                    ui.paste_into(&editor, text.as_deref());
+                    ui.clipboard_shortcut(&key, modifiers, &*platform.0);
                 }
+                ui.dispatch(zgx::input::InputEvent::KeyUp { key, modifiers });
                 Ok((format!("pressed {keys}"), Value::Nil))
             })(),
             "snapshot" => (|| {
@@ -1233,6 +1590,10 @@ impl Session {
                     Value::record([
                         ("name", Value::from(name.as_str())),
                         ("frame", Value::Num(after as f64)),
+                        // Now, on the frames' clock (their `ended_ms`): a
+                        // tool timing input it sends lines its own clock up
+                        // with theirs by this.
+                        ("ms", Value::Num(zgx::trace::now_ms())),
                     ]),
                 ))
             }
@@ -1277,6 +1638,11 @@ impl Session {
                 let session = self.clone();
                 let request = request.clone();
                 return Reply::Later(Box::pin(async move { session.wait(&request).await }));
+            }
+            "clipboard" => {
+                let platform = self.0.host.0.platform.borrow().clone();
+                let request = request.clone();
+                return Reply::Later(Box::pin(async move { clipboard(platform, &request).await }));
             }
             "record" => {
                 let stop = field("stop").is_some_and(|v| v.truthy());
@@ -1645,11 +2011,26 @@ impl Session {
                     }
                 })
                 .collect();
-            let unnamed = frame
-                .writes
-                .iter()
-                .filter(|(s, _)| !names.contains_key(s))
-                .count();
+            // The rest by where the script made them (`500 × rows.luau:12
+            // use_state`), most first; those no maker named, counted.
+            let sites: std::collections::HashMap<usize, &Rc<str>> =
+                frame.sites.iter().map(|(s, site)| (*s, site)).collect();
+            let mut made: Vec<(Rc<str>, usize)> = Vec::new();
+            let mut unnamed = 0;
+            for (signal, _) in frame.writes.iter().filter(|(s, _)| !names.contains_key(s)) {
+                match sites.get(signal) {
+                    Some(site) => match made.iter_mut().find(|(m, _)| Rc::ptr_eq(m, site)) {
+                        Some((_, n)) => *n += 1,
+                        None => made.push(((*site).clone(), 1)),
+                    },
+                    None => unnamed += 1,
+                }
+            }
+            made.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            writes.extend(made.into_iter().map(|(site, n)| match n {
+                1 => site.to_string(),
+                n => format!("{n} × {site}"),
+            }));
             if unnamed > 0 {
                 writes.push(format!("{unnamed} unnamed"));
             }
@@ -1907,9 +2288,12 @@ impl Session {
                 (Ok(_), true) => false,
                 (Ok(node), false) => match &want {
                     None => true,
+                    // What it says, or what a field in it holds.
                     Some(text) => {
-                        let scene = ui.scene.borrow();
-                        driver::first_text(&scene, *node).is_some_and(|t| t.contains(text.as_str()))
+                        let shown = driver::first_text(&ui.scene.borrow(), *node);
+                        shown.is_some_and(|t| t.contains(text.as_str()))
+                            || driver::first_value(&ui, *node)
+                                .is_some_and(|v| v.contains(text.as_str()))
                     }
                 },
                 (Err(_), false) => false,
@@ -1929,10 +2313,16 @@ impl Session {
             }
             if Instant::now() >= deadline {
                 let why = match found {
-                    Ok(node) => format!(
-                        "still there: {}",
-                        driver::first_text(&ui.scene.borrow(), node).unwrap_or_default()
-                    ),
+                    Ok(node) => {
+                        let shown = driver::first_text(&ui.scene.borrow(), node);
+                        match driver::first_value(&ui, node) {
+                            Some(value) => format!(
+                                "still there: {}, holding {value:?}",
+                                shown.unwrap_or_default()
+                            ),
+                            None => format!("still there: {}", shown.unwrap_or_default()),
+                        }
+                    }
                     Err(error) => error,
                 };
                 return failed(format!("timed out after {timeout} ms ({why})"));

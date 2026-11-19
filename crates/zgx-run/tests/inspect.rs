@@ -1074,10 +1074,428 @@ return ui.input {
     end,
 }
 "##;
-    let app = TestApp::new(|runtime| ScriptHost::inline(runtime, "app", PASTE));
+    let app = TestApp::with_desktop(|runtime| ScriptHost::inline(runtime, "app", PASTE));
     let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
-    text(&ask(&app, &session, r##"{"cmd":"click","target":"#name"}"##));
-    let stroke = if cfg!(target_os = "macos") { "cmd+v" } else { "ctrl+v" };
-    text(&ask(&app, &session, &format!(r#"{{"cmd":"key","keys":"{stroke}"}}"#)));
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"click","target":"#name"}"##,
+    ));
+    let stroke = if cfg!(target_os = "macos") {
+        "cmd+v"
+    } else {
+        "ctrl+v"
+    };
+    text(&ask(
+        &app,
+        &session,
+        &format!(r#"{{"cmd":"key","keys":"{stroke}"}}"#),
+    ));
     assert!(text(&ask(&app, &session, r#"{"cmd":"state"}"#)).contains("heard = 1"));
+}
+
+/// What a QA script does off-screen: put content on the clipboard
+/// (`clipboard set`), then press ⌘V (Ctrl+V off macOS) into a field. The
+/// key, which nothing in the view takes, reaches the clipboard as a
+/// window's would: the field's `on_paste` hears the paste, here an image
+/// it reads back, and text goes in as typed. Before, `key` dispatched to the
+/// view alone and no paste happened.
+#[test]
+fn a_clipboard_set_then_pasted_with_the_key_reaches_on_paste() {
+    const PASTING: &str = r##"
+local heard = ui.state("heard", "")
+local value = ui.state("value", "")
+return ui.column {
+    ui.input { id = "field", label = "Field", value = value, w = 160, on_paste = function(e)
+        if e.text ~= nil then
+            heard:set(`text {e.text}`)
+            return false
+        end
+        ui.clipboard.read_image():after(function(image)
+            heard:set(if image then `image {image.w}x{image.h}` else "nothing")
+        end)
+        return true
+    end },
+    ui.text { id = "heard", "{heard}" },
+}
+"##;
+    // A 2 by 1 PNG: red, then blue.
+    const PNG: [u8; 71] = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 244, 34, 127, 138, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0,
+        66, 255, 1, 15, 249, 3, 253, 133, 17, 153, 118, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+        130,
+    ];
+    let app = TestApp::with_desktop(|runtime| ScriptHost::inline(runtime, "app", PASTING));
+    let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
+    let paste = if cfg!(target_os = "macos") {
+        "cmd+v"
+    } else {
+        "ctrl+v"
+    };
+    let png = std::env::temp_dir().join(format!("zgx-paste-{}.png", std::process::id()));
+    std::fs::write(&png, PNG).unwrap();
+    let set = format!(
+        r#"{{"cmd":"clipboard","action":"set","image":{}}}"#,
+        Value::from(png.to_str().unwrap()).to_json()
+    );
+    assert_eq!(
+        text(&ask(&app, &session, &set)),
+        "the clipboard holds a 2x1 image"
+    );
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"click","target":"#field"}"##,
+    ));
+    text(&ask(
+        &app,
+        &session,
+        &format!(r#"{{"cmd":"key","keys":"{paste}"}}"#),
+    ));
+    let wait = r##"{"cmd":"wait","target":"#heard","text":"image 2x1"}"##;
+    text(&ask(&app, &session, wait));
+    // Text: the hook hears it and lets it in.
+    let set = r#"{"cmd":"clipboard","action":"set","text":"hello"}"#;
+    text(&ask(&app, &session, set));
+    text(&ask(
+        &app,
+        &session,
+        &format!(r#"{{"cmd":"key","keys":"{paste}"}}"#),
+    ));
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#heard","text":"text hello"}"##,
+    ));
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#field","text":"hello"}"##,
+    ));
+    let read = text(&ask(&app, &session, r#"{"cmd":"clipboard"}"#));
+    assert!(read.starts_with("text: \"hello\""), "{read}");
+    std::fs::remove_file(png).unwrap();
+}
+
+/// A frame's writes to states no `ui.state` names say where the script made
+/// them, one line for each place however many rows made one there: forty
+/// rows' `ui.use_state`, `ui.computed` and `ui.tween` written, not "40
+/// unnamed" for each.
+#[test]
+fn frames_name_the_states_they_write_by_where_the_script_made_them() {
+    let _log = FRAME_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    const ROWS: &str = r##"
+local on = ui.state("on", false)
+ui.command { id = "light", run = function() on:set(true) end }
+local Row = ui.component(function(props)
+    local lit = ui.use_state(false)
+    ui.effect(function() lit:set(on:get()) end)
+    local shift = ui.computed(function() return if on:get() then 10 else 0 end)
+    return ui.div { h = 10, x = ui.tween(shift),
+        bg = function() return if lit:get() then "#ffffff" else "#000000" end }
+end)
+local rows = {}
+for i = 1, 40 do rows[i] = Row { i = i } end
+return ui.column(rows)
+"##;
+    // The chunk's lines from 1, as Luau counts them.
+    let line = |of: &str| ROWS.lines().position(|l| l.contains(of)).unwrap() + 1;
+    // Named from the first frame, as a host serving devtools does.
+    zgx_script::inspect::prepare();
+    let app = TestApp::new(|runtime| ScriptHost::inline(runtime, "rows", ROWS));
+    let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
+    app.frames(3);
+    text(&ask(&app, &session, r#"{"cmd":"mark","name":"lit"}"#));
+    assert!(app.host.run_command("light"));
+    app.frames(3);
+    let frames = text(&ask(&app, &session, r#"{"cmd":"frames","since":"lit"}"#));
+    for (made, what) in [
+        ("ui.use_state", "use_state"),
+        ("ui.computed", "computed"),
+        ("ui.tween", "tween"),
+    ] {
+        let site = format!("40 × rows:{} {what}", line(made));
+        assert!(frames.contains(&site), "{site} in {frames}");
+    }
+    // Every row's write named: what is left unnamed is the engine's own.
+    assert!(!frames.contains("40 unnamed"), "{frames}");
+}
+
+/// Files put on the clipboard (`clipboard set --files`), as a file manager
+/// copies them, read back on its `files:` line and reach a field's
+/// `on_paste` as files: an app's paste-as-upload, driven off-screen.
+#[test]
+fn files_set_on_the_clipboard_read_back_and_paste_as_files() {
+    const PASTING: &str = r##"
+local heard = ui.state("heard", "")
+local value = ui.state("value", "")
+return ui.column {
+    ui.input { id = "field", label = "Field", value = value, w = 160, on_paste = function(e)
+        local names = {}
+        for _, file in e.files do
+            table.insert(names, file.name)
+        end
+        heard:set(`files {table.concat(names, " ")}`)
+        return true
+    end },
+    ui.text { id = "heard", "{heard}" },
+}
+"##;
+    let app = TestApp::with_desktop(|runtime| ScriptHost::inline(runtime, "app", PASTING));
+    let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
+    let dir = std::env::temp_dir().join(format!("zgx-paste-files-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (notes, shot) = (dir.join("notes.txt"), dir.join("shot.png"));
+    std::fs::write(&notes, "notes").unwrap();
+    std::fs::write(&shot, "png").unwrap();
+    let files = Value::List(
+        [&notes, &shot]
+            .map(|path| Value::from(path.to_str().unwrap()))
+            .into(),
+    );
+    let set = format!(
+        r#"{{"cmd":"clipboard","action":"set","files":{}}}"#,
+        files.to_json()
+    );
+    assert_eq!(
+        text(&ask(&app, &session, &set)),
+        "the clipboard holds 2 files"
+    );
+    let read = ask(&app, &session, r#"{"cmd":"clipboard"}"#);
+    let line = format!(
+        "files: {:?}",
+        [notes.display().to_string(), shot.display().to_string()]
+    );
+    assert!(text(&read).lines().any(|l| l == line), "{}", text(&read));
+    assert_eq!(
+        read.field("data")
+            .and_then(|d| d.field("files"))
+            .map(Value::to_json),
+        Some(files.to_json())
+    );
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"click","target":"#field"}"##,
+    ));
+    let paste = if cfg!(target_os = "macos") {
+        "cmd+v"
+    } else {
+        "ctrl+v"
+    };
+    text(&ask(
+        &app,
+        &session,
+        &format!(r#"{{"cmd":"key","keys":"{paste}"}}"#),
+    ));
+    let wait = r##"{"cmd":"wait","target":"#heard","text":"files notes.txt shot.png"}"##;
+    text(&ask(&app, &session, wait));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `wait --text` is met by what a field holds, as by what a node says: a
+/// labelled field's first text is its label, and its value no text of it.
+#[test]
+fn waiting_for_text_is_met_by_what_is_typed_into_a_field() {
+    const APP: &str = r##"
+local value = ui.state("value", "")
+return ui.column {
+    ui.input { id = "field", label = "Field", value = value, w = 160 },
+}
+"##;
+    let app = TestApp::new(|runtime| ScriptHost::inline(runtime, "app", APP));
+    let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
+    let early = ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#field","text":"typed","timeout_ms":50}"##,
+    );
+    assert!(error(&early).contains("still there"), "{}", early.to_json());
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"type","target":"#field","text":"typed here"}"##,
+    ));
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#field","text":"typed"}"##,
+    ));
+}
+
+/// `type --no-click` types where focus is, the caret where it was: a click
+/// first would put it where the click landed.
+#[test]
+fn type_without_a_click_types_at_the_caret_where_focus_is() {
+    let (app, session) = app();
+    let no_focus = ask(
+        &app,
+        &session,
+        r#"{"cmd":"type","text":"x","no_click":true}"#,
+    );
+    assert_eq!(error(&no_focus), "nothing has focus to type into");
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"type","target":"#name","text":"world"}"##,
+    ));
+    // The caret back before "world", a character at a time.
+    for _ in 0..5 {
+        text(&ask(&app, &session, r#"{"cmd":"key","keys":"ArrowLeft"}"#));
+    }
+    let typed = text(&ask(
+        &app,
+        &session,
+        r#"{"cmd":"type","text":"hello ","no_click":true}"#,
+    ));
+    assert!(typed.starts_with("typed into @"), "{typed}");
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#name","text":"hello world"}"##,
+    ));
+    let both = ask(
+        &app,
+        &session,
+        r##"{"cmd":"type","target":"#name","text":"x","no_click":true}"##,
+    );
+    assert!(
+        error(&both).contains("give no target"),
+        "{}",
+        both.to_json()
+    );
+}
+
+/// What `zgx inspect` drives of drags from outside the app reaches what the
+/// host's real events do (`zgx::outside_drag`): files hovering a node and
+/// leaving (its `on_file_hover`), dropped (its `on_file_drop`, on
+/// `FilesDrop`), text let go over a field (into it), text only passing over
+/// (a would-drop answer, nothing dropped), and reduced motion set here and
+/// given back (what `ui.prefers` reads).
+#[test]
+fn outside_drags_and_reduced_motion_reach_what_the_hosts_events_do() {
+    const APP: &str = r##"
+local heard = ui.state("heard", "")
+local over = ui.state("over", "no")
+local value = ui.state("value", "ab")
+return ui.column {
+    ui.div { id = "drop", w = 200, h = 100, bg = "#333333",
+        on_file_hover = function(on) over:set(if on then "yes" else "no") end,
+        on_file_drop = function(files)
+            local names = {}
+            for _, file in files do table.insert(names, file.name) end
+            heard:set(table.concat(names, " "))
+        end },
+    ui.text { id = "over", "{over}" },
+    ui.text { id = "heard", "{heard}" },
+    ui.input { id = "field", label = "Field", value = value, w = 160 },
+    ui.text { id = "motion", function() return if ui.prefers.reduced_motion:get() then "still" else "moving" end },
+}
+"##;
+    let app = TestApp::new(|runtime| ScriptHost::inline(runtime, "app", APP));
+    let session = Session::new(&app.ui, app.handle.clone(), &app.host, None);
+    let dir = std::env::temp_dir().join(format!("zgx-outside-drop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let files = Value::List(
+        [&a, &b]
+            .map(|path| Value::from(path.to_str().unwrap()))
+            .into(),
+    );
+    let ask_json = |request: String| ask(&app, &session, &request);
+    // Hovering, then leaving.
+    let hover = format!(
+        r##"{{"cmd":"files","action":"hover","at":"#drop","files":{}}}"##,
+        files.to_json()
+    );
+    let said = text(&ask_json(hover));
+    assert!(said.contains("2 files over"), "{said}");
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#over","text":"yes"}"##,
+    ));
+    text(&ask(&app, &session, r#"{"cmd":"files","action":"leave"}"#));
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#over","text":"no"}"##,
+    ));
+    // Dropped: `on_file_drop` hears both, by name, as on `FilesDrop`.
+    let drop = format!(
+        r##"{{"cmd":"files","action":"drop","at":"#drop","files":{}}}"##,
+        files.to_json()
+    );
+    let said = text(&ask_json(drop));
+    assert!(
+        said.contains("2 files dropped") && said.contains("taken"),
+        "{said}"
+    );
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#heard","text":"a.txt b.txt"}"##,
+    ));
+    // Text over the field only: it would drop, nothing is dropped.
+    let passing = ask(
+        &app,
+        &session,
+        r##"{"cmd":"text-drop","at":"#field","hover_only":true}"##,
+    );
+    assert!(
+        text(&passing).contains("would drop"),
+        "{}",
+        passing.to_json()
+    );
+    let value = |app: &TestApp| {
+        app.host
+            .states()
+            .into_iter()
+            .find(|(name, _)| name == "value")
+            .map(|(_, value)| value.to_string())
+            .unwrap()
+    };
+    assert_eq!(value(&app), "ab", "a drag passing over drops nothing");
+    // Let go over the field: it goes in.
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"text-drop","at":"#field","text":"XY","html":"<b>XY</b>"}"##,
+    ));
+    assert!(value(&app).contains("XY"), "{}", value(&app));
+    text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"wait","target":"#field","text":"XY"}"##,
+    ));
+    // Reduced motion set here, either way, then the system's back.
+    let system = text(&ask(
+        &app,
+        &session,
+        r##"{"cmd":"node","target":"#motion"}"##,
+    ));
+    let system = if system.contains("still") {
+        "still"
+    } else {
+        "moving"
+    };
+    for (value, shows) in [("on", "still"), ("off", "moving"), ("system", system)] {
+        let said = text(&ask(
+            &app,
+            &session,
+            &format!(r#"{{"cmd":"prefers","name":"reduced-motion","value":"{value}"}}"#),
+        ));
+        if value != "system" {
+            assert!(said.contains("the system's own is unchanged"), "{said}");
+        }
+        text(&ask(
+            &app,
+            &session,
+            &format!(r##"{{"cmd":"wait","target":"#motion","text":"{shows}"}}"##),
+        ));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

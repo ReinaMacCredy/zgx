@@ -412,22 +412,33 @@ impl Runtime {
         };
         callback()
     }
-    /// A signal in this runtime holding `value`.
+    /// A signal in this runtime holding `value`. Traced, it is named by the
+    /// line that made it until a maker names it better (a script's line).
+    #[cfg_attr(feature = "trace", track_caller)]
     pub fn signal<T: 'static>(&self, value: T) -> Signal<T> {
-        Signal {
+        let signal = Signal {
             inner: Rc::new(SignalInner {
                 value: RefCell::new(value),
                 version: Cell::new(0),
                 subscribers: RefCell::default(),
                 runtime: Rc::downgrade(&self.inner),
             }),
+        };
+        #[cfg(feature = "trace")]
+        if crate::trace::enabled() {
+            crate::trace::made(signal.addr(), std::panic::Location::caller());
         }
+        signal
     }
     /// Runs immediately. Keep the returned handle alive to keep the subscription.
+    /// Traced, it is named by the line that made it until a maker names it
+    /// better (`@12 binding`, a script's line).
+    #[cfg_attr(feature = "trace", track_caller)]
     pub fn effect(&self, callback: impl FnMut() + 'static) -> Effect {
         self.effect_marked(false, callback)
     }
     /// [`Runtime::effect`], `mount_pure` if it reads no layout.
+    #[cfg_attr(feature = "trace", track_caller)]
     pub(crate) fn effect_marked(
         &self,
         mount_pure: bool,
@@ -442,6 +453,7 @@ impl Runtime {
     pub(crate) fn rest(&self) {
         self.inner.effects.borrow_mut().rest();
     }
+    #[cfg_attr(feature = "trace", track_caller)]
     pub(crate) fn effect_callback(&self, mount_pure: bool, callback: Callback) -> Effect {
         let born = self.inner.next.get();
         self.inner.next.set(born + 1);
@@ -457,6 +469,10 @@ impl Runtime {
                 owns: false,
             },
         );
+        #[cfg(feature = "trace")]
+        if crate::trace::enabled() {
+            crate::trace::made_effect(id, std::panic::Location::caller());
+        }
         self.inner.queue(id);
         let effect = Effect {
             id,
@@ -469,6 +485,7 @@ impl Runtime {
     /// even inside a batch or a flush, where `effect` queues it behind what
     /// is running: a value derived by it is readable at once (a computed
     /// made while a component builds, which `on_mount` then reads).
+    #[cfg_attr(feature = "trace", track_caller)]
     pub fn effect_now(&self, callback: impl FnMut() + 'static) -> Effect {
         if self.inner.batch_depth.get() == 0 && !self.inner.flushing.get() {
             return self.effect(callback);
@@ -488,6 +505,10 @@ impl Runtime {
                 owns: false,
             },
         );
+        #[cfg(feature = "trace")]
+        if crate::trace::enabled() {
+            crate::trace::made_effect(id, std::panic::Location::caller());
+        }
         // Made before it runs: a first run that panics drops it, so
         // nothing is left subscribed with no handle to dispose of it.
         let effect = Effect {
@@ -566,7 +587,7 @@ impl Runtime {
                     .inner
                     .batch_depth
                     .set(self.0.inner.batch_depth.get() - 1);
-                if !std::thread::panicking() {
+                if !unwinding() {
                     self.0.flush();
                 }
             }
@@ -615,7 +636,7 @@ impl Runtime {
                     .inner
                     .batch_depth
                     .set(self.0.inner.batch_depth.get() - 1);
-                if !std::thread::panicking() {
+                if !unwinding() {
                     if (self.2)() {
                         self.0.flush_watched(&mut self.1);
                     } else {
@@ -1030,6 +1051,15 @@ struct SignalInner<T> {
     subscribers: RefCell<IdSet>,
     runtime: Weak<Inner>,
 }
+// A traced signal's maker goes with it: its address may be another's next.
+#[cfg(feature = "trace")]
+impl<T> Drop for SignalInner<T> {
+    fn drop(&mut self) {
+        if crate::trace::enabled() {
+            crate::trace::forget_signal((self as *const Self).cast::<()>() as usize);
+        }
+    }
+}
 impl<T> Dependency for SignalInner<T> {
     fn unsubscribe(&self, id: EffectId) {
         self.subscribers.borrow_mut().remove(&id);
@@ -1049,8 +1079,7 @@ impl Drop for HeldEffects {
     fn drop(&mut self) {
         let inner = &self.0.inner;
         inner.batch_depth.set(inner.batch_depth.get() - 1);
-        if !std::thread::panicking()
-            && (!inner.queued.borrow().is_empty() || !inner.pending.borrow().is_empty())
+        if !unwinding() && (!inner.queued.borrow().is_empty() || !inner.pending.borrow().is_empty())
         {
             self.0.flush();
         }
@@ -1285,6 +1314,20 @@ impl ServiceScope {
     }
 }
 
+/// Whether a panic is unwinding through this frame, so a guard's clean-up
+/// (a flush, a gesture's end) would act on half-made state: where panics
+/// unwind, `std::thread::panicking` itself.
+#[cfg(panic = "unwind")]
+pub(crate) use std::thread::panicking as unwinding;
+/// Where panics abort (wasm32), nothing unwinds, so no guard is ever
+/// dropped by one; `std::thread::panicking` stays true after a panic a host
+/// caught (a trap the page's JS carried on past), and trusting it would
+/// leave every later effect unrun.
+#[cfg(not(panic = "unwind"))]
+#[inline(always)]
+pub(crate) fn unwinding() -> bool {
+    false
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,6 +46,10 @@ impl Platform for Desktop {
         &self,
         notification: zgx::platform::Notification,
     ) -> Pending<Result<(), zgx::platform::NotifyError>> {
+        // Off-screen (`ZGX_OFFSCREEN`): no banner on anyone's screen.
+        if !crate::window_chrome::may_show() {
+            return Box::pin(async { Ok(()) });
+        }
         crate::notify::notify(notification)
     }
     fn set_badge(&self, badge: Option<&str>) -> bool {
@@ -57,7 +61,7 @@ impl Platform for Desktop {
         Box::pin(async move {
             let tag = next.await?;
             // The app forward, to where the click asks it to go.
-            if let Some(window) = window {
+            if let Some(window) = window.filter(|_| crate::window_chrome::may_show()) {
                 window.set_minimized(false);
                 window.focus_window();
             }
@@ -106,18 +110,35 @@ impl Platform for Desktop {
     }
     #[cfg(target_os = "macos")]
     fn look_up(&self, text: &str, baseline: (f32, f32), size: f32) -> bool {
-        self.dialogs
-            .window()
-            .is_some_and(|window| crate::look_up::show(&window, text, baseline, size))
+        crate::window_chrome::may_show()
+            && self
+                .dialogs
+                .window()
+                .is_some_and(|window| crate::look_up::show(&window, text, baseline, size))
     }
     fn set_text_language(&self, language: Option<&str>) {
         if let Some(windows) = &self.windows {
             let _ = windows.set_text_language(language.map(str::to_owned));
         }
     }
+    fn add_font(&self, bytes: Arc<[u8]>) -> Result<Vec<String>, String> {
+        let windows = self.windows.as_ref().ok_or("no windows here")?;
+        let font = zgx_gpu::text::FontData::new(bytes)?;
+        let families = font.families().to_vec();
+        windows.add_font(font)?;
+        Ok(families)
+    }
+    fn fonts(&self) -> Vec<Arc<[u8]>> {
+        self.windows
+            .as_ref()
+            .map_or_else(Vec::new, crate::WindowFactory::font_files)
+    }
     fn open_url(&self, url: &str) -> bool {
-        // The launcher runs detached: nothing waits on the browser.
-        crate::url::valid_url(url) && open::that_detached(url).is_ok()
+        // The launcher runs detached: nothing waits on the browser. Off-screen,
+        // no browser comes up.
+        crate::window_chrome::may_show()
+            && crate::url::valid_url(url)
+            && open::that_detached(url).is_ok()
     }
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     fn misspellings(&self, text: &str) -> Vec<std::ops::Range<usize>> {
@@ -153,6 +174,20 @@ impl Platform for Desktop {
             .as_mut()
             .and_then(|clipboard| clipboard.get_files().ok())
             .unwrap_or_default()
+    }
+    fn set_clipboard_files(&self, files: Vec<std::path::PathBuf>) -> bool {
+        self.clipboard
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|clipboard| clipboard.set_files(files))
+    }
+    fn clipboard_html(&self) -> Option<String> {
+        self.clipboard
+            .borrow_mut()
+            .as_mut()?
+            .get_html()
+            .ok()
+            .filter(|html| !html.is_empty())
     }
     fn set_clipboard_rich_text(&self, text: String, html: String) -> bool {
         self.clipboard

@@ -73,6 +73,8 @@ pub(crate) enum FileEvent {
         x: f32,
         y: f32,
         text: String,
+        /// The same as HTML, where the source offered `text/html`.
+        html: Option<String>,
         accepted: std::sync::mpsc::Sender<bool>,
     },
 }
@@ -106,6 +108,10 @@ enum Command {
     },
     /// The clipboard's `text/uri-list`: the files a file manager copied.
     LoadFiles {
+        reply: mpsc::Sender<Result<Loaded, String>>,
+    },
+    /// The clipboard's `text/html`: a browser's or word processor's copy.
+    LoadHtml {
         reply: mpsc::Sender<Result<Loaded, String>>,
     },
     /// Raise `window` with an activation token; held here until done, so
@@ -231,6 +237,15 @@ impl WaylandClipboard {
             .send(Command::LoadImage { reply })
             .map_err(|_| "Wayland data worker stopped".to_string())?;
         Ok(read_loaded(answer)?.0)
+    }
+    /// The clipboard's HTML (`text/html`), as offered: a browser's or a
+    /// word processor's copy.
+    pub fn load_html(&self) -> Result<String, String> {
+        let (reply, answer) = mpsc::channel();
+        self.0
+            .send(Command::LoadHtml { reply })
+            .map_err(|_| "Wayland data worker stopped".to_string())?;
+        Ok(String::from_utf8_lossy(&read_loaded(answer)?.0).into_owned())
     }
     pub fn load_files(&self) -> Result<Vec<std::path::PathBuf>, String> {
         let (reply, answer) = mpsc::channel();
@@ -368,6 +383,9 @@ impl NativeData {
                             Command::LoadFiles { reply } => {
                                 let _ = reply.send(state.load_files());
                             }
+                            Command::LoadHtml { reply } => {
+                                let _ = reply.send(state.load_html());
+                            }
                             Command::Activate { token, window } => state.activate(&token, &window),
                             Command::Drag {
                                 window,
@@ -463,6 +481,8 @@ struct Offer {
     text: Option<usize>,
     /// Whether it offers `image/png`.
     png: bool,
+    /// Whether it offers `text/html`.
+    html: bool,
     /// The compositor's action for it, as last said. Hyprland says it once,
     /// as it makes the offer: before the enter that names it.
     action: Option<DndAction>,
@@ -520,8 +540,16 @@ struct TextDrag {
     y: f32,
     /// Whether the window would take it where it last was.
     accepted: bool,
+    /// Whether the offer has `text/html`: read beside its text as it drops.
+    offers_html: bool,
     /// Let go of: its text being read.
     read: Option<Transfer>,
+    /// Its text, once read (each transfer gives its bytes once).
+    got: Option<Vec<u8>>,
+    /// Its HTML being read, beside its text.
+    html_read: Option<Transfer>,
+    /// Its HTML, once read.
+    html: Option<String>,
 }
 struct Drag {
     offer: wl_data_offer::WlDataOffer,
@@ -903,6 +931,16 @@ impl State {
         drop(write);
         Ok(Loaded(read, false))
     }
+    fn load_html(&mut self) -> Result<Loaded, String> {
+        let (read, write) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let offer = self.selection.as_ref().ok_or("the clipboard is empty")?;
+        if !offer.html {
+            return Err("the clipboard holds no HTML".into());
+        }
+        offer.proxy.receive("text/html".into(), write.as_fd());
+        drop(write);
+        Ok(Loaded(read, false))
+    }
     fn load(&mut self, primary: bool) -> Result<Loaded, String> {
         // Even this process's own selection goes through the compositor: its
         // writer is another thread, so the caller's wait cannot deadlock.
@@ -984,18 +1022,47 @@ impl State {
             bytes: Vec::new(),
             deadline: Instant::now() + Duration::from_secs(3),
         });
+        // Its HTML too, where offered: a rich destination drops that.
+        if text.offers_html
+            && let Ok((read, write)) = UnixStream::pair()
+            && read.set_nonblocking(true).is_ok()
+        {
+            text.offer.receive("text/html".into(), write.as_fd());
+            drop(write);
+            text.html_read = Some(Transfer {
+                stream: read,
+                bytes: Vec::new(),
+                deadline: Instant::now() + Duration::from_secs(3),
+            });
+        }
     }
-    /// The text drag's text, read as it arrives: it drops then.
+    /// The text drag's text, and its HTML where offered, read as they
+    /// arrive: it drops once both have (HTML that fails, with its text
+    /// alone).
     fn read_text(&mut self) {
-        let Some(read) = self.text.as_mut().and_then(|text| text.read.as_mut()) else {
+        let Some(text) = self.text.as_mut() else {
             return;
         };
-        let bytes = match read.poll() {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return,
-            Err(_) => return self.cancel(),
+        let Some(read) = text.read.as_mut() else {
+            return;
         };
+        if text.got.is_none() {
+            match read.poll() {
+                Ok(Some(bytes)) => text.got = Some(bytes),
+                Ok(None) => return,
+                Err(_) => return self.cancel(),
+            }
+        }
+        if let Some(html) = text.html_read.as_mut() {
+            match html.poll() {
+                Ok(Some(bytes)) => text.html = Some(html_text(&bytes)),
+                Ok(None) => return,
+                Err(_) => {}
+            }
+            text.html_read = None;
+        }
         let text = self.text.take().unwrap();
+        let bytes = text.got.unwrap_or_default();
         let (accepted, reply) = std::sync::mpsc::channel();
         (self.handler)(
             text.token,
@@ -1003,6 +1070,7 @@ impl State {
                 x: text.x,
                 y: text.y,
                 text: String::from_utf8_lossy(&bytes).into_owned(),
+                html: text.html,
                 accepted,
             },
         );
@@ -1511,6 +1579,7 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
                 if let Some(saved) = state.offers.get_mut(&offer.id().protocol_id()) {
                     saved.uris |= mime_type == "text/uri-list";
                     saved.png |= mime_type == "image/png";
+                    saved.html |= mime_type == "text/html";
                     saved.text = preferred(saved.text, &mime_type);
                 }
             }
@@ -1553,6 +1622,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                         uris: false,
                         text: None,
                         png: false,
+                        html: false,
                         action: None,
                     },
                 );
@@ -1627,7 +1697,11 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                         x,
                         y,
                         accepted: false,
+                        offers_html: offer.html,
                         read: None,
+                        got: None,
+                        html_read: None,
+                        html: None,
                     });
                     (state.handler)(token, FileEvent::TextOver { x, y });
                     let _ = connection.flush();
@@ -1803,6 +1877,27 @@ impl Transfer {
         }
     }
 }
+/// HTML's bytes as text: UTF-16 after a byte order mark (as Firefox gives
+/// `text/html`), else UTF-8.
+fn html_text(bytes: &[u8]) -> String {
+    let units = |le: bool| {
+        bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| match le {
+                true => u16::from_le_bytes(pair),
+                false => u16::from_be_bytes(pair),
+            })
+            .collect::<Vec<u16>>()
+    };
+    match bytes {
+        [0xff, 0xfe, ..] => String::from_utf16_lossy(&units(true)),
+        [0xfe, 0xff, ..] => String::from_utf16_lossy(&units(false)),
+        [0xef, 0xbb, 0xbf, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
 /// Whether a drop the compositor delivered is taken (read, and finished).
 /// Before version 3 there are no actions. A copy is what was asked for
 /// (`set_actions(copy, copy)`); a move too, as Hyprland chooses move for
@@ -1852,6 +1947,16 @@ mod tests {
         assert!(takes_drop(3, None));
         assert!(!takes_drop(3, Some(DndAction::empty())));
         assert!(!takes_drop(3, Some(DndAction::Ask)));
+    }
+    #[test]
+    fn html_reads_as_utf8_or_utf16_by_its_mark() {
+        assert_eq!(html_text("<b>caf\u{e9}</b>".as_bytes()), "<b>caf\u{e9}</b>");
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain("<i>\u{e9}</i>".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        assert_eq!(html_text(&utf16), "<i>\u{e9}</i>");
+        assert_eq!(html_text(b"\xef\xbb\xbf<p>"), "<p>");
     }
     #[test]
     fn a_uri_list_gives_its_files() {

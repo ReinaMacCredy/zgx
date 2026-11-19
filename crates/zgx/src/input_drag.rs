@@ -82,6 +82,10 @@ pub struct DragEvent {
 #[derive(Debug)]
 pub struct DraggedText {
     text: String,
+    /// The same as HTML, where another app offered it (a browser's
+    /// selection, a document's): a rich destination drops it as it pastes
+    /// HTML.
+    html: Option<String>,
     /// The editor it was selected in (its scene's `identity`, as node ids
     /// are each window's own, and its node), and where: a drop there moves
     /// it.
@@ -95,8 +99,18 @@ impl DraggedText {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
+            html: None,
             from: None,
             taken: std::cell::Cell::new(false),
+        }
+    }
+    /// Text dragged in from another app with its HTML (`public.html`,
+    /// `text/html`, `CF_HTML`'s fragment): copied wherever it is dropped.
+    #[doc(hidden)]
+    pub fn with_html(text: impl Into<String>, html: Option<String>) -> Self {
+        Self {
+            html,
+            ..Self::new(text)
         }
     }
     pub(crate) fn from_editor(
@@ -107,6 +121,7 @@ impl DraggedText {
     ) -> Self {
         Self {
             text,
+            html: None,
             from: Some((scene, editor, range)),
             taken: std::cell::Cell::new(false),
         }
@@ -122,6 +137,13 @@ impl DraggedText {
     /// The text.
     pub fn text(&self) -> &str {
         &self.text
+    }
+    /// The same as HTML, where the app it came from offered it: what a
+    /// rich destination drops, run through its paste of HTML. Known as it
+    /// drops, as the text is.
+    #[doc(hidden)]
+    pub fn html(&self) -> Option<&str> {
+        self.html.as_deref()
     }
 }
 /// What a drag carries to other apps, when a host hands it to the platform
@@ -197,7 +219,24 @@ pub(super) struct DragSession {
     preview_origin: Option<(f32, f32)>,
     export: Option<Rc<[DragItem]>>,
     away: bool,
+    /// The pointer left the window (`PointerLeave`) and has not moved over
+    /// it since.
+    left: bool,
     moves_window: bool,
+}
+/// Where a drag over the window is, for a scroll view it holds near an edge
+/// (`drag_scroll`): the window's own, another window's or app's, or files.
+pub(crate) struct DragPoint {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    /// The window's own drag's preview, not under the pointer.
+    pub(crate) preview: Option<NodeId>,
+    kind: PointKind,
+}
+enum PointKind {
+    Own,
+    Visit(Action),
+    Files(std::path::PathBuf),
 }
 impl Visit {
     /// The node it names.
@@ -488,6 +527,7 @@ impl InputDispatcher {
             preview_origin: None,
             export: None,
             away: false,
+            left: false,
             moves_window: false,
         };
         let (pressed, orphans) = {
@@ -553,12 +593,19 @@ impl InputDispatcher {
         if let Some(active) = &mut self.state.borrow_mut().drag {
             active.x = x;
             active.y = y;
+            active.left = false;
         }
         self.to_source(scene, drag.source, drag.event(DragPhase::Move, false));
         // Over another window, its destinations hear it (`drag_over`).
         if drag.away {
             return;
         }
+        self.drag_over_here(scene, drag);
+    }
+    /// What is under the window's drag hears it over it, and what it left
+    /// hears it leave.
+    fn drag_over_here(&self, scene: &Rc<RefCell<Scene>>, drag: DragSession) {
+        let (x, y) = (drag.x, drag.y);
         if !self
             .state
             .borrow()
@@ -764,11 +811,68 @@ impl InputDispatcher {
                 }
                 if let Some(drag) = &mut self.state.borrow_mut().drag {
                     drag.destination = None;
+                    drag.left = true;
                 }
                 self.arm_spring(None);
                 true
             }
             _ => false,
+        }
+    }
+    /// Where a drag over the window is: the window's own (unless it is over
+    /// another window or left this one), another window's or app's
+    /// (`drag_over`), or files from outside (`InputEvent::FileHover`). None
+    /// once it left, dropped or ended.
+    pub(crate) fn drag_point(&self) -> Option<DragPoint> {
+        let state = self.state.borrow();
+        if let Some(drag) = &state.drag {
+            return (!drag.away && !drag.left).then(|| DragPoint {
+                x: drag.x,
+                y: drag.y,
+                preview: drag.preview,
+                kind: PointKind::Own,
+            });
+        }
+        if let Some(visit) = &state.visit {
+            return Some(DragPoint {
+                x: visit.x,
+                y: visit.y,
+                preview: None,
+                kind: PointKind::Visit(visit.payload.clone()),
+            });
+        }
+        let (x, y, path) = state.file_point.as_ref()?;
+        Some(DragPoint {
+            x: *x,
+            y: *y,
+            preview: None,
+            kind: PointKind::Files(path.clone()),
+        })
+    }
+    /// The drag at `point` is over what scrolled under it: what is there
+    /// now hears it over it (and what it left, leave), as if it had moved.
+    pub(crate) fn drag_over_again(&self, scene: &Rc<RefCell<Scene>>, point: DragPoint) {
+        match point.kind {
+            PointKind::Own => {
+                self.validate_drag(scene);
+                let drag = self.state.borrow().drag.clone();
+                if let Some(drag) = drag.filter(|drag| !drag.away && !drag.left) {
+                    self.drag_over_here(scene, drag);
+                }
+            }
+            PointKind::Visit(payload) => {
+                self.drag_over(scene, &payload, point.x, point.y);
+            }
+            PointKind::Files(path) => {
+                self.dispatch(
+                    scene,
+                    InputEvent::FileHover {
+                        x: point.x,
+                        y: point.y,
+                        path,
+                    },
+                );
+            }
         }
     }
 }

@@ -185,6 +185,48 @@ pub(crate) fn zoom_buttons(window: &winit::window::Window, titlebar: Titlebar, z
     let _ = (window, titlebar, zoom);
 }
 
+/// The title bar's free area and its buttons (`titlebar_area`).
+#[doc(hidden)]
+pub type TitlebarArea = (Option<zgx::scene::Rect>, Option<zgx::scene::Rect>);
+
+/// A resize `debug_titlebar_mid_resize` made: the height asked for and the
+/// one the window took, and the title bar as zgx reads it where winit
+/// reports the resize (None: nothing reported one, the frame unchanged),
+/// then once AppKit is done.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct TitlebarResize {
+    /// The window's frame height asked for.
+    pub asked: f64,
+    /// The frame height the window took.
+    pub took: f64,
+    /// The title bar read where winit reports the resize: None when
+    /// nothing reported one.
+    pub during: Option<TitlebarArea>,
+    /// The title bar once AppKit is done with the resize.
+    pub after: TitlebarArea,
+}
+
+/// Test hook (macOS; main thread): a bare window with the inset title bar is
+/// resized as Accessibility resizes a window (Raycast, Rectangle) to each
+/// of the heights `heights` gives for its screen's visible height (what a
+/// snapped window fills at most: AppKit keeps an on-screen window's frame
+/// within it), and for each, the title bar's area and buttons as zgx reads
+/// them where winit reports the resize, then once AppKit is done. Empty
+/// elsewhere.
+#[doc(hidden)]
+pub fn debug_titlebar_mid_resize(heights: impl FnOnce(f64) -> Vec<f64>) -> Vec<TitlebarResize> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::titlebar_mid_resize(heights)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = heights;
+        Vec::new()
+    }
+}
+
 /// The title bar's free area and the window's buttons in it, in points
 /// (`WindowInfo::titlebar_area`, `controls`): `None` for a standard title
 /// bar and in fullscreen.
@@ -2064,6 +2106,53 @@ pub(crate) fn zoom_outside_handler(zoom: impl FnOnce() + Send + 'static) {
     dispatch2::DispatchQueue::main().exec_async(zoom);
 }
 
+/// `ZGX_OFFSCREEN=1`: test and probe sessions keep their windows from anyone's
+/// screen: invisible and click-through, out of Mission Control and window
+/// cycling, never activating, with no Dock icon or Cmd-Tab place, while they
+/// go on drawing (it implies `ZGX_RENDER_WHEN_COVERED`) and answering
+/// `zgx inspect` (its snapshots are zgx's own frames).
+pub(crate) static OFFSCREEN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    zgx::env::var_os("ZGX_OFFSCREEN").is_some_and(|v| !v.is_empty() && v != "0")
+});
+
+/// Hides `window` from the screen as `OFFSCREEN` says (macOS).
+pub(crate) fn send_offscreen(window: &winit::window::Window) {
+    #[cfg(target_os = "macos")]
+    if let Some(window) = mac::ns_window(window) {
+        hide_ns_window(&window);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
+}
+
+/// Whether anything may be put on the screen: not under `OFFSCREEN`, whose
+/// windows are never ordered in (made hidden, a show, focus, restore,
+/// fullscreen or zoom of one does nothing) and which shows no popup, native
+/// menu, dialog, alert, notification, look-up or browser. WindowServer lists
+/// none of its windows on any screen.
+pub(crate) fn may_show() -> bool {
+    !*OFFSCREEN
+}
+
+/// A shown window's alpha: none while `OFFSCREEN` (macOS's popup panels).
+#[cfg(target_os = "macos")]
+pub(crate) fn shown_alpha() -> f64 {
+    if *OFFSCREEN { 0. } else { 1. }
+}
+
+/// `send_offscreen` for a window zgx made itself (a popup's).
+#[cfg(target_os = "macos")]
+pub(crate) fn hide_ns_window(window: &objc2_app_kit::NSWindow) {
+    use objc2_app_kit::NSWindowCollectionBehavior;
+    // AppKit keeps a titled window on a screen as it shows, so it is made unseen instead of moved
+    window.setAlphaValue(0.);
+    window.setIgnoresMouseEvents(true);
+    window.setHasShadow(false);
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle,
+    );
+}
+
 pub(crate) fn double_click(window: &winit::window::Window) {
     #[cfg(target_os = "macos")]
     mac::double_click(window);
@@ -2709,10 +2798,100 @@ mod mac {
     pub(super) fn titlebar_area(
         window: &winit::window::Window,
     ) -> (Option<zgx::scene::Rect>, Option<zgx::scene::Rect>) {
-        use zgx::scene::Rect;
-        let Some(window) = ns_window(window) else {
-            return (None, None);
+        match ns_window(window) {
+            Some(window) => titlebar_area_of(&window),
+            None => (None, None),
+        }
+    }
+
+    /// Test hook (`debug_titlebar_mid_resize`): a bare window with the inset
+    /// title bar, its frame set as tall as `heights` gives for its screen's
+    /// visible height, in turn, as Accessibility sets it
+    /// (`setFrame:display:`), and `titlebar_area` read where winit reports
+    /// each resize: as the content view's frame changes. Each reading, then
+    /// one once AppKit is done with the resize.
+    pub(super) fn titlebar_mid_resize(
+        heights: impl FnOnce(f64) -> Vec<f64>,
+    ) -> Vec<super::TitlebarResize> {
+        use objc2::MainThreadMarker;
+        use objc2_foundation::{NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize};
+        let Some(mtm) = MainThreadMarker::new() else {
+            return Vec::new();
         };
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable;
+        let frame = NSRect::new(NSPoint::new(100., 100.), NSSize::new(600., 400.));
+        // SAFETY: NSWindow's designated initializer, on the main thread; the
+        // window isn't released when closed (dropped here, its owner).
+        let window = unsafe {
+            let window = NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                style,
+                objc2_app_kit::NSBackingStoreType::Buffered,
+                false,
+            );
+            window.setReleasedWhenClosed(false);
+            window
+        };
+        content_under_titlebar(&window);
+        inset_buttons(&window);
+        let Some(content) = window.contentView() else {
+            return Vec::new();
+        };
+        content.setPostsFrameChangedNotifications(true);
+        // On screen, as a snapped window is (AppKit lays an unshown one's
+        // title bar out only as it shows).
+        let _ = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        window.orderFrontRegardless();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let block = block2::RcBlock::new({
+            let seen = seen.clone();
+            let window = window.clone();
+            move |_: std::ptr::NonNull<NSNotification>| {
+                seen.borrow_mut().push(titlebar_area_of(&window));
+            }
+        });
+        let center = NSNotificationCenter::defaultCenter();
+        // SAFETY: AppKit's own notification name; the block runs on the
+        // main thread (the content view's frame is set there) and is
+        // removed before it's dropped.
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(objc2_app_kit::NSViewFrameDidChangeNotification),
+                Some(&content),
+                None,
+                &block,
+            )
+        };
+        let visible = window
+            .screen()
+            .map_or(0., |screen| screen.visibleFrame().size.height);
+        let mut readings = Vec::new();
+        for asked in heights(visible) {
+            let mut frame = window.frame();
+            // As Accessibility's AXSize: the top left stays.
+            frame.origin.y += frame.size.height - asked;
+            frame.size.height = asked;
+            seen.borrow_mut().clear();
+            window.setFrame_display(frame, false);
+            readings.push(super::TitlebarResize {
+                asked,
+                took: window.frame().size.height,
+                during: seen.borrow().last().copied(),
+                after: titlebar_area_of(&window),
+            });
+        }
+        // SAFETY: the observer `addObserverForName:` returned.
+        unsafe { center.removeObserver(observer.as_ref()) };
+        window.close();
+        readings
+    }
+
+    fn titlebar_area_of(window: &NSWindow) -> (Option<zgx::scene::Rect>, Option<zgx::scene::Rect>) {
+        use zgx::scene::Rect;
         let Some(content) = window.contentView() else {
             return (None, None);
         };
@@ -2720,29 +2899,59 @@ mod mac {
             return (None, None);
         }
         let size = content.frame().size;
+        // NSWindowCloseButton, MiniaturizeButton, ZoomButton.
+        let buttons: Vec<Retained<NSView>> = [0_usize, 1, 2]
+            .into_iter()
+            .filter_map(|button| {
+                // SAFETY: `-standardWindowButton:` takes an NSUInteger and
+                // returns an NSButton (a view) or nil, retained here.
+                unsafe { msg_send![&*window, standardWindowButton: button] }
+            })
+            .collect();
+        // The buttons are measured from the top of the title bar's container
+        // (their bar's superview), which AppKit keeps at the window's top,
+        // not from the content view's. A window resized by a frame set from
+        // outside (Accessibility's AXSize, as Raycast and Rectangle snap
+        // windows; `setFrame:`) has its content view resized first, and
+        // winit reports the resize from there (`frameDidChange:`), before
+        // AppKit moves the container to the new top: read against the
+        // content then, the buttons stood the height's change away from the
+        // top (a title bar laid out on them drew far down the window), and
+        // the bar was as tall as that change, or gone.
+        // SAFETY: a superview clears its subviews' back pointer as it lets
+        // them go, so one still set is alive (main thread).
+        let container = buttons
+            .first()
+            .and_then(|button| unsafe { button.superview() })
+            .and_then(|bar| unsafe { bar.superview() });
+        let in_window = |view: &NSView| {
+            let frame = view.convertRect_toView(view.bounds(), None);
+            (frame.origin.y + frame.size.height, frame.size.height)
+        };
+        let (window_top, _) = in_window(&content);
+        let (top, container_height) = container.as_deref().map_or((window_top, 0.), in_window);
         // The content covers the title bar (a full-size content view): the
-        // bar is what the content's layout rect leaves out.
-        let bar = (size.height - window.contentLayoutRect().size.height) as f32;
+        // bar is what the content's layout rect leaves out. Until AppKit has
+        // moved the container to the window's new top, that rect may be the
+        // old frame's or the new one's: the container's own height then
+        // (AppKit's: zgx sets it only for a zoom, `zoom_buttons`, which
+        // places it at the top).
+        let bar = if container.is_none() || top == window_top {
+            let layout = window.contentLayoutRect();
+            window_top - (layout.origin.y + layout.size.height)
+        } else {
+            container_height
+        };
+        let bar = bar as f32;
         if bar <= 0. {
             return (None, None);
         }
         let width = size.width as f32;
         let mut controls: Option<Rect> = None;
-        // NSWindowCloseButton, MiniaturizeButton, ZoomButton.
-        for button in [0_usize, 1, 2] {
-            // SAFETY: `-standardWindowButton:` takes an NSUInteger and
-            // returns an NSButton (a view) or nil, retained here.
-            let button: Option<Retained<NSView>> =
-                unsafe { msg_send![&*window, standardWindowButton: button] };
-            let Some(button) = button.filter(|b| !b.isHidden()) else {
-                continue;
-            };
-            let frame = content.convertRect_fromView(button.bounds(), Some(&button));
-            let y = if content.isFlipped() {
-                frame.origin.y
-            } else {
-                size.height - frame.origin.y - frame.size.height
-            };
+        for button in buttons.iter().filter(|b| !b.isHidden()) {
+            // In the window's (bottom-up) points, from the container's top.
+            let frame = button.convertRect_toView(button.bounds(), None);
+            let y = top - frame.origin.y - frame.size.height;
             let rect = Rect::new(
                 frame.origin.x as f32,
                 y as f32,

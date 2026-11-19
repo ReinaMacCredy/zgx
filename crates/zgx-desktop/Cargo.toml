@@ -56,10 +56,17 @@ webkitgtk = []
 # 9%), for up to 3 MB more resident memory. A program has one allocator:
 # leave this off if yours declares a `#[global_allocator]`.
 mimalloc = ["dep:mimalloc"]
+# Sound (zgx-audio on the system's output): one engine for the app, made
+# when first asked for (`WindowFactory::audio`), voices ending waking the
+# event loop, and the `ui` bus following the user's interface-sound setting.
+# The default output opens at the first sound and closes after the quiet
+# hold. Off by default: an app that plays nothing carries none of it.
+audio = ["dep:zgx-audio", "zgx-audio/device"]
 
 [dependencies]
 zgx = { path = "../zgx", version = "0.1.10", default-features = false }
 zgx-terminal = { path = "../zgx-terminal", version = "0.1.10", optional = true }
+zgx-audio = { path = "../zgx-audio", version = "0.1.10", optional = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 zgx-gpu = { path = "../zgx-gpu", version = "0.1.10", default-features = false }
 winit = "0.30.13"
@@ -123,7 +130,7 @@ objc2-user-notifications = { version = "=0.3.2", default-features = false, featu
 zgx-ghostty-sys = { path = "../zgx-ghostty-sys", version = "0.1.10", optional = true }
 libc = { version = "0.2", optional = true }
 # Native views over zgx (src/native_host): web pages, clipping masks, backdrops.
-objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKBackForwardList", "WKBackForwardListItem", "WKNavigationDelegate", "WKNavigation", "WKNavigationAction", "WKNavigationResponse", "WKWebsiteDataStore", "WKUserContentController", "WKUserScript", "WKScriptMessageHandler", "WKScriptMessage", "WKUIDelegate", "WKWindowFeatures", "WKFrameInfo", "WKSecurityOrigin", "WKPreferences", "WKURLSchemeHandler", "WKURLSchemeTask", "WKOpenPanelParameters", "WKFindConfiguration", "WKFindResult", "WKDownload", "WKDownloadDelegate", "WKContentWorld"] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKBackForwardList", "WKBackForwardListItem", "WKNavigationDelegate", "WKNavigation", "WKNavigationAction", "WKNavigationResponse", "WKWebsiteDataStore", "WKWebsiteDataRecord", "WKUserContentController", "WKUserScript", "WKScriptMessageHandler", "WKScriptMessage", "WKUIDelegate", "WKWindowFeatures", "WKFrameInfo", "WKSecurityOrigin", "WKPreferences", "WKURLSchemeHandler", "WKURLSchemeTask", "WKOpenPanelParameters", "WKFindConfiguration", "WKFindResult", "WKDownload", "WKDownloadDelegate", "WKContentWorld"] }
 # Answers custom-scheme requests on the main queue, from whatever thread served them.
 dispatch2 = "0.3"
 block2 = "0.6"
@@ -163,6 +170,16 @@ harness = false
 # On the main thread, where AppKit's windows are made and animate.
 [[test]]
 name = "zoom_steps"
+harness = false
+
+# `ZGX_OFFSCREEN`, read once: a process of its own.
+[[test]]
+name = "offscreen"
+harness = false
+
+# On the main thread, where AppKit's windows are made (`fn main`).
+[[test]]
+name = "titlebar_resize"
 harness = false
 
 [dev-dependencies]

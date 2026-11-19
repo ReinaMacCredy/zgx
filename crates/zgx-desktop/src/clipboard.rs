@@ -40,6 +40,60 @@ enum Backend {
     Native(arboard::Clipboard),
     #[cfg(target_os = "linux")]
     Wayland(crate::wayland_data::WaylandClipboard),
+    Memory(Memory),
+}
+
+/// A clipboard of the process's own (`ZGX_CLIPBOARD=memory`): text, HTML,
+/// files, an image and the primary selection held in memory, for test and
+/// QA sessions (an off-screen one driven by `zgx inspect`) to copy and paste
+/// through the app's own paths without touching the person's clipboard.
+/// Writing one kind replaces the others, as a system clipboard's write does.
+#[derive(Clone, Default)]
+pub(crate) struct Memory(std::sync::Arc<std::sync::Mutex<Held>>);
+#[derive(Default)]
+struct Held {
+    text: Option<String>,
+    html: Option<String>,
+    files: Vec<std::path::PathBuf>,
+    image: Option<zgx::image::ImageData>,
+    primary: Option<String>,
+}
+impl Memory {
+    fn with<T>(&self, f: impl FnOnce(&mut Held) -> T) -> T {
+        f(&mut self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+    /// Replace what it holds with `text` and `html` (either may be none).
+    fn set(&self, text: Option<String>, html: Option<String>) {
+        self.with(|held| {
+            let primary = held.primary.take();
+            *held = Held {
+                text,
+                html,
+                primary,
+                ..Held::default()
+            };
+        });
+    }
+}
+/// Whether this process's clipboard is held in memory (`ZGX_CLIPBOARD=memory`):
+/// an off-screen session's is, unless it names another (`memory_wanted`).
+fn in_memory() -> bool {
+    memory_wanted(
+        zgx::env::var_os("ZGX_CLIPBOARD").as_deref(),
+        *crate::window_chrome::OFFSCREEN,
+    )
+}
+/// `ZGX_CLIPBOARD`'s word where it says one (`memory`, or another such as
+/// `system` for the person's), else whether the session is off-screen
+/// (`ZGX_OFFSCREEN`): one nobody sees copies and pastes through its own.
+fn memory_wanted(clipboard: Option<&std::ffi::OsStr>, offscreen: bool) -> bool {
+    match clipboard {
+        Some(word) if !word.is_empty() => word == "memory",
+        _ => offscreen,
+    }
 }
 
 pub(crate) struct Clipboard {
@@ -52,6 +106,11 @@ impl Clipboard {
         display: OwnedDisplayHandle,
         #[cfg(target_os = "linux")] wayland: Option<crate::wayland_data::WaylandClipboard>,
     ) -> Result<Self> {
+        if in_memory() {
+            return Ok(Self {
+                backend: Backend::Memory(Memory::default()),
+            });
+        }
         #[cfg(target_os = "linux")]
         if let RawDisplayHandle::Wayland(_) = display.display_handle()?.as_raw() {
             let wayland = wayland.ok_or("the Wayland data worker is unavailable")?;
@@ -65,12 +124,13 @@ impl Clipboard {
         })
     }
 
-    /// Put `text` on the clipboard with `html`, its rich form, beside it
-    /// where the platform takes HTML (macOS, Windows, X11); text alone on
-    /// Wayland.
+    /// Put `text` on the clipboard with `html`, its rich form, beside it:
+    /// `public.html` on macOS, `HTML Format` on Windows, `text/html` on X11
+    /// and Wayland.
     pub(crate) fn set_rich_text(&mut self, text: String, html: String) -> Result<()> {
         match &mut self.backend {
             Backend::Native(clipboard) => clipboard.set_html(html, Some(platform_text(text)))?,
+            Backend::Memory(memory) => memory.set(Some(text), Some(html)),
             #[cfg(target_os = "linux")]
             Backend::Wayland(clipboard) => clipboard.store_rich(text, html)?,
         }
@@ -80,8 +140,25 @@ impl Clipboard {
     pub(crate) fn get_text(&mut self) -> Result<String> {
         match &mut self.backend {
             Backend::Native(clipboard) => Ok(clipboard.get_text()?),
+            Backend::Memory(memory) => memory
+                .with(|held| held.text.clone())
+                .ok_or_else(|| "the clipboard holds no text".into()),
             #[cfg(target_os = "linux")]
             Backend::Wayland(clipboard) => Ok(clipboard.load(false)?),
+        }
+    }
+
+    /// The clipboard's HTML: a browser's or word processor's copy, as it
+    /// offers it (on Windows the fragment its `HTML Format` header marks).
+    /// An error where it holds none.
+    pub(crate) fn get_html(&mut self) -> Result<String> {
+        match &mut self.backend {
+            Backend::Native(clipboard) => Ok(clipboard.get().html()?),
+            Backend::Memory(memory) => memory
+                .with(|held| held.html.clone())
+                .ok_or_else(|| "the clipboard holds no HTML".into()),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(clipboard) => Ok(clipboard.load_html()?),
         }
     }
 
@@ -89,8 +166,23 @@ impl Clipboard {
     pub(crate) fn get_files(&mut self) -> Result<Vec<std::path::PathBuf>> {
         match &mut self.backend {
             Backend::Native(clipboard) => Ok(clipboard.get().file_list()?),
+            Backend::Memory(memory) => Ok(memory.with(|held| held.files.clone())),
             #[cfg(target_os = "linux")]
             Backend::Wayland(clipboard) => Ok(clipboard.load_files()?),
+        }
+    }
+
+    /// Put `files` on the clipboard, replacing what it holds: only a
+    /// clipboard of the process's own takes them (`ZGX_CLIPBOARD=memory`),
+    /// for a driven session to paste files without a file manager.
+    pub(crate) fn set_files(&mut self, files: Vec<std::path::PathBuf>) -> bool {
+        match &mut self.backend {
+            Backend::Memory(memory) => {
+                memory.set(None, None);
+                memory.with(|held| held.files = files);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -99,6 +191,7 @@ impl Clipboard {
     pub(crate) fn set_text(&mut self, text: String) -> Result<()> {
         match &mut self.backend {
             Backend::Native(clipboard) => clipboard.set_text(platform_text(text))?,
+            Backend::Memory(memory) => memory.set(Some(text), None),
             #[cfg(target_os = "linux")]
             Backend::Wayland(clipboard) => clipboard.store(false, text)?,
         }
@@ -112,6 +205,7 @@ impl Clipboard {
     pub(crate) fn images(&self) -> Images {
         match &self.backend {
             Backend::Native(_) => Images::Native,
+            Backend::Memory(memory) => Images::Memory(memory.clone()),
             #[cfg(target_os = "linux")]
             Backend::Wayland(clipboard) => Images::Wayland(clipboard.clone()),
         }
@@ -123,7 +217,9 @@ impl Clipboard {
     pub(crate) fn set_png(&mut self, png: Vec<u8>) -> Result<()> {
         match &mut self.backend {
             Backend::Wayland(clipboard) => Ok(clipboard.store_image(png)?),
-            Backend::Native(_) => Err("the system's clipboard takes images itself".into()),
+            Backend::Native(_) | Backend::Memory(_) => {
+                Err("the system's clipboard takes images itself".into())
+            }
         }
     }
     /// The primary selection (X11, Wayland): the text last selected
@@ -139,6 +235,9 @@ impl Clipboard {
                     .text()?)
             }
             Backend::Wayland(clipboard) => Ok(clipboard.load(true)?),
+            Backend::Memory(memory) => memory
+                .with(|held| held.primary.clone())
+                .ok_or_else(|| "the primary selection is empty".into()),
         }
     }
 
@@ -154,6 +253,7 @@ impl Clipboard {
                     .text(text)?;
             }
             Backend::Wayland(clipboard) => clipboard.store(true, text)?,
+            Backend::Memory(memory) => memory.with(|held| held.primary = Some(text)),
         }
         Ok(())
     }
@@ -164,6 +264,7 @@ pub(crate) enum Images {
     Native,
     #[cfg(target_os = "linux")]
     Wayland(crate::wayland_data::WaylandClipboard),
+    Memory(Memory),
 }
 
 /// The clipboard's image, decoded on the calling thread (a worker's: a
@@ -171,6 +272,14 @@ pub(crate) enum Images {
 /// there: on Windows a PNG, else a DIB (what Paint, browsers and
 /// screenshots copy); on Wayland its `image/png`.
 pub(crate) fn read_image(images: &Images) -> Result<zgx::image::ImageData> {
+    if let Images::Memory(memory) = images {
+        return memory
+            .with(|held| {
+                // A copy sharing the pixels.
+                (held.image.as_ref()).map(|image| image.transformed(zgx::affine::Affine::IDENTITY))
+            })
+            .ok_or_else(|| "the clipboard holds no image".into());
+    }
     #[cfg(target_os = "linux")]
     if let Images::Wayland(clipboard) = images {
         let png = clipboard.load_image()?;
@@ -196,6 +305,12 @@ pub(crate) fn read_image(images: &Images) -> Result<zgx::image::ImageData> {
 /// as a PNG and a DIB, which apps that take either paste; on Wayland as a
 /// PNG.
 pub(crate) fn write_image(images: &Images, image: &zgx::image::ImageData) -> Result<()> {
+    if let Images::Memory(memory) = images {
+        memory.set(None, None);
+        let kept = image.transformed(zgx::affine::Affine::IDENTITY);
+        memory.with(|held| held.image = Some(kept));
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     if let Images::Wayland(clipboard) = images {
         let mut png = Vec::new();
@@ -377,6 +492,79 @@ mod dib {
 
 #[cfg(test)]
 mod tests {
+    /// An off-screen session's clipboard is its own unless `ZGX_CLIPBOARD`
+    /// names another; `memory` makes any session's its own.
+    #[test]
+    fn an_off_screen_session_holds_its_clipboard_in_memory() {
+        use std::ffi::OsStr;
+        assert!(super::memory_wanted(None, true));
+        assert!(super::memory_wanted(Some(OsStr::new("")), true));
+        assert!(super::memory_wanted(Some(OsStr::new("memory")), true));
+        assert!(super::memory_wanted(Some(OsStr::new("memory")), false));
+        assert!(!super::memory_wanted(Some(OsStr::new("system")), true));
+        assert!(!super::memory_wanted(None, false));
+        assert!(!super::memory_wanted(Some(OsStr::new("")), false));
+    }
+    /// HTML and its text through the system clipboard (macOS, Windows,
+    /// X11): what `set_rich_text` writes, `get_html` and `get_text` read
+    /// back. Ignored: it replaces the clipboard of whoever runs it. CI runs
+    /// it on each (`--ignored --exact`; Linux as `clipboard-html-x11`).
+    #[test]
+    #[ignore]
+    fn html_and_its_text_round_trip_through_the_system_clipboard() {
+        let mut clipboard = super::Clipboard {
+            backend: super::Backend::Native(arboard::Clipboard::new().expect("the clipboard")),
+        };
+        let html =
+            "<p>Rich <b>bold</b>, <i>italic</i> &amp; <a href=\"https://zgx.dev\">a link</a> é</p>";
+        clipboard
+            .set_rich_text("Rich bold, italic & a link é".into(), html.into())
+            .expect("HTML written");
+        // macOS wraps it in a document (with a UTF-8 charset); the fragment
+        // itself comes back whole.
+        let read = clipboard.get_html().expect("HTML read back");
+        assert!(read.contains(html), "{read:?}");
+        assert_eq!(
+            clipboard.get_text().expect("its text"),
+            "Rich bold, italic & a link é"
+        );
+        // Plain text written over it: no HTML is left to read.
+        clipboard.set_text("plain".into()).expect("text written");
+        assert!(clipboard.get_html().is_err(), "HTML left behind plain text");
+    }
+
+    /// A clipboard of the process's own (`ZGX_CLIPBOARD=memory`): what is
+    /// written reads back, a write of one kind replaces the others as a
+    /// system clipboard's does, and the primary selection is apart.
+    #[test]
+    fn the_memory_clipboard_holds_what_was_written_last() {
+        let memory = super::Memory::default();
+        let mut clipboard = super::Clipboard {
+            backend: super::Backend::Memory(memory.clone()),
+        };
+        assert!(clipboard.get_text().is_err() && clipboard.get_html().is_err());
+        clipboard
+            .set_rich_text("Rich".into(), "<b>Rich</b>".into())
+            .unwrap();
+        assert_eq!(clipboard.get_text().unwrap(), "Rich");
+        assert_eq!(clipboard.get_html().unwrap(), "<b>Rich</b>");
+        clipboard.set_text("plain".into()).unwrap();
+        assert!(clipboard.get_html().is_err(), "text replaced the HTML");
+        let images = clipboard.images();
+        let image = zgx::image::ImageData::new(2, 1, vec![255; 8]).unwrap();
+        super::write_image(&images, &image).unwrap();
+        let back = super::read_image(&images).unwrap();
+        assert_eq!((back.width(), back.height()), (2, 1));
+        assert!(clipboard.get_text().is_err(), "the image replaced the text");
+        #[cfg(target_os = "linux")]
+        {
+            clipboard.set_primary_text("selected".into()).unwrap();
+            assert_eq!(clipboard.get_primary_text().unwrap(), "selected");
+            clipboard.set_text("again".into()).unwrap();
+            assert_eq!(clipboard.get_primary_text().unwrap(), "selected");
+        }
+    }
+
     #[test]
     fn lines_copied_end_in_cr_lf_once() {
         assert_eq!(

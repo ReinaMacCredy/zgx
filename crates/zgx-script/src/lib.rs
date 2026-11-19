@@ -24,11 +24,22 @@
 //!
 //! The `ui` and `anime` libraries are documented in `docs/scripting.md`.
 #![warn(missing_docs)]
+
+/// The commit this crate was built from: its full 40-hex id, or `"unknown"`
+/// when it was built from no git checkout and no packaged crate saying one
+/// (a tarball, say). Read from git's own files when it builds, so a cargo
+/// git checkout, a worktree and a path build each say what they hold.
+#[doc(hidden)]
+pub const BUILD_REV: &str = env!("ZGX_BUILD_REV");
+
 mod actions;
 mod anim;
 mod anime;
 pub mod app_config;
 pub mod app_types;
+#[cfg(feature = "audio")]
+mod audio;
+mod b64;
 mod bundle;
 mod calls;
 mod canvas;
@@ -44,6 +55,7 @@ mod fetch_policy;
 mod journal;
 mod json;
 pub use elements_report::{ElementGroup, ElementsReport, ListedElement};
+mod atoms;
 mod errors;
 #[cfg(target_os = "macos")]
 mod file_events;
@@ -101,6 +113,9 @@ mod variants;
 #[cfg(target_arch = "wasm32")]
 mod web;
 mod windows;
+#[cfg(not(target_arch = "wasm32"))]
+mod work;
+mod zip;
 
 pub use bundle::{Bundle, BundleFile, MemoryFiles, build};
 pub use calls::{Body, Request, Response};
@@ -110,6 +125,10 @@ pub use fetch_policy::{FetchPolicy, Url};
 pub use persist::app_data_dir;
 pub use socket::{Message, Socket, SocketRequest};
 pub use windows::WindowState;
+/// zgx-audio, as `ScriptHost::set_audio` takes its engine (the `audio`
+/// feature).
+#[cfg(feature = "audio")]
+pub use zgx_audio;
 /// A window's size as `ui.window.size` and `win.size` hold it.
 pub fn window_size_value(width: f32, height: f32) -> Value {
     windows::size(width, height)
@@ -131,7 +150,7 @@ use std::{
     time::Duration,
 };
 use zgx::{
-    compose::{View, prelude::*, switch},
+    compose::{NodeHandle, View, prelude::*, switch},
     reactive::{Runtime, Signal},
 };
 
@@ -230,6 +249,13 @@ pub(crate) struct Deadline {
     wall: Instant,
     cpu: Duration,
     budget: Duration,
+    /// In the browser, an outermost call's budget starts at the first check
+    /// that looks (`interrupt::check`), not as the call does: reading the
+    /// clock (`performance.now`, through JS) cost more than most calls, and
+    /// a call that ends before that check never reads it. Until then `wall`
+    /// and `cpu` mean nothing.
+    #[cfg(target_arch = "wasm32")]
+    lazy: bool,
 }
 /// How old a CPU-time reading an outermost call's budget may start from:
 /// reading the thread's CPU clock costs more than a short call itself, and a
@@ -238,13 +264,16 @@ pub(crate) struct Deadline {
 /// past it. Starts that shift another budget (a nested call, work off the
 /// clock) read the clock afresh: an early start there would give the outer
 /// call back more than it spent, every time.
+#[cfg(any(unix, windows))]
 const CPU_READING_AGE: Duration = Duration::from_millis(1);
+#[cfg(any(unix, windows))]
 thread_local! {
     /// The thread's last CPU-time reading, and the last instant it is fresh.
     /// An unrepresentable expiry is beyond every representable instant.
     static CPU_READING: Cell<Option<(Option<Instant>, Duration)>> = const { Cell::new(None) };
 }
 /// The thread's CPU time, or a reading of it at most `CPU_READING_AGE` old.
+#[cfg(any(unix, windows))]
 fn recent_thread_cpu(now: Instant) -> Duration {
     CPU_READING.with(|reading| match reading.get() {
         Some((until, cpu)) if until.is_none_or(|until| now <= until) => cpu,
@@ -258,11 +287,26 @@ fn recent_thread_cpu(now: Instant) -> Duration {
 impl Deadline {
     /// A budget from now, its CPU start a recent reading (`CPU_READING_AGE`).
     fn start_recent(budget: Duration) -> Self {
-        let wall = Instant::now();
-        Self {
-            wall,
-            cpu: recent_thread_cpu(wall),
+        // Started at the first check that looks (`lazy`).
+        #[cfg(target_arch = "wasm32")]
+        return Self {
+            wall: clock_start(),
+            cpu: Duration::ZERO,
             budget,
+            lazy: true,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wall = Instant::now();
+            Self {
+                wall,
+                #[cfg(any(unix, windows))]
+                cpu: recent_thread_cpu(wall),
+                // Wall time stands in for the CPU's (`thread_cpu`): read once.
+                #[cfg(not(any(unix, windows)))]
+                cpu: thread_cpu_at(wall),
+                budget,
+            }
         }
     }
     /// A budget from now, read exactly: one that will shift another.
@@ -271,15 +315,34 @@ impl Deadline {
             wall: Instant::now(),
             cpu: thread_cpu(),
             budget,
+            #[cfg(target_arch = "wasm32")]
+            lazy: false,
         }
+    }
+    /// Whether its clock has yet to start (`lazy`).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn lazy(&self) -> bool {
+        self.lazy
+    }
+    /// The same budget, its clock started now.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn started_now(self) -> Self {
+        Self::start(self.budget)
     }
     /// The same budget with the time `other` has run since it started
     /// taken off the clock.
     fn shifted(self, other: &Deadline) -> Self {
+        // Not started: nothing has been counted to take off.
+        #[cfg(target_arch = "wasm32")]
+        if self.lazy {
+            return self;
+        }
         Self {
             wall: self.wall + other.wall.elapsed(),
             cpu: self.cpu + thread_cpu().saturating_sub(other.cpu),
             budget: self.budget,
+            #[cfg(target_arch = "wasm32")]
+            lazy: false,
         }
     }
     /// When its wall time passes its budget: it is exceeded from then on,
@@ -292,12 +355,15 @@ impl Deadline {
         thread_cpu().saturating_sub(self.cpu)
     }
     pub(crate) fn exceeded(&self) -> bool {
-        past_budget(
-            self.wall.elapsed(),
-            thread_cpu().saturating_sub(self.cpu),
-            self.budget,
-            CPU_GRAIN,
-        )
+        #[cfg(any(unix, windows))]
+        let (wall, cpu) = (self.wall.elapsed(), thread_cpu().saturating_sub(self.cpu));
+        // Wall time stands in for the CPU's (`thread_cpu`): read once.
+        #[cfg(not(any(unix, windows)))]
+        let (wall, cpu) = {
+            let now = Instant::now();
+            (now - self.wall, thread_cpu_at(now).saturating_sub(self.cpu))
+        };
+        past_budget(wall, cpu, self.budget, CPU_GRAIN)
     }
 }
 /// How coarse the thread's CPU clock is (`thread_cpu`): exact on Unix; a
@@ -402,8 +468,19 @@ fn thread_cpu() -> Duration {
 /// Without a thread CPU clock, wall time stands in.
 #[cfg(not(any(unix, windows)))]
 fn thread_cpu() -> Duration {
+    thread_cpu_at(Instant::now())
+}
+/// [`thread_cpu`] as of `now`, a reading of the wall clock already made.
+#[cfg(not(any(unix, windows)))]
+fn thread_cpu_at(now: Instant) -> Duration {
+    now.saturating_duration_since(clock_start())
+}
+/// When this thread first read the clock for a budget: what its stand-in
+/// CPU time counts from, and a budget not yet started holds.
+#[cfg(not(any(unix, windows)))]
+fn clock_start() -> Instant {
     thread_local! { static START: Instant = Instant::now(); }
-    START.with(|s| s.elapsed())
+    START.with(|start| *start)
 }
 
 /// What a script reads of time and chance, on a virtual clock: Luau's own
@@ -531,6 +608,11 @@ impl Vm {
     /// it rebuilds) off the script's clock: the budget stops runaway
     /// scripts, not the updates they cause.
     pub(crate) fn off_clock<R>(&self, f: impl FnOnce() -> R) -> R {
+        // A budget not yet started has nothing to take off.
+        #[cfg(target_arch = "wasm32")]
+        if self.deadline.get().is_some_and(|d| d.lazy()) {
+            return f();
+        }
         let started = Deadline::start(Duration::ZERO);
         let result = f();
         if let Some(d) = self.deadline.get() {
@@ -989,6 +1071,9 @@ pub enum Capability {
     /// `ui.open_folder`: a folder the user picks, with everything inside
     /// it to list, read and write.
     Folders,
+    /// `ui.load_font`: a font file from its directory (or one the user
+    /// picked) added to every window's text, the app's too.
+    Fonts,
     /// `ui.term`: terminal sessions, to read and to type into.
     Terminals,
     /// `ui.web` and `ui.webview`: web pages.
@@ -996,6 +1081,14 @@ pub enum Capability {
     /// `ui.window`: windows of its own, which could pose as the app's or
     /// the system's (asking for a password).
     Windows,
+    /// `audio`: sounds played into a bus of the plugin's own (the `audio`
+    /// feature). It reaches no other bus and no device.
+    #[cfg(feature = "audio")]
+    Audio,
+    /// `ui.scene3d` and `ui.model`: 3D scenes, drawn on the GPU (the
+    /// `scene3d` feature).
+    #[cfg(feature = "scene3d")]
+    Scene3d,
     /// What the app defines (`expose_action`, `expose_shared`): a host
     /// action or shared state a plugin reaches only if granted it.
     Named(String),
@@ -1756,6 +1849,9 @@ struct Inner {
     fetch_policy: fetch_policy::SharedPolicy,
     /// What each plugin may do beyond its sandbox (`grant`), by name.
     grants: RefCell<HashMap<String, Vec<Capability>>>,
+    /// Each plugin's heap where the app set its own (`plugin_memory`), by
+    /// name; the rest have `Limits::plugin_memory`.
+    plugin_memory: RefCell<HashMap<String, usize>>,
     /// What every plugin may do (`grant_all_plugins`), those loaded later
     /// too.
     all_plugins: RefCell<Vec<Capability>>,
@@ -1773,6 +1869,8 @@ struct Inner {
     platform: io::SharedPlatform,
     /// The files the user picked in this host's dialogs.
     picked: io::Picked,
+    /// Where `d:save_temp` saves (`download_dir`).
+    downloads: Rc<io::Downloads>,
     /// What scripts may have of folders, and the ones kept past a run.
     folders: Rc<folder::Access>,
     /// `ui.args` and `ui.on_open` (`ScriptHost::args`, `open`).
@@ -1804,6 +1902,9 @@ struct Inner {
     /// (`window_chrome`).
     chrome: RefCell<Option<zgx::reactive::Effect>>,
     window_size: RefCell<Option<zgx::reactive::Effect>>,
+    /// The host's view as it's mounted: what `ui.focus_snapshot` asks of
+    /// its window.
+    root: Rc<RefCell<Option<NodeHandle>>>,
     /// `ui.window.full_screen` and `full_screen_transition` kept as the
     /// window says (`ScriptHost::window_full_screen`).
     full_screen: RefCell<Option<zgx::reactive::Effect>>,
@@ -1886,6 +1987,9 @@ struct Inner {
     theme_error: RefCell<Option<String>>,
     /// Collects the VMs' garbage as the host goes idle (`zgx::idle`).
     idle: RefCell<Option<zgx::idle::IdleTrim>>,
+    /// The scripts' `audio`: the host's engine, made at their first call.
+    #[cfg(feature = "audio")]
+    audio: Rc<audio::AudioHost>,
 }
 
 /// A wake-up for one waiting task: `notify` before or during the wait ends it.
@@ -1973,6 +2077,7 @@ impl ScriptHost {
             connector: Rc::default(),
             fetch_policy: Rc::default(),
             grants: RefCell::default(),
+            plugin_memory: RefCell::default(),
             all_plugins: RefCell::default(),
             managed: RefCell::default(),
             exposed_actions: Rc::default(),
@@ -1982,6 +2087,7 @@ impl ScriptHost {
             rewatch: RefCell::default(),
             platform: Rc::default(),
             picked: Rc::default(),
+            downloads: Rc::default(),
             folders: Rc::new(folder::Access::new(persist.clone())),
             opens: Rc::default(),
             show_errors: cfg!(debug_assertions),
@@ -2021,6 +2127,7 @@ impl ScriptHost {
             shared: Rc::new(Store::new(runtime)),
             chrome: RefCell::default(),
             window_size: RefCell::default(),
+            root: Rc::default(),
             full_screen: RefCell::default(),
             zoom: RefCell::default(),
             visible: RefCell::default(),
@@ -2063,12 +2170,22 @@ impl ScriptHost {
             lint: runtime.signal(None),
             theme_error: RefCell::default(),
             idle: RefCell::default(),
+            #[cfg(feature = "audio")]
+            audio: audio::AudioHost::new(runtime),
         }));
         host.0.assets.connect(
             host.0.timers.clone(),
             host.0.fetcher.clone(),
             host.0.fetch_policy.clone(),
         );
+        #[cfg(feature = "audio")]
+        host.0.audio.set_timers(host.0.timers.clone());
+        // No files in the browser: a sound's are fetched, through the host's
+        // transport and under its policy.
+        #[cfg(all(feature = "audio", target_arch = "wasm32"))]
+        host.0
+            .audio
+            .set_fetch(host.0.fetcher.clone(), host.0.fetch_policy.clone());
         host.trim_when_idle();
         host
     }
@@ -2216,6 +2333,16 @@ impl ScriptHost {
                 Files::Disk => {}
             }
         })
+    }
+    /// The folder a page's downloads are saved into with no dialog
+    /// (Luau's `d:save_temp`), each under its suggested name made unique:
+    /// one of the app's own, temporary, which the app clears. Until it
+    /// names one, `d:save_temp` raises. Plugins need `Capability::Files`
+    /// for it, as for `d:save_to`.
+    #[doc(hidden)]
+    pub fn download_dir(self, dir: impl Into<PathBuf>) -> Self {
+        *self.0.downloads.dir.borrow_mut() = Some(dir.into());
+        self
     }
     /// Whether a script error shows over the interface, with where it
     /// happened (development), or not (what ships: the last good interface
@@ -2778,6 +2905,7 @@ impl ScriptHost {
         for old in managed.drain(..) {
             if let Script::Plugin { name, .. } = old {
                 grants.remove(&name);
+                self.0.plugin_memory.borrow_mut().remove(&name);
             }
         }
         for plugin in plugins {
@@ -2787,6 +2915,12 @@ impl ScriptHost {
                 path: plugin.entry,
             });
         }
+    }
+    /// Plugin `name`'s heap, in bytes, in place of `Limits::plugin_memory`
+    /// (a plugin whose manifest asks for more), from its next load. Set
+    /// after `set_plugins`, which forgets those of the plugins it replaces.
+    pub fn plugin_memory(&self, name: impl Into<String>, bytes: usize) {
+        self.0.plugin_memory.borrow_mut().insert(name.into(), bytes);
     }
     /// Let plugins bind, invoke and call host action `name` (`action`,
     /// `async_action`): all of them, or (`Some`) those granted
@@ -2835,6 +2969,25 @@ impl ScriptHost {
         rules.set_guard(Rc::new(guard));
         // The VM already loaded hears it too; a later load's has it from
         // the start.
+        if let Some(loaded) = &*self.0.current.borrow()
+            && let Some(vm) = loaded._vms.last()
+        {
+            vm.lua.set_app_data(rules::Guarded(rules));
+        }
+    }
+    /// Asks `guard` of pages in place of [`guard`](Self::guard)'s
+    /// [`GuardKind::Web`]: each URL the app's scripts load (`:load`, `src`,
+    /// `html`'s base) and each navigation the platform starts, a main
+    /// frame's, an iframe's and a redirect's, told the id the page was made
+    /// under (`ui.web("tab")` gives `Some("tab")`; an anonymous `ui.web(opts)`
+    /// or `ui.webview` without `web`, `None`). An `Err` stops it, as
+    /// `guard`'s does. So one host lets its browser tabs reach what its
+    /// previews may not. Unset, `guard` decides as before. The last one set
+    /// applies, at once.
+    #[doc(hidden)]
+    pub fn web_guard(&self, guard: impl Fn(Option<&str>, &str) -> Result<(), String> + 'static) {
+        let rules = rules::start(&self.0);
+        rules.set_web_guard(Rc::new(guard));
         if let Some(loaded) = &*self.0.current.borrow()
             && let Some(vm) = loaded._vms.last()
         {
@@ -3213,6 +3366,50 @@ impl ScriptHost {
         if !w.design_forced {
             w.design = mode;
         }
+    }
+    /// The engine scripts' `audio` plays through (the `audio` feature):
+    /// `make` is called the first time a script calls `audio`, so a script
+    /// that never does makes none. A desktop host hands every script host
+    /// the application's one engine; a headless one an offline engine,
+    /// whose renders it runs (`zgx_audio::Audio::offline`). Without it,
+    /// scripts' calls of `audio` are errors saying so.
+    #[cfg(feature = "audio")]
+    pub fn set_audio(&self, make: impl Fn() -> zgx_audio::Audio + 'static) {
+        self.0.audio.set_make(Rc::new(make));
+    }
+    /// The engine, if a script has called `audio` (`set_audio`'s).
+    #[cfg(feature = "audio")]
+    pub fn audio_engine(&self) -> Option<zgx_audio::Audio> {
+        self.0.audio.made()
+    }
+    /// Voices that ended (`zgx_audio::Audio::take_ended`'s ids): their
+    /// `playing` states turn false, and what followed state into them
+    /// stops. A desktop host calls it as the engine wakes it
+    /// (`Audio::on_voices_ended`); an offline one after rendering.
+    #[cfg(feature = "audio")]
+    pub fn voices_ended(&self, ids: &[u64]) {
+        self.0.audio.voices_ended(ids);
+    }
+    /// Holds finished decodes back from the plays waiting on them, until
+    /// called again with `false`: for a test that places how long a play
+    /// waited on a clock of its own, whatever the decode took.
+    #[doc(hidden)]
+    #[cfg(feature = "audio")]
+    pub fn hold_sound_loads(&self, held: bool) {
+        self.0.audio.hold_loads(held);
+    }
+    /// How many sounds the host keeps decoded for its app's scripts
+    /// (`audio.sound`): what a test reads to see a sound let go.
+    #[cfg(feature = "audio")]
+    pub fn sounds_held(&self) -> usize {
+        self.0.audio.sounds_held()
+    }
+    /// The user's interface-sound setting, as the host passes it to the
+    /// engine (`Audio::set_ui_sounds`): what `audio.ui_sounds_enabled`
+    /// reads.
+    #[cfg(feature = "audio")]
+    pub fn set_ui_sounds_enabled(&self, enabled: bool) {
+        self.0.audio.set_ui_sounds(enabled);
     }
     /// How many times Rust has called into the scripts (a prop, an effect,
     /// a handler, a component built), counting from the host's start: what
@@ -3612,6 +3809,8 @@ impl ScriptHost {
     /// Loads the scripts again: everything, or with `ran`, in the app's VM
     /// kept, those modules alone run again (`load_kept`).
     fn reload_with(&self, ran: Option<Vec<PathBuf>>) -> Result<(), String> {
+        #[cfg(feature = "audio")]
+        self.0.audio.begin_load();
         self.0.lent.borrow_mut().pending.clear();
         self.0.commands.begin();
         self.0.windows.begin();
@@ -3674,6 +3873,9 @@ impl ScriptHost {
                 });
                 // The replaced scripts' animations end with them.
                 self.0.engine.drop_orphans();
+                // And their sounds, with their fades.
+                #[cfg(feature = "audio")]
+                self.0.audio.end_load(true);
                 if let Some(rewatch) = &*self.0.rewatch.borrow() {
                     rewatch.send(());
                 }
@@ -3685,6 +3887,8 @@ impl ScriptHost {
                 self.0.focus.release();
                 eprintln!("{error}");
                 report(&self.0.error, error.clone());
+                #[cfg(feature = "audio")]
+                self.0.audio.end_load(false);
                 self.start_check();
                 Err(error)
             }
@@ -4005,6 +4209,9 @@ impl ScriptHost {
         let view = component(move |cx| {
             // One frame loop ticks every animation; it idles at rest.
             if let Some(frames) = cx.try_service::<zgx::frame::FrameClock>() {
+                // Bindings driving sound step on the same frames.
+                #[cfg(feature = "audio")]
+                host.0.audio.set_frames((*frames).clone());
                 cx.tasks().spawn(engine.run((*frames).clone()));
             }
             // `ui.persist` saves on a timer from here, and `ui.every` runs.
@@ -4090,6 +4297,9 @@ impl ScriptHost {
                 },
             )
         });
+        // Its window, for `ui.focus_snapshot`.
+        let root = self.0.root.clone();
+        let view = view.on_mount(move |handle| *root.borrow_mut() = Some(handle));
         match links {
             Some(links) => zgx::compose::provide(links, view),
             None => view,
@@ -4581,7 +4791,8 @@ impl ScriptHost {
         let lua = Lua::new().clone();
         let limits = self.0.limits;
         let memory = if plugin {
-            limits.plugin_memory
+            let own = self.0.plugin_memory.borrow().get(&name).copied();
+            own.unwrap_or(limits.plugin_memory)
         } else {
             limits.memory
         };
@@ -4636,6 +4847,7 @@ impl ScriptHost {
             actions: self.0.actions.clone(),
             platform: self.0.platform.clone(),
             picked: self.0.picked.clone(),
+            downloads: self.0.downloads.clone(),
             functions: self.0.functions.clone(),
             persist: self.0.persist.clone(),
             warnings: self.0.warnings.clone(),
@@ -4669,7 +4881,10 @@ impl ScriptHost {
         let ui: mlua::Table = lua.globals().get("ui").map_err(fail)?;
         // Each module made the first time a script names it (`lazy`).
         let lazy = lazy::Lazy::default();
-        lazy.ui(&["path", "linear"], canvas::install);
+        lazy.ui(
+            &["path", "linear", "radial", "conic", "render_canvas"],
+            canvas::install,
+        );
         lazy.ui(&["glass"], node::install_glass);
         lazy.ui(&["map"], node::install_map);
         #[cfg(feature = "scene3d")]
@@ -4692,9 +4907,17 @@ impl ScriptHost {
         });
         i18n::install(&lazy, self.0.locales.clone(), self.files());
         let (windows, shared) = (self.0.windows.clone(), self.0.shared.clone());
-        lazy.ui(&["window", "window_rect", "windows"], move |lua, ui| {
-            windows::install(lua, ui, windows, &shared)
-        });
+        // The window's focus with it: a module of its own costs every VM
+        // made one more entry, and every name a script reads first one more
+        // to pass.
+        let root = self.0.root.clone();
+        lazy.ui(
+            &["window", "window_rect", "windows", "focus_snapshot"],
+            move |lua, ui| {
+                windows::install(lua, ui, windows, &shared)?;
+                element::install_focus_snapshot(lua, ui, root)
+            },
+        );
         let may = |capability: Capability| grants.allows(&capability);
         let fetch = may(Capability::Fetch).then(|| self.0.fetcher.clone());
         let policy = self.0.fetch_policy.clone();
@@ -4713,10 +4936,12 @@ impl ScriptHost {
         let (platform, picked) = (self.0.platform.clone(), self.0.picked.clone());
         let (clipboard, files_allowed) = (may(Capability::Clipboard), may(Capability::Files));
         let (folders, access) = (may(Capability::Folders), self.0.folders.clone());
+        let fonts = may(Capability::Fonts);
         lazy.ui(
             &[
                 "badge",
                 "clipboard",
+                "load_font",
                 "notify",
                 "open_files",
                 "open_folder",
@@ -4724,10 +4949,11 @@ impl ScriptHost {
                 "remembered_folder",
                 "save_file",
                 "write_file",
+                "zip",
             ],
             move |lua, ui| {
                 folder::install(lua, ui, platform.clone(), folders, access)?;
-                io::install(lua, ui, platform, picked, clipboard, files_allowed)
+                io::install(lua, ui, platform, picked, clipboard, files_allowed, fonts)
             },
         );
         // A plugin's lent packages' tokens too: a lent design system themes it.
@@ -4763,6 +4989,13 @@ impl ScriptHost {
             opens::install(lua, ui, opens, plugin)
         });
         lazy.global(&["anime"], |lua, _| anime::api::install(lua));
+        #[cfg(feature = "audio")]
+        {
+            let (audio, plugin) = (self.0.audio.clone(), plugin.then(|| name.as_str().into()));
+            lazy.global(&["audio"], move |lua, globals| {
+                audio::install(lua, globals, audio, plugin)
+            });
+        }
         self.install_require(
             &lua,
             script.dir(),
@@ -4925,6 +5158,9 @@ fn collect_garbage(inner: &Inner) {
         collect_fully(&vm.lua);
         vm.interrupt.heap_settled(vm.lua.used_memory());
     }
+    // Sounds only the scripts' collected garbage held.
+    #[cfg(feature = "audio")]
+    inner.audio.trim(0);
 }
 /// Full collections until one frees nothing more: a collection finalizes
 /// the garbage's userdata, and what only they held goes in the next.

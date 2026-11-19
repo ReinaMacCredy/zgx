@@ -261,6 +261,94 @@ fn scroll_offsets_write_the_viewport() {
     assert_eq!(viewport.scroll_top(), 200);
 }
 
+/// A scroll view's rows keep their size, as on the desktop, where they lay
+/// out unbounded in its content: not shrunk to fit it as a flex container's
+/// children are, inside a keyed list's too.
+#[wasm_bindgen_test]
+fn a_scroll_views_rows_keep_their_size() {
+    let runtime = Runtime::new();
+    let offset = runtime.signal(0_f32);
+    let host = host();
+    let mounted = zgx_dom::mount(
+        &runtime,
+        &host,
+        scroll(offset.clone())
+            .h(100.)
+            .children((0..4).map(|i| column().h(40.).child(text(format!("row {i}")))))
+            .child(keyed(|| vec![1, 2], |_: i32, _| column().h(30.))),
+    );
+    zgx_dom::flush();
+    let heights = |parent: &web_sys::Element| {
+        let rows = parent.children();
+        (0..rows.length())
+            .map(|i| rows.item(i).unwrap().get_bounding_client_rect().height())
+            .collect::<Vec<_>>()
+    };
+    let viewport = first(&host);
+    assert_eq!(heights(&viewport)[..4], [40.; 4]);
+    let list = viewport.children().item(4).unwrap();
+    assert_eq!(heights(&list), [30.; 2]);
+    mounted.unmount();
+    host.remove();
+}
+
+/// `NodeHandle::scroll_into_view` by the browser's own `scrollIntoView`,
+/// at once: whether its scroll container moved, as on the desktop.
+#[wasm_bindgen_test]
+fn a_node_scrolls_into_view_by_the_browsers_own() {
+    use zgx::compose::{RowAlign, ScrollIntoView};
+    let runtime = Runtime::new();
+    let offset = runtime.signal(0_f32);
+    let host = host();
+    let handle = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let kept = handle.clone();
+    let mounted = zgx_dom::mount(
+        &runtime,
+        &host,
+        scroll(offset.clone())
+            .h(100.)
+            .children((0..10).map(move |i| {
+                let kept = kept.clone();
+                // A block 40 high (a text alone lays out inline, its line's
+                // height).
+                let row = column().h(40.).child(text(format!("row {i}")));
+                if i == 5 {
+                    row.on_mount(move |node| *kept.borrow_mut() = Some(node))
+                } else {
+                    row
+                }
+            })),
+    );
+    zgx_dom::flush();
+    let viewport = first(&host);
+    let row5 = handle.borrow().clone().expect("row 5 mounted");
+    let row5_element = viewport.children().item(5).unwrap();
+    assert_eq!(row5_element.get_bounding_client_rect().height(), 40.);
+    let at_start = ScrollIntoView {
+        block: RowAlign::Start,
+        inline: RowAlign::Nearest,
+        animate: Some(false),
+    };
+    // Row 5, below what shows, comes to its top.
+    assert!(row5.scroll_into_view(at_start));
+    assert_eq!(
+        row5_element.get_bounding_client_rect().top(),
+        viewport.get_bounding_client_rect().top()
+    );
+    assert_eq!(viewport.scroll_top(), 200);
+    assert!(!row5.scroll_into_view(at_start), "already there");
+    assert!(
+        !row5.scroll_into_view(ScrollIntoView {
+            block: RowAlign::Nearest,
+            ..at_start
+        }),
+        "it shows: nearest leaves it"
+    );
+    // Gone, so it pushes no later test's host out of view.
+    mounted.unmount();
+    host.remove();
+}
+
 #[wasm_bindgen_test]
 fn virtual_lists_mount_what_shows() {
     let runtime = Runtime::new();
@@ -310,6 +398,70 @@ fn roles_and_labels_reach_aria() {
     assert_eq!(view.get_attribute("aria-label").unwrap(), "Tools");
 }
 
+/// A toggle button's state reaches `aria-pressed`, and follows.
+#[wasm_bindgen_test]
+fn a_pressed_state_reaches_aria_pressed_and_follows() {
+    let runtime = Runtime::new();
+    let bold = runtime.signal(false);
+    let read = bold.clone();
+    let host = host();
+    let _mounted = zgx_dom::mount(
+        &runtime,
+        &host,
+        column()
+            .accessible_label("Bold")
+            .pressed_when(move || read.get())
+            .child(text("B")),
+    );
+    let view = first(&host);
+    assert_eq!(view.get_attribute("aria-pressed").unwrap(), "false");
+    bold.set(true);
+    zgx_dom::flush();
+    assert_eq!(view.get_attribute("aria-pressed").unwrap(), "true");
+}
+
+/// A tree item's depth reaches `aria-level`, as a number and followed: the
+/// same element takes its new depth.
+#[wasm_bindgen_test]
+fn a_tree_items_level_reaches_aria_level_and_follows() {
+    let runtime = Runtime::new();
+    let depth = runtime.signal(1_usize);
+    let read = depth.clone();
+    let host = host();
+    let _mounted = zgx_dom::mount(
+        &runtime,
+        &host,
+        column()
+            .child(
+                row()
+                    .role(zgx::semantics::Role::TreeItem)
+                    .level(2)
+                    .child(text("Fixed")),
+            )
+            .child(
+                row()
+                    .role(zgx::semantics::Role::TreeItem)
+                    .level_when(move || read.get())
+                    .child(text("Moved")),
+            ),
+    );
+    let items = host.query_selector_all("[role=treeitem]").unwrap();
+    let item = |i| {
+        items
+            .item(i)
+            .unwrap()
+            .dyn_into::<web_sys::Element>()
+            .unwrap()
+    };
+    let (fixed, moved) = (item(0), item(1));
+    assert_eq!(fixed.get_attribute("aria-level").as_deref(), Some("2"));
+    assert_eq!(moved.get_attribute("aria-level").as_deref(), Some("1"));
+    depth.set(3);
+    zgx_dom::flush();
+    assert_eq!(moved.get_attribute("aria-level").as_deref(), Some("3"));
+    assert!(moved.is_connected(), "the same element, not a new one");
+}
+
 #[wasm_bindgen_test]
 fn clocks_and_tracing_read_the_browser_clock() {
     // std's clock panics in a browser; zgx's reads `performance.now()`.
@@ -353,6 +505,18 @@ async fn sleep(ms: i32) {
     wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
 }
 
+/// Wait until `ready` holds, checking every 10 ms on the browser's clock,
+/// for at most 2 s: observers report with a rendering update, which a busy
+/// machine may deliver late.
+async fn until(ready: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if ready() {
+            return;
+        }
+        sleep(10).await;
+    }
+}
+
 #[wasm_bindgen_test]
 async fn observers_report_sizes_and_visibility() {
     use std::{cell::RefCell, rc::Rc};
@@ -381,14 +545,21 @@ async fn observers_report_sizes_and_visibility() {
                 ));
             }),
     );
-    sleep(50).await;
+    until(|| {
+        seen.borrow()
+            .as_ref()
+            .is_some_and(|(size, bounds, visible)| {
+                size.get() == (120., 40.) && bounds.get().width == 120. && visible.get()
+            })
+    })
+    .await;
     let (size, bounds, visible) = seen.borrow().clone().unwrap();
     assert_eq!(size.get(), (120., 40.));
     assert_eq!(bounds.get().width, 120.);
     assert!(visible.get());
     width.set(200.);
     zgx_dom::flush();
-    sleep(50).await;
+    until(|| size.get() == (200., 40.)).await;
     assert_eq!(size.get(), (200., 40.));
     mounted.unmount();
 }
@@ -734,4 +905,182 @@ fn virtual_list_rows_lie_inside_the_list() {
     // Gone, so it pushes no later test's host out of view.
     mounted.unmount();
     host.remove();
+}
+
+#[wasm_bindgen_test]
+fn rows_observing_their_visibility_mount_whole() {
+    let runtime = Runtime::new();
+    let rows = runtime.signal((0..4).collect::<Vec<u32>>());
+    let host = host();
+    let mounted = zgx_dom::mount(
+        &runtime,
+        &host,
+        column().child(keyed(
+            move || rows.get(),
+            |n: u32, _| {
+                row()
+                    .child(text(format!("Row {n}")))
+                    .child(text("seen"))
+                    .on_mount(|node| {
+                        let _ = node.observe_visibility();
+                    })
+            },
+        )),
+    );
+    // A row's block replayed (or stamped) whole, its observer's op among
+    // the others.
+    let list = first(&host).first_element_child().unwrap();
+    assert_eq!(
+        texts(&list),
+        ["Row 0seen", "Row 1seen", "Row 2seen", "Row 3seen"]
+    );
+    mounted.unmount();
+    host.remove();
+}
+
+/// Text dragged in from another app (the browser's own drag and drop) drops
+/// on a view that takes `DraggedText`, as on the desktop: its text, and its
+/// HTML where the source offered `text/html` (`DraggedText::html`); over it,
+/// the browser hears it taken (its default prevented, a copy).
+#[wasm_bindgen_test]
+fn text_dragged_in_from_another_app_drops_with_its_html() {
+    use std::{cell::RefCell, rc::Rc};
+    use zgx::{compose::div, input::DraggedText};
+    let runtime = Runtime::new();
+    let host = host();
+    // Each drop's text and HTML.
+    type Dropped = Vec<(String, Option<String>)>;
+    let got: Rc<RefCell<Dropped>> = Rc::default();
+    let into = got.clone();
+    let mounted = zgx_dom::mount(
+        &runtime,
+        &host,
+        div()
+            .size(200., 100.)
+            .on_drop(move |text: &DraggedText, _| {
+                into.borrow_mut()
+                    .push((text.text().to_owned(), text.html().map(str::to_owned)));
+            }),
+    );
+    zgx_dom::flush();
+    let target = first(&host);
+    let r = target.get_bounding_client_rect();
+    let (x, y) = ((r.left() + 100.) as i32, (r.top() + 50.) as i32);
+    let drag = |kind: &str, html: Option<&str>| {
+        let data = web_sys::DataTransfer::new().unwrap();
+        data.set_data("text/plain", "bold").unwrap();
+        if let Some(html) = html {
+            data.set_data("text/html", html).unwrap();
+        }
+        let init = web_sys::DragEventInit::new();
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        init.set_client_x(x);
+        init.set_client_y(y);
+        init.set_data_transfer(Some(&data));
+        let event = web_sys::DragEvent::new_with_event_init_dict(kind, &init).unwrap();
+        // Whether nothing prevented its default.
+        target.dispatch_event(&event).unwrap()
+    };
+    assert!(!drag("dragover", Some("<b>bold</b>")), "taken over it");
+    assert!(!drag("drop", Some("<b>bold</b>")));
+    assert!(!drag("dragover", None));
+    assert!(!drag("drop", None));
+    assert_eq!(
+        *got.borrow(),
+        [
+            ("bold".to_owned(), Some("<b>bold</b>".to_owned())),
+            ("bold".to_owned(), None)
+        ]
+    );
+    mounted.unmount();
+    host.remove();
+}
+
+#[wasm_bindgen_test]
+fn nested_stamped_rows_reach_their_nodes_and_handlers() {
+    // Rows whose written nodes sit deep, after static siblings and inside
+    // static parents: the same DOM stamped as written in full, and each
+    // row's handlers, at two depths, act for that row.
+    let keys = || (0..40).collect::<Vec<u32>>();
+    let runtime = Runtime::new();
+    let pressed = runtime.signal(Vec::<(u32, u8)>::new());
+    let shape = {
+        let pressed = pressed.clone();
+        move |k: u32, _: &mut zgx::compose::Context| {
+            let (a, b) = (pressed.clone(), pressed.clone());
+            row()
+                .child(text("static"))
+                .child(column().child(text("inner static")).child(
+                    button().child(text(format!("deep {k}"))).on_click(move || {
+                        a.update(|p| p.push((k, 1)));
+                    }),
+                ))
+                .child(text(format!("after {k}")))
+                .child(button().child(text("x")).on_click(move || {
+                    b.update(|p| p.push((k, 2)));
+                }))
+        }
+    };
+    let (stamped, full) = (host(), host());
+    let a = zgx_dom::mount(&runtime, &stamped, keyed(keys, shape.clone()));
+    zgx_dom::__set_templates(false);
+    let b = zgx_dom::mount(&runtime, &full, keyed(keys, shape));
+    zgx_dom::__set_templates(true);
+    assert_eq!(stamped.inner_html(), full.inner_html());
+    let rows = first(&stamped).children();
+    for k in [3u32, 17, 39] {
+        let buttons = rows.item(k).unwrap().query_selector_all("button").unwrap();
+        assert_eq!(
+            buttons.item(0).unwrap().text_content().unwrap(),
+            format!("deep {k}")
+        );
+        for i in 0..2 {
+            buttons
+                .item(i)
+                .unwrap()
+                .dyn_into::<web_sys::HtmlElement>()
+                .unwrap()
+                .click();
+        }
+    }
+    assert_eq!(
+        pressed.get(),
+        [(3, 1), (3, 2), (17, 1), (17, 2), (39, 1), (39, 2)]
+    );
+    a.unmount();
+    b.unmount();
+    stamped.remove();
+    full.remove();
+}
+
+#[wasm_bindgen_test]
+fn rows_alternating_between_two_shapes_stamp_each_right() {
+    // Each row's shape differs from the last's: checked against it, it
+    // isn't that one, and is stamped from its own shape's template. Then
+    // rows of one shape run, and a row of the other between them.
+    let order = |k: u32| if k < 30 { k.is_multiple_of(2) } else { k != 45 };
+    let shape = move |k: u32, _: &mut zgx::compose::Context| {
+        if order(k) {
+            row().child(text(format!("a {k}"))).child(text("left"))
+        } else {
+            column()
+                .child(text("top"))
+                .child(text(format!("b {k}")))
+                .child(button().child(text("go")))
+        }
+    };
+    let keys = || (0..60).collect::<Vec<u32>>();
+    let runtime = Runtime::new();
+    let (stamped, full) = (host(), host());
+    let a = zgx_dom::mount(&runtime, &stamped, keyed(keys, shape));
+    zgx_dom::__set_templates(false);
+    let b = zgx_dom::mount(&runtime, &full, keyed(keys, shape));
+    zgx_dom::__set_templates(true);
+    assert_eq!(stamped.inner_html(), full.inner_html());
+    assert!(stamped.inner_html().contains("b 45"));
+    a.unmount();
+    b.unmount();
+    stamped.remove();
+    full.remove();
 }

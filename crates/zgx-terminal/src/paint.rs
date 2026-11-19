@@ -3,7 +3,7 @@
 //! the screen model only for rows that changed.
 use crate::{Palette, Term, dim};
 use alacritty_terminal::{
-    grid::Dimensions,
+    grid::{Dimensions, Row},
     index::{Column, Line, Point},
     selection::SelectionRange,
     term::cell::{Cell, Flags},
@@ -22,6 +22,9 @@ pub(crate) struct Metrics {
     pub font_size: f32,
     pub cell_width: f32,
     pub cell_height: f32,
+    /// A line of text's height as shaping measures it (the cell's, before
+    /// it is rounded up to whole device pixels): a run's stated height.
+    pub line_height: f32,
 }
 
 /// How the terminal colours what programs leave to it.
@@ -444,9 +447,10 @@ fn row_built<L, const STYLED: bool, const RUNS: bool>(
             // A plain row's runs say whether it has one (`row`).
             if STYLED
                 && !underline.is_empty()
-                && (underline.intersects(STYLED_UNDERLINES) || cell.underline_color().is_some())
+                && (underline.intersects(STYLED_UNDERLINES)
+                    || cells.underline_color(Column(column)).is_some())
             {
-                styled_underline(&mut paint, term, palette, cell, column, width, ink);
+                styled_underline(&mut paint, term, palette, cells, column, width, ink);
                 underline = Flags::empty();
             }
             if blank && underline.is_empty() {
@@ -467,8 +471,9 @@ fn row_built<L, const STYLED: bool, const RUNS: bool>(
                 underlines |= underline;
                 let mut text = String::new();
                 text.push(c);
-                if let Some(extra) = cell.zerowidth() {
-                    coloured |= !underline.is_empty() && cell.underline_color().is_some();
+                if let Some(extra) = cells.zerowidth(Column(column)) {
+                    coloured |=
+                        !underline.is_empty() && cells.underline_color(Column(column)).is_some();
                     text.extend(extra);
                 }
                 paint.runs.push(Run {
@@ -506,8 +511,9 @@ fn row_built<L, const STYLED: bool, const RUNS: bool>(
                 });
             }
             open.push(if blank { ' ' } else { c });
-            if let Some(extra) = cell.zerowidth() {
-                coloured |= !underline.is_empty() && cell.underline_color().is_some();
+            if let Some(extra) = cells.zerowidth(Column(column)) {
+                coloured |=
+                    !underline.is_empty() && cells.underline_color(Column(column)).is_some();
                 open.extend(extra);
             }
         }
@@ -518,7 +524,7 @@ fn row_built<L, const STYLED: bool, const RUNS: bool>(
             let cell: &Cell = &cells[Column(column)];
             let flags = cell.flags;
             let plain = |c: char| (' '..='~').contains(&c);
-            if cell.extra.is_none()
+            if !cell.has_extra()
                 && plain(cell.c)
                 && !flags.intersects(
                     Flags::WIDE_CHAR
@@ -542,7 +548,7 @@ fn row_built<L, const STYLED: bool, const RUNS: bool>(
                     if cell.flags != flags
                         || cell.fg != fg
                         || cell.bg != bg
-                        || cell.extra.is_some()
+                        || cell.has_extra()
                         || !plain(c)
                         || (c != ' ' && !in_style)
                     {
@@ -597,21 +603,21 @@ const STYLED_UNDERLINES: Flags = Flags::DOUBLE_UNDERLINE
     .union(Flags::DOTTED_UNDERLINE)
     .union(Flags::DASHED_UNDERLINE);
 
-/// `cell`'s underline in a style or colour of its own (column `column`,
-/// cells `width` wide, its text in `ink`), joined to the one before it where
-/// they meet in the same style and colour.
+/// The underline of `cells`' cell at `column` in a style or colour of its
+/// own (cells `width` wide, its text in `ink`), joined to the one before it
+/// where they meet in the same style and colour.
 #[cold]
 #[inline(never)]
 fn styled_underline<L>(
     paint: &mut RowPaint,
     term: &alacritty_terminal::Term<L>,
     palette: &Palette,
-    cell: &Cell,
+    cells: &Row<Cell>,
     column: usize,
     width: f32,
     ink: Color,
 ) {
-    let flags = cell.flags;
+    let flags = cells[Column(column)].flags;
     let style = if flags.contains(Flags::UNDERCURL) {
         UnderlineStyle::Curly
     } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
@@ -623,8 +629,8 @@ fn styled_underline<L>(
     } else {
         UnderlineStyle::Single
     };
-    let color = cell
-        .underline_color()
+    let color = cells
+        .underline_color(Column(column))
         .map_or(ink, |given| self::color(resolve(term, palette, given)));
     let span = if flags.contains(Flags::WIDE_CHAR) {
         2.
@@ -691,6 +697,13 @@ pub(crate) fn font() -> FontStyle {
 /// (`LetterSpacing::cells`, set once with the cell, `view::row_view`).
 pub(crate) fn draw(paint: &RowPaint, metrics: Metrics, font: &FontStyle) -> Canvas {
     let mut canvas = Canvas::new();
+    // The grid's cell as shaping holds it (to a 1024th of a point): each
+    // run's width is its cells of it, its height the line's, stated for the
+    // scene not to measure what the grid decides (`CanvasText::known_size`).
+    let cell = font
+        .letter_spacing
+        .cell()
+        .filter(|_| metrics.line_height > 0.);
     for fill in paint.fills.iter().chain(&paint.lines) {
         if fill.height < 0. {
             draw_underline(&mut canvas, fill, metrics);
@@ -733,9 +746,25 @@ pub(crate) fn draw(paint: &RowPaint, metrics: Metrics, font: &FontStyle) -> Canv
             font,
             anchor,
             baseline: TextBaseline::Top,
+            known_size: cell
+                .map(|cell| (grid_cells(&run.text) as f32 * cell, metrics.line_height))
+                .into(),
+            width: f32::INFINITY,
         });
     }
     canvas
+}
+
+/// How many cells `text` takes on the grid, as shaping places it there
+/// (`snap_to_cells` in the cosmic-text fork): each character's width as
+/// unicode-width tells it. A cell holds no control character, so ASCII is
+/// a cell a byte.
+fn grid_cells(text: &str) -> usize {
+    if text.is_ascii() {
+        return text.len();
+    }
+    use unicode_width::UnicodeWidthChar;
+    text.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 /// An underline in a style of its own (`UnderlineStyle`) on a row's canvas:
@@ -896,6 +925,7 @@ mod tests {
             font_size: 13.,
             cell_width: 8.,
             cell_height: 16.,
+            line_height: 15.6,
         };
         let shapes = [
             CursorShape::Block,

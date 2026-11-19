@@ -37,6 +37,11 @@ export const internal = [
   'docs/performance-feature-audit.md',
   'docs/gpui-parity.md',
   'docs/design-3d.md',
+  'docs/design-audio.md',
+  'docs/design-audio-luau.md',
+  // Until Wing makes the audio API public (with zgx-dom's): then a page
+  // beside reference/3d.
+  'docs/reference/audio.md',
 ];
 
 export const sets = [
@@ -136,7 +141,7 @@ export const sets = [
       { slug: 'reference/containers', src: 'docs/reference/containers.md', title: 'Containers' },
       { slug: 'reference/controls', src: 'docs/reference/controls.md', title: 'Controls' },
       { slug: 'reference/text', src: 'docs/reference/text.md', title: 'Text', intro: true,
-        sections: ['Text', 'Text options', 'Rich text and spans', 'Example', 'Markdown', 'Selectable text', 'Gotchas'] },
+        sections: ['Text', 'Text options', 'Rich text and spans', 'Example', 'Markdown', 'Fonts', 'Selectable text', 'Gotchas'] },
       { slug: 'reference/dynamic', src: 'docs/reference/dynamic.md', title: 'Dynamic content' },
       { slug: 'reference/scrolling', src: 'docs/reference/scrolling.md', title: 'Scrolling and lists' },
       { slug: 'reference/overlays', src: 'docs/reference/overlays.md', title: 'Overlays and menus' },
@@ -185,6 +190,8 @@ export const sets = [
         description: 'zgx inspect memory: what a running app holds, a line for each holder.' },
       { slug: 'acting', src: 'docs/agents/inspect.md', title: 'Acting', sections: ['Acting'], unwrap: true,
         description: 'click, type, key, scroll, command, set, wait and sleep.' },
+      { slug: 'clipboard', src: 'docs/agents/inspect.md', title: 'Clipboard', sections: ['Clipboard'], unwrap: true,
+        description: 'Read and set the window’s clipboard (its own under ZGX_CLIPBOARD=memory), then paste or copy with key.' },
       { slug: 'popups', src: 'docs/agents/inspect.md', title: 'Popovers and menus', sections: ['Popovers, menus and other popups'], unwrap: true,
         description: 'Open a popover, menu or select, wait for it, and act inside; popups past the window included.' },
       { slug: 'windows', src: 'docs/agents/inspect.md', title: 'Other windows', sections: ["The app's other windows"], unwrap: true,

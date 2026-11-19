@@ -38,7 +38,7 @@ Any [property](properties.md); these are the text ones (they also set the defaul
 | `weight` | `number` | `400` | 100 to 900 |
 | `bold` | `boolean` | `false` | weight 700 |
 | `italic` | `boolean` | `false` | |
-| `font` | `string` | the host's | `"mono"` (or `"monospace"`), `"sans"`, `"serif"`, or a family name |
+| `font` | `string` | the host's | `"mono"` (or `"monospace"`), `"sans"`, `"serif"`, or a family name: installed, the host's, or one the script loaded ([fonts](#fonts)) |
 | `align` | `"start" \| "left" \| "center" \| "right"` | `"start"` | within the text's own box |
 | `wrap` | `boolean \| "balance"` | `false` | wrap at the box's width; `"balance"` balances the lines, as CSS's `text-wrap: balance` (see [properties](properties.md)) |
 | `lines` | `number` | none | at most this many lines |
@@ -209,9 +209,53 @@ return ui.column {
 }
 ```
 
+## Fonts
+
+`font` names a family the system has installed, one the host registered, or one the script loaded. `ui.load_font(src)` loads a TrueType or OpenType file (`.ttf`, `.otf`, `.ttc`, up to 64 MiB) for every window: `src` is a path from the script's directory, a `File` the user picked, or `{ base64 = text }`: a font's bytes in base64, as a server or a host's call hands them over (a font the app downloaded). It returns a promise of the family names the file holds, which is what `font` then names. Text in those families, `ui.text` and a canvas's `c:text` alike, lays out and draws again in it; another file of the same family (its bold, its italic) adds that face beside the others.
+
+```lua
+-- The system's sans until Inter loads, and if it can't.
+local family = ui.state("family", "sans")
+local _ = ui.task(function()
+	local loaded, families = pcall(function()
+		return ui.load_font("fonts/Inter-Regular.ttf"):await() -- { "Inter" }
+	end)
+	if loaded then
+		family:set(families[1])
+	end
+end)
+return ui.text { "Handgloves", font = function() return family:get() end, text_size = 24 }
+```
+
+A canvas's `draw` runs again when a state it reads changes: have it read one the load sets (`family` above) so `c:measure_text` measures in the font once it is there.
+
+A file that is not a font rejects the promise (`kind` `"io"`), as do one that can't be read and text that isn't base64. A plugin's fonts come from its directory or below (or a file the user picked), and only with `Capability::Fonts` (`fonts` in `zgx.json`): a loaded font is the app's too, so the host decides.
+
 ## Selectable text
 
 Text is not selectable unless asked, as in native apps. `selectable = true` on any node makes the text in it and everything it holds selectable as a web page's is: one selection runs across its texts, paragraphs, list rows and spans in document order. Drag to select; a double press selects a word and a triple press a paragraph, and dragging after either extends by words or paragraphs; Shift extends; ⌘A / Ctrl+A selects it all and ⌘C / Ctrl+C copies plain text (a tab between texts side by side, a blank line between blocks set apart). A secondary press on selected text offers Copy and Select All. Links and buttons inside still click; a drag that starts on one selects. Holding a drag past a scroll viewport's edge scrolls it, and a selection in `ui.list`'s rows outlives the rows it recycles. `selectable = false` keeps a part out (a toolbar, a timestamp). `ui.markdown_view` is selectable already; drawing `ui.markdown`'s blocks yourself, put `selectable = true` on the node you draw them in, as above. [crates/zgx-script/examples/selectable](../../crates/zgx-script/examples/selectable/app.luau) draws a whole document (`cargo run -p zgx-script --example selectable`). The highlight follows CSS's `::selection`. `selection_color` and `selected_text_color` on the selectable node set its background and the selected glyphs' colour (a colour, a `"$token"`, a state or a function). The tokens `$selection`, `$selection.inactive` (window at the back), `$selection.text` and `$selection.text.inactive` (transparent, the default, keeps the glyphs' colours) and `$selection.radius` style it per subtree through `theme`: `ui.column { selectable = true, theme = { ["selection.text"] = "#ffffff", ["selection.radius"] = 3 }, … }`. Prose the examples ship (the agent trace, the streaming transcript, the notes preview) is selectable, as a browser's would be; controls and chrome are not.
+
+`on_copy` on the selectable node says what a copy out of it puts on the clipboard, for ⌘C / Ctrl+C, the Edit menu and the selection's Copy alike: a quote copied with its source, say. It hears `{ text, html, leaves, rows }`, the selection's plain text and HTML as they would go on the clipboard; for each text node the selection spans in order, the id of the element it is in inside the region (`false` for none); and for each `ui.list` it spans, `{ list, first, last }`, the list's id and the first and last rows (from 1), mounted or not, so a Select All over rows scrolled away still finds what they cite; and returns `{ text, html }` (a missing `text` keeps the selection's), or nil to copy as usual. A region without one is never asked and costs nothing. A leaf is known by an element's `id` only, not by a `ui.list` row's `key`: give the text in a row an `id` to know it.
+
+```lua
+local sources: { [string]: string } = { q1 = "Darwin, On the Origin of Species" }
+
+return ui.column {
+	selectable = true,
+	on_copy = function(request)
+		local first = request.leaves[1]
+		local source = if first then sources[first] else nil
+		if not source then
+			return nil
+		end
+		return {
+			text = `{request.text} ({source})`,
+			html = `<blockquote>{request.html}</blockquote><cite>{source}</cite>`,
+		}
+	end,
+	ui.text { "Endless forms most beautiful.", id = "q1" },
+}
+```
 
 On macOS a selection, or an input's, also answers the system's text services: the context menu offers Look Up “…” (⌃⌘D looks up without it), the Services menu takes it as plain text, and a service returning text replaces an editable selection. Selected text drags into inputs, where it moves (Option copies), and into other apps as plain text; a password's never leaves its field ([Rust: dragging text](../drag-drop.md#dragging-text)).
 

@@ -6,7 +6,10 @@
 -- by path), put `"languageMode": "strict"` in the project's .luaurc, add
 -- this file to `luau-lsp.types.definitionFiles`, and turn on Luau's new
 -- type solver (`"luau-lsp.fflags.override": { "LuauSolverV2": "true" }`,
--- or `--flag:LuauSolverV2=true`): the types below need it.
+-- or `--flag:LuauSolverV2=true`): the types below need it. Give it the
+-- iteration budget `zgx check` does, too (`"LuauTypeInferIterationLimit":
+-- "100000"` beside it): a `Merge<…>` of an element's props handed back to
+-- the element needs more than the default's.
 --
 -- Edit zgx.d.luau.in: zgx.d.luau, what editors and `zgx check` read, is
 -- that file with each `export type X = Merge<…>` written out as its table
@@ -719,11 +722,15 @@ export type State<T> = {
 	-- Adds to a number (1 by default).
 	add: (self: State<T>, by: number?) -> (),
 	-- Lists: append, insert at an index from 1, remove (returning the item,
-	-- nil outside the list), and the length (tracked, as `get` is).
+	-- nil outside the list), and the length (tracked, as `get` is); a
+	-- string's length is its bytes (`#`), read where it is held.
 	push: (self: State<T>, item: Item<T>) -> (),
 	insert: (self: State<T>, index: number, item: Item<T>) -> (),
 	remove: (self: State<T>, index: number) -> Item<T>?,
 	len: (self: State<T>) -> number,
+	-- Strings: `string.sub` of the string held (tracked, as `get` is), only
+	-- those bytes copied: a long document's part without the rest of it.
+	sub: (self: State<T>, i: number, j: number?) -> string,
 	-- One item of a list (from 1), tracked as `get` is, without the list
 	-- made into a table (a long list's rows, as a list shows them).
 	at: (self: State<T>, index: number) -> Item<T>?,
@@ -857,6 +864,10 @@ declare extern type LayerShader with
 end
 declare extern type Brush with
 end
+-- `ui.radial`'s and `ui.conic`'s options: `ry` an ellipse's vertical
+-- radius, `angle` where a conic one starts, `transform` a matrix
+-- { a, b, c, d, e, f } (x' = a x + c y + e, y' = b x + d y + f) mapping it.
+export type GradientOptions = { ry: number?, angle: number?, transform: { number }? }
 
 -- What failed (`ui.try`'s error, a promise's `error`, `:after`'s
 -- `on_error`): the same from every source. Still text where text goes:
@@ -931,6 +942,17 @@ export type Response = {
 -- A file a dialog, a drop or the system gives (the web's `File`): `size` in
 -- bytes, `type` its media type by its extension ("image/png"; "" unknown).
 export type File = { path: string, name: string, size: number, type: string }
+-- `ui.zip(file)`: a .zip written into a file the user picked, an entry at a
+-- time (stored as given; names are relative paths). `close` comes after
+-- every `add`, in order, and only then is the file replaced.
+-- `add_canvas` adds `draw`'s picture as `ui.render_canvas` would make it
+-- (the same options), made on the zip's thread with no pixels through the
+-- script and up to 256 MiB of them: a promise of its bytes and pixels.
+export type Zip = {
+	add: (self: Zip, name: string, data: string | { base64: string }) -> Promise<nil>,
+	add_canvas: (self: Zip, name: string, draw: (c: Canvas, w: number, h: number) -> (), opts: RenderCanvasOptions) -> Promise<RenderedFile>,
+	close: (self: Zip) -> Promise<nil>,
+}
 export type FilePickerOptions = {
 	title: string?,
 	-- Where the dialog opens.
@@ -1142,6 +1164,14 @@ export type SocketOptions = {
 	on_close: ((error: UiError?) -> ())?,
 }
 
+-- Internal, subject to change: what had keyboard focus, and a field's
+-- selection, from `ui.focus_snapshot()`.
+export type FocusSnapshot = {
+	-- Focus back where it was, a field's selection with it, nothing
+	-- scrolled: false if its element is gone or its text no longer fits.
+	restore: (self: FocusSnapshot) -> boolean,
+}
+
 -- A connection kept open (`ui.socket`).
 export type Socket = {
 	status: State<"connecting" | "open" | "reconnecting" | "closed">,
@@ -1186,6 +1216,12 @@ declare extern type Element with
 	-- list of measured rows measures those around it as it lands, so it
 	-- ends where asked. False for elements that are not lists.
 	function scroll_to_row(self, i: number, options: { align: ("start" | "center" | "end" | "nearest")? }?): boolean
+	-- (Hidden until its API is settled.) The scroll views around it moved
+	-- so it shows, innermost first, as the web's scrollIntoView: `block`
+	-- down ("start" by default) and `inline` across ("nearest"), easing
+	-- there unless the system reduces motion (`animate` says otherwise).
+	-- Whether any moved.
+	function scroll_into_view(self, options: { block: ("start" | "center" | "end" | "nearest")?, inline: ("start" | "center" | "end" | "nearest")?, animate: boolean? }?): boolean
 	function has_class(self, class: string): boolean
 	-- An input's selection, in characters (Unicode code points from 0, as
 	-- `utf8.len` counts them). Each returns false (or nil) for elements
@@ -1409,6 +1445,20 @@ export type CanvasTextOptions = {
 	font: string?,
 	align: ("start" | "center" | "end")?,
 	baseline: ("top" | "middle" | "bottom")?,
+	-- Points between lines, and added after each character.
+	line_height: number?,
+	letter_spacing: number?,
+	-- Wrapped to lines this many points wide, in a box that wide.
+	width: number?,
+	-- `c:text`: a matrix { a, b, c, d, e, f } (x' = a x + c y + e,
+	-- y' = b x + d y + f) mapping the placed text, as a turned shape's.
+	transform: { number }?,
+}
+-- How `c:image` fills its box, cuts its corners and fades it.
+export type CanvasImageOptions = {
+	fit: Fit?,
+	radius: number?,
+	opacity: number?,
 }
 declare extern type Canvas with
 	function rect(self, x: number, y: number, w: number, h: number, paint: Paint, radius: number?): ()
@@ -1416,14 +1466,45 @@ declare extern type Canvas with
 	function line(self, x1: number, y1: number, x2: number, y2: number, paint: Paint, width: number?, opts: LineOptions?): ()
 	function fill(self, path: Path, paint: Paint, rule: ("nonzero" | "evenodd")?): ()
 	function stroke(self, path: Path, paint: Paint, width: number?, opts: StrokeOptions?): ()
+	-- A picture (a path, a URL, `host:<name>` or a Bitmap) in a box, as
+	-- `ui.image` fits one; nothing while one isn't there yet.
+	function image(self, src: string | Bitmap, x: number, y: number, w: number, h: number, opts: CanvasImageOptions?): ()
+	-- The shadow the path casts, written as a `shadow` property is, under
+	-- what is drawn after it.
+	function shadow(self, path: Path, shadow: ShadowSpec?): ()
 	-- Clips what follows to the path, until `restore`.
 	function clip(self, path: Path): ()
 	function restore(self): ()
-	-- A line of text at (x, y), over the shapes whatever their order.
+	-- A line of text at (x, y), or a paragraph wrapped to `opts.width`, in
+	-- the drawing's order, cut by the open clips' box.
 	function text(self, text: string, x: number, y: number, opts: CanvasTextOptions?): ()
 	-- Its width and height, for placing what goes around it.
 	function measure_text(self, text: string, opts: CanvasTextOptions?): (number, number)
 end
+-- `ui.render_canvas`'s picture: its size in points, pixels a point, the
+-- drawing's point at its top left, what is under it (transparent), and the
+-- file: "png" (the default), "jpeg" (`quality` 1 to 100, 90 unless said;
+-- no transparency: laid over white) or "webp" (lossless).
+export type RenderCanvasOptions = {
+	width: number,
+	height: number,
+	scale: number?,
+	x: number?,
+	y: number?,
+	background: Color?,
+	format: ("png" | "jpeg" | "webp")?,
+	quality: number?,
+	-- A file the user picked (`ui.save_file`): the picture is written there,
+	-- with no pixels through the script and up to 256 MiB of them (not 32),
+	-- and the promise gives nil.
+	file: (File | string)?,
+	-- With `file`: the picture added at the file's end instead of over it
+	-- (a PDF's page; await each), and the promise gives a `RenderedFile`.
+	append: boolean?,
+}
+-- A picture file zgx made and wrote itself: its size in bytes, and its
+-- pixels.
+export type RenderedFile = { bytes: number, width: number, height: number }
 
 -- `ui.web(opts)`: a web page's controller. Its fields are tracked, so a
 -- text or computed reading `web.title` follows the page.
@@ -1444,6 +1525,10 @@ declare extern type Download with
 	function save_to(self, file: File | string, opts: DownloadOptions?): ()
 	-- The save dialog, suggesting `name`: the file saved to, or nil.
 	function ask(self, opts: DownloadOptions?): Promise<File?>
+	-- Internal, subject to change: saved with no dialog in the folder the
+	-- host names for downloads, under `name` made unique: the file once
+	-- it is whole, or nil if it stopped.
+	function save_temp(self, opts: DownloadOptions?): Promise<File?>
 	function cancel(self): ()
 end
 declare extern type Web with
@@ -1490,6 +1575,13 @@ declare extern type Web with
 	-- The script's value as Luau data (JSON's shape, whatever the page
 	-- returns: `any`), or nil and the error.
 	function eval(self, js: string, reply: ((value: any, err: string?) -> ...unknown)?): ()
+	-- Forget url's site, as a browser's "Remove site data": what this
+	-- page's profile keeps for its domain and those under it (cookies,
+	-- storage, caches, service workers), for every web on the profile.
+	-- How many of the platform's records went; open pages keep what they
+	-- hold until they reload. On Windows, storage of the site's other
+	-- subdomains stays.
+	function clear_site_data(self, url: string): Promise<number>
 	-- A page from `ui.web(id, opts)` leaves the host's registry: the next
 	-- `ui.web(id)` makes a new one.
 	function close(self): ()
@@ -1880,6 +1972,23 @@ export type NavigateEvent = { direction: "back" | "forward" }
 -- A trackpad's two-finger swipe, step by step (`on_swipe`): `dx` and `dy` as a
 -- scroll's, in points, while it's `moved`.
 export type SwipeEvent = { phase: "began" | "moved" | "ended" | "cancelled", dx: number, dy: number }
+-- A copy out of a selectable region, as its `on_copy` hears it: made by
+-- the engine and read by the app, so checked by name, not by its shape
+-- (which keeps every props table that holds `on_copy` cheap to check).
+declare extern type SelectionCopy with
+	text: string
+	html: string
+	leaves: { string | false }
+	-- Each `ui.list` it spans, in order: the list's id (`false` for none)
+	-- and the first and last rows (from 1), mounted or not, so a Select All
+	-- over rows scrolled away still names them.
+	rows: { { list: string | false, first: number, last: number } }
+end
+-- What goes on the clipboard: text, and HTML beside it where given.
+export type ClipboardContent = {
+	text: string?,
+	html: string?,
+}
 -- What a drag carries to other apps (`drag_export`): text, a link, files
 -- (absolute paths).
 export type DragExport = { text: string?, url: string?, files: { string }? }
@@ -2405,6 +2514,11 @@ export type NodeProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: number?,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: (number | Readable<number> | (() -> number))?,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: (boolean | Readable<boolean> | (() -> boolean))?,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -2412,6 +2526,9 @@ export type NodeProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: (boolean | Readable<boolean> | (() -> boolean))?,
 	expanded: (boolean | Readable<boolean> | (() -> boolean))?,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: (boolean | Readable<boolean> | (() -> boolean))?,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: ("polite" | "assertive" | "off")?,
@@ -2475,6 +2592,12 @@ export type NodeProps = {
 	tooltip_delay: number?,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: (boolean | Readable<boolean> | (() -> boolean) | Styles)?,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: (boolean | Readable<boolean> | (() -> boolean))?,
 	hover: Styles?,
 	active: Styles?,
 	focus: Styles?,
@@ -2521,6 +2644,10 @@ export type NodeProps = {
 	layer_on: Reactive<boolean>?,
 	-- Events.
 	on_click: (ClickHandler | Handler | Action)?,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: SoundProp?, --@audio
 	-- Primary pointer down and up.
 	on_press: (((e: PointerEvent) -> ...unknown) | Action)?,
 	on_release: (((e: PointerEvent) -> ...unknown) | Action)?,
@@ -2535,6 +2662,12 @@ export type NodeProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: ((e: SwipeEvent) -> ...unknown)?,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: ((request: SelectionCopy) -> ...ClipboardContent?)?,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: ((files: { File }, e: PointerEvent) -> ...unknown)?,
@@ -2561,7 +2694,10 @@ export type NodeProps = {
 	on_resize: ((size: Size, element: Element) -> ...unknown)?,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: ((visible: boolean, element: Element) -> ...unknown)?,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -2615,6 +2751,11 @@ export type NodeProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: boolean?,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: State<boolean>?,
 }
 export type MaskOptions = { [number]: Bitmap, w: number?, h: number?, x: number?, y: number?, sweep: MaskSweep? }
 -- The mask moving `x`, `y` points from where it starts, over and over every
@@ -2841,6 +2982,11 @@ export type Props = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -2848,6 +2994,9 @@ export type Props = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -2911,6 +3060,12 @@ export type Props = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -2957,6 +3112,10 @@ export type Props = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -2971,6 +3130,12 @@ export type Props = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -2997,7 +3162,10 @@ export type Props = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -3051,6 +3219,11 @@ export type Props = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 }
 export type Props_w = Reactive<Length>?
@@ -3226,9 +3399,11 @@ export type Props_focus_on_press = boolean?
 export type Props_capture_keys = boolean?
 export type Props_role = AriaRole?
 export type Props_heading = number?
+export type Props_level = (number | Readable<number> | (() -> number))?
 export type Props_selected = (boolean | Readable<boolean> | (() -> boolean))?
 export type Props_checked = (boolean | Readable<boolean> | (() -> boolean))?
 export type Props_expanded = (boolean | Readable<boolean> | (() -> boolean))?
+export type Props_pressed = (boolean | Readable<boolean> | (() -> boolean))?
 export type Props_live = ("polite" | "assertive" | "off")?
 export type Props_description = (string | ReadOnlyState<string> | (() -> string))?
 export type Props_value_text = Reactive<string>?
@@ -3250,6 +3425,7 @@ export type Props_tooltip_placement = Placement?
 export type Props_tooltip_interactive = boolean?
 export type Props_tooltip_delay = number?
 export type Props_disabled = (boolean | Readable<boolean> | (() -> boolean) | Styles)?
+export type Props_dim = (boolean | Readable<boolean> | (() -> boolean))?
 export type Props_hover = Styles?
 export type Props_active = Styles?
 export type Props_focus = Styles?
@@ -3272,12 +3448,14 @@ export type Props_layer_clock = boolean?
 export type Props_shader_clock = boolean?
 export type Props_layer_on = Reactive<boolean>?
 export type Props_on_click = (ClickHandler | Handler | Action)?
+export type Props_sound = SoundProp? --@audio
 export type Props_on_press = (((e: PointerEvent) -> ...unknown) | Action)?
 export type Props_on_release = (((e: PointerEvent) -> ...unknown) | Action)?
 export type Props_on_aux_click = (((e: AuxClickEvent) -> ...unknown) | Action)?
 export type Props_on_double_click = (((e: PointerEvent) -> ...unknown) | Action)?
 export type Props_on_navigate = (((e: NavigateEvent) -> ...unknown) | Action)?
 export type Props_on_swipe = ((e: SwipeEvent) -> ...unknown)?
+export type Props_on_copy = ((request: SelectionCopy) -> ...ClipboardContent?)?
 export type Props_on_file_drop = ((files: { File }, e: PointerEvent) -> ...unknown)?
 export type Props_on_file_hover = ((over: boolean) -> ...unknown)?
 export type Props_on_hover = (((inside: boolean) -> ...unknown) | Action)?
@@ -3312,6 +3490,7 @@ export type Props_on_drag_spring = ((payload: any) -> boolean?)?
 export type Props_context_menu = ((e: PointerEvent) -> ...{ Node }?)?
 export type Props_context_menu_style = Styles?
 export type Props_context_menu_below = boolean?
+export type Props_context_menu_open = State<boolean>?
 -- column, row, div, overlay, grid, button: and children.
 export type ContainerProps = {
 	-- Size and position.
@@ -3529,6 +3708,11 @@ export type ContainerProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -3536,6 +3720,9 @@ export type ContainerProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -3599,6 +3786,12 @@ export type ContainerProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -3645,6 +3838,10 @@ export type ContainerProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -3659,6 +3856,12 @@ export type ContainerProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -3685,7 +3888,10 @@ export type ContainerProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -3739,6 +3945,11 @@ export type ContainerProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -3979,6 +4190,11 @@ export type GlassProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -3986,6 +4202,9 @@ export type GlassProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -4049,6 +4268,12 @@ export type GlassProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -4095,6 +4320,10 @@ export type GlassProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -4109,6 +4338,12 @@ export type GlassProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -4135,7 +4370,10 @@ export type GlassProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -4189,6 +4427,11 @@ export type GlassProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -4438,6 +4681,11 @@ export type ScrollProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -4445,6 +4693,9 @@ export type ScrollProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -4508,6 +4759,12 @@ export type ScrollProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -4554,6 +4811,10 @@ export type ScrollProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -4568,6 +4829,12 @@ export type ScrollProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -4594,7 +4861,10 @@ export type ScrollProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -4648,6 +4918,11 @@ export type ScrollProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -4914,6 +5189,11 @@ export type TextProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -4921,6 +5201,9 @@ export type TextProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -4984,6 +5267,12 @@ export type TextProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -5030,6 +5319,10 @@ export type TextProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -5044,6 +5337,12 @@ export type TextProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -5070,7 +5369,10 @@ export type TextProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -5124,6 +5426,11 @@ export type TextProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	-- The text: a string or template, a number, a function, or a state
 	-- (its value, followed as a template's is).
 	[number]: Text | Readable<any>,
@@ -5349,6 +5656,11 @@ export type MarkdownViewProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -5356,6 +5668,9 @@ export type MarkdownViewProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -5419,6 +5734,12 @@ export type MarkdownViewProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -5465,6 +5786,10 @@ export type MarkdownViewProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -5479,6 +5804,12 @@ export type MarkdownViewProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -5505,7 +5836,10 @@ export type MarkdownViewProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -5559,6 +5893,11 @@ export type MarkdownViewProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Text,
 	literal: boolean?,
 	-- Single newlines break lines, as people's messages show them.
@@ -5608,6 +5947,13 @@ export type SpanProps = {
 	-- A link (`on_click`) under the pointer: underlined, recoloured. With
 	-- it, the link isn't underlined at rest unless `underline` says so.
 	hover: { underline: boolean?, color: Color? }?,
+	-- Internal, and may change: a box of its own (CSS's `display:
+	-- inline-flex`), its line height and `padding` its box, which its
+	-- line's box holds (a badge taller than the text grows its line).
+	box: boolean?,
+	-- Internal, and may change: its own line height, in points (a `box`
+	-- span's box is it and its `padding`), where the paragraph's is not.
+	line_height: number?,
 	-- An icon before the text, in the line (a file chip's file type):
 	-- `src` (a file, `https://…`) or `code` (SVG markup), `size` square
 	-- (12), `gap` from the text (4), centred on the line; `tint` a colour,
@@ -5634,6 +5980,10 @@ export type SpanProps = {
 	-- it with the system's handler (after `on_click`'s), and whose context
 	-- menu opens or copies it.
 	href: string?,
+	-- Internal, subject to change: what assistive technology reads for the
+	-- run in place of its text, a citation badge's "Citation 1, Sleep
+	-- study.pdf"; a run that acts is then read once, as a button by it.
+	label: string?,
 	-- The run's own context menu, as an element's: on a link, in place of
 	-- Open Link and Copy Link. Inside the text selected, the selection's
 	-- menu shows instead; returning nil lets the click through to the
@@ -5871,6 +6221,11 @@ export type RichProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -5878,6 +6233,9 @@ export type RichProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -5941,6 +6299,12 @@ export type RichProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -5987,6 +6351,10 @@ export type RichProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -6001,6 +6369,12 @@ export type RichProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -6027,7 +6401,10 @@ export type RichProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -6077,6 +6454,11 @@ export type RichProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Span | Text | SpanProps,
 	literal: boolean?,
 	-- As an element's, told the run under the click or the focused link
@@ -6300,6 +6682,11 @@ export type ImageProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -6307,6 +6694,9 @@ export type ImageProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -6370,6 +6760,12 @@ export type ImageProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -6416,6 +6812,10 @@ export type ImageProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -6430,6 +6830,12 @@ export type ImageProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -6456,7 +6862,10 @@ export type ImageProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -6510,6 +6919,11 @@ export type ImageProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- PNG or JPEG, relative to the script; `https://…` (through the
 	-- host's fetcher); `host:<name>` (an image the app made); or a
@@ -6746,6 +7160,11 @@ export type SvgProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -6753,6 +7172,9 @@ export type SvgProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -6816,6 +7238,12 @@ export type SvgProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -6862,6 +7290,10 @@ export type SvgProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -6876,6 +7308,12 @@ export type SvgProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -6902,7 +7340,10 @@ export type SvgProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -6956,6 +7397,11 @@ export type SvgProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	src: Reactive<string>?,
 	code: string?,
@@ -7303,6 +7749,11 @@ export type Scene3DProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -7310,6 +7761,9 @@ export type Scene3DProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -7373,6 +7827,12 @@ export type Scene3DProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -7419,6 +7879,10 @@ export type Scene3DProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -7433,6 +7897,12 @@ export type Scene3DProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -7459,7 +7929,10 @@ export type Scene3DProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -7513,6 +7986,11 @@ export type Scene3DProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	-- Its accessible name.
 	label: string?,
 	camera: Camera3D?,
@@ -7755,6 +8233,11 @@ export type CanvasProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -7762,6 +8245,9 @@ export type CanvasProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -7825,6 +8311,12 @@ export type CanvasProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -7871,6 +8363,10 @@ export type CanvasProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -7885,6 +8381,12 @@ export type CanvasProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -7911,7 +8413,10 @@ export type CanvasProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -7965,6 +8470,11 @@ export type CanvasProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- Runs again when the size or the state it reads changes. Required
 	-- unless `each` and `draw_item` draw it.
@@ -8216,6 +8726,11 @@ export type CheckboxProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -8223,6 +8738,9 @@ export type CheckboxProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -8286,6 +8804,12 @@ export type CheckboxProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -8332,6 +8856,10 @@ export type CheckboxProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -8346,6 +8874,12 @@ export type CheckboxProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -8372,7 +8906,10 @@ export type CheckboxProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -8426,6 +8963,11 @@ export type CheckboxProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- Required unless `field` gives it. A state, both ways; or, controlled
 	-- as React's are, a function it shows, a change going to `on_change`.
@@ -8655,6 +9197,11 @@ export type InputProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -8662,6 +9209,9 @@ export type InputProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -8725,6 +9275,12 @@ export type InputProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -8771,6 +9327,10 @@ export type InputProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -8785,6 +9345,12 @@ export type InputProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -8811,7 +9377,10 @@ export type InputProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -8865,6 +9434,11 @@ export type InputProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- A state, both ways; or, controlled as React's inputs are, a function
 	-- (or text) it shows, edits going out by `on_change` and `on_commit`.
@@ -8936,6 +9510,10 @@ export type InputProps = {
 	active_descendant: (string | Readable<string?> | (() -> string?))?,
 	-- Several lines only: numbered in a gutter at the left (a code editor).
 	line_numbers: boolean?,
+	-- Internal, subject to change: false, text dragged over it leaves its
+	-- caret and selection where they are (the app shows where it would
+	-- drop); it still takes the drop where it is let go.
+	drop_caret: boolean?,
 	-- Several lines only: a line's styles, asked for the lines in view and
 	-- again only for one that changes. Given the line and what the line
 	-- before left (0 before the first), it returns spans `{ from, to,
@@ -8981,6 +9559,65 @@ export type InputProps = {
 	-- The first line in view, from 1, whenever it changes: an outline following
 	-- the text.
 	on_top_line: ((line: number) -> ())?,
+	-- Its atoms (chips): ranges of the text that edit as one unit, `{ id,
+	-- from, to, data?, style? }` each, `from` and `to` in characters from 0
+	-- (half-open), by `from`. Two-way, as `value` is: the editor writes it as
+	-- they are made, lost or moved, and setting it restores them (a draft's;
+	-- set the text first). The label stays in the text.
+	atoms: State<{ AtomItem }>?,
+	-- Told after atoms are made, lost or moved (an edit, an undo): what was
+	-- added and removed (a removed one with its `label` and the range it had),
+	-- all of them, and why: "edit", "undo", "redo" or "set".
+	on_atoms: ((change: AtomChange) -> ())?,
+	-- Internal, subject to change: an atom pressed and let go in place
+	-- (within 4 points, no text dragged over), with where, in the window's
+	-- points. True takes the press: the caret stays where it was, out of
+	-- the chip.
+	on_atom_press: ((atom: AtomItem, at: { x: number, y: number }) -> boolean?)?,
+	-- Internal, subject to change: the atom the pointer comes onto, with
+	-- its box on the line under the pointer (window points), and nil, nil as
+	-- it leaves; again when a scroll or a new layout moves it.
+	on_atom_hover: ((atom: AtomItem?, box: { x: number, y: number, width: number, height: number }?) -> ())?,
+	-- The wash behind atoms that have none of their own (`style.bg`).
+	-- Internal, subject to change: and how they show beyond it, as a
+	-- mention does (an atom's own `style` wins field by field).
+	atom_style: AtomLook?,
+}
+-- Internal, subject to change: how an atom shows. Its text's colour and
+-- weight, a line under it (the font's thickness, `offset` points below the
+-- baseline), and an icon in room before its text that stays with its first
+-- word as it wraps.
+export type AtomLook = {
+	bg: Color?,
+	color: Color?,
+	weight: number?,
+	underline: (boolean | { color: Color?, offset: number? })?,
+	icon: { src: string?, code: string?, size: number?, gap: number?, tint: Color? }?,
+	-- Its text shown as a picture instead (an equation), sized in EM of the
+	-- textarea's text: one caret unit, its text kept for copy and search.
+	svg: { src: string?, code: string?, width: number, height: number, descent: number? }?,
+}
+export type AtomItem = {
+	id: string?,
+	from: number,
+	to: number,
+	data: any?,
+	style: AtomLook?,
+	-- Only on a removed atom: the text it had.
+	label: string?,
+}
+export type AtomChange = {
+	reason: "edit" | "undo" | "redo" | "set",
+	atoms: { AtomItem },
+	added: { AtomItem },
+	removed: { AtomItem },
+}
+export type InsertAtomOptions = {
+	id: string?,
+	data: any?,
+	style: { bg: string? }?,
+	-- The characters it takes the place of (the `@que` typed to ask for it).
+	replace: { from: number, to: number }?,
 }
 -- `value` from 0 to 1, or nil: indeterminate (work of unknown size), a
 -- stretch of the bar sweeping across.
@@ -9200,6 +9837,11 @@ export type ProgressProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -9207,6 +9849,9 @@ export type ProgressProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -9270,6 +9915,12 @@ export type ProgressProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -9316,6 +9967,10 @@ export type ProgressProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -9330,6 +9985,12 @@ export type ProgressProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -9356,7 +10017,10 @@ export type ProgressProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -9410,6 +10074,11 @@ export type ProgressProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	value: State<number> | State<number?> | number | (() -> number?),
 	label: Label?,
@@ -9630,6 +10299,11 @@ export type SliderProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -9637,6 +10311,9 @@ export type SliderProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -9697,6 +10374,12 @@ export type SliderProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -9743,6 +10426,10 @@ export type SliderProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -9757,6 +10444,12 @@ export type SliderProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -9783,7 +10476,10 @@ export type SliderProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -9837,6 +10533,11 @@ export type SliderProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- Required unless `field` gives it. A state, both ways; or, controlled
 	-- as React's are, a function it shows, a change going to `on_change`.
@@ -10075,6 +10776,11 @@ export type SegmentedProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -10082,6 +10788,9 @@ export type SegmentedProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -10145,6 +10854,12 @@ export type SegmentedProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -10191,6 +10906,10 @@ export type SegmentedProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -10205,6 +10924,12 @@ export type SegmentedProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -10231,7 +10956,10 @@ export type SegmentedProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -10285,6 +11013,11 @@ export type SegmentedProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- Required unless `field` gives it. A state, both ways; or, controlled
 	-- as React's are, a function it shows, a change going to `on_change`.
@@ -10516,6 +11249,11 @@ export type StepperProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -10523,6 +11261,9 @@ export type StepperProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -10586,6 +11327,12 @@ export type StepperProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -10632,6 +11379,10 @@ export type StepperProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -10646,6 +11397,12 @@ export type StepperProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -10672,7 +11429,10 @@ export type StepperProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -10726,6 +11486,11 @@ export type StepperProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- Required unless `field` gives it. A state, both ways; or, controlled
 	-- as React's are, a function it shows, a change going to `on_change`.
@@ -10958,6 +11723,11 @@ export type DisclosureProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -10965,6 +11735,9 @@ export type DisclosureProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -11028,6 +11801,12 @@ export type DisclosureProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -11074,6 +11853,10 @@ export type DisclosureProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -11088,6 +11871,12 @@ export type DisclosureProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -11114,7 +11903,10 @@ export type DisclosureProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -11168,6 +11960,11 @@ export type DisclosureProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -11411,6 +12208,11 @@ export type AccordionProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -11418,6 +12220,9 @@ export type AccordionProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -11481,6 +12286,12 @@ export type AccordionProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -11527,6 +12338,10 @@ export type AccordionProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -11541,6 +12356,12 @@ export type AccordionProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -11567,7 +12388,10 @@ export type AccordionProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -11621,6 +12445,11 @@ export type AccordionProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Node,
 	open: State<any>,
 }
@@ -11838,6 +12667,11 @@ export type SectionProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -11845,6 +12679,9 @@ export type SectionProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -11908,6 +12745,12 @@ export type SectionProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -11954,6 +12797,10 @@ export type SectionProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -11968,6 +12815,12 @@ export type SectionProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -11994,7 +12847,10 @@ export type SectionProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -12048,6 +12904,11 @@ export type SectionProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -12290,6 +13151,11 @@ export type SeparatorProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -12297,6 +13163,9 @@ export type SeparatorProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -12360,6 +13229,12 @@ export type SeparatorProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -12406,6 +13281,10 @@ export type SeparatorProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -12420,6 +13299,12 @@ export type SeparatorProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -12446,7 +13331,10 @@ export type SeparatorProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -12500,6 +13388,11 @@ export type SeparatorProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	vertical: boolean?,
 }
@@ -12725,6 +13618,11 @@ export type TabsProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -12732,6 +13630,9 @@ export type TabsProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -12795,6 +13696,12 @@ export type TabsProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -12841,6 +13748,10 @@ export type TabsProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -12855,6 +13766,12 @@ export type TabsProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -12881,7 +13798,10 @@ export type TabsProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -12935,6 +13855,11 @@ export type TabsProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- The tabs, two-way: closing removes one, reordering moves it.
 	items: State<{ TabItem }>,
@@ -13182,6 +14107,11 @@ export type TreeProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -13189,6 +14119,9 @@ export type TreeProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -13252,6 +14185,12 @@ export type TreeProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -13298,6 +14237,10 @@ export type TreeProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -13312,6 +14255,12 @@ export type TreeProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -13338,7 +14287,10 @@ export type TreeProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -13392,6 +14344,11 @@ export type TreeProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	items: State<{ TreeNode }> | State<{ any }>,
 	-- The open items' ids, both ways.
@@ -13635,6 +14592,11 @@ export type DataGridProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -13642,6 +14604,9 @@ export type DataGridProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -13705,6 +14670,12 @@ export type DataGridProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -13751,6 +14722,10 @@ export type DataGridProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -13765,6 +14740,12 @@ export type DataGridProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -13791,7 +14772,10 @@ export type DataGridProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -13845,6 +14829,11 @@ export type DataGridProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- A state is written as columns are resized and moved.
 	columns: { GridColumn } | State<{ GridColumn }> | State<{ any }>,
@@ -14084,6 +15073,11 @@ export type CalendarProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -14091,6 +15085,9 @@ export type CalendarProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -14154,6 +15151,12 @@ export type CalendarProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -14200,6 +15203,10 @@ export type CalendarProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -14214,6 +15221,12 @@ export type CalendarProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -14240,7 +15253,10 @@ export type CalendarProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -14294,6 +15310,11 @@ export type CalendarProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- The date, `"2026-10-23"`, both ways; nil: none chosen.
 	value: State<string?> | State<any> | (() -> string?),
@@ -14526,6 +15547,11 @@ export type DatePickerProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -14533,6 +15559,9 @@ export type DatePickerProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -14596,6 +15625,12 @@ export type DatePickerProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -14642,6 +15677,10 @@ export type DatePickerProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -14656,6 +15695,12 @@ export type DatePickerProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -14682,7 +15727,10 @@ export type DatePickerProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -14736,6 +15784,11 @@ export type DatePickerProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	value: State<string?> | State<any> | (() -> string?),
 	on_change: ((value: string?) -> ())?,
@@ -14966,6 +16019,11 @@ export type TimeFieldProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -14973,6 +16031,9 @@ export type TimeFieldProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -15036,6 +16097,12 @@ export type TimeFieldProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -15082,6 +16149,10 @@ export type TimeFieldProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -15096,6 +16167,12 @@ export type TimeFieldProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -15122,7 +16199,10 @@ export type TimeFieldProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -15176,6 +16256,11 @@ export type TimeFieldProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- The time, `"09:30"` (24-hour), both ways.
 	value: State<string?> | State<any> | (() -> string?),
@@ -15405,6 +16490,11 @@ export type ComboboxProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -15412,6 +16502,9 @@ export type ComboboxProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -15475,6 +16568,12 @@ export type ComboboxProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -15521,6 +16620,10 @@ export type ComboboxProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -15535,6 +16638,12 @@ export type ComboboxProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -15561,7 +16670,10 @@ export type ComboboxProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -15615,6 +16727,11 @@ export type ComboboxProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- What the field holds, both ways.
 	text: State<string>,
@@ -15852,6 +16969,11 @@ export type CommandPaletteProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -15859,6 +16981,9 @@ export type CommandPaletteProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -15922,6 +17047,12 @@ export type CommandPaletteProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -15968,6 +17099,10 @@ export type CommandPaletteProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -15982,6 +17117,12 @@ export type CommandPaletteProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -16008,7 +17149,10 @@ export type CommandPaletteProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -16062,6 +17206,11 @@ export type CommandPaletteProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	open: State<boolean>,
 	commands: { PaletteCommand }?,
@@ -16287,6 +17436,11 @@ export type SelectProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -16294,6 +17448,9 @@ export type SelectProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -16357,6 +17514,12 @@ export type SelectProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -16403,6 +17566,10 @@ export type SelectProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -16417,6 +17584,12 @@ export type SelectProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -16443,7 +17616,10 @@ export type SelectProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -16497,6 +17673,11 @@ export type SelectProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- Required unless `field` gives it. A state, both ways; or, controlled
 	-- as React's are, a function it shows, a change going to `on_change`.
@@ -16729,6 +17910,11 @@ export type SplitProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -16736,6 +17922,9 @@ export type SplitProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -16799,6 +17988,12 @@ export type SplitProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -16845,6 +18040,10 @@ export type SplitProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -16859,6 +18058,12 @@ export type SplitProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -16885,7 +18090,10 @@ export type SplitProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -16939,6 +18147,11 @@ export type SplitProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -17227,6 +18440,11 @@ export type ListProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -17234,6 +18452,9 @@ export type ListProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -17297,6 +18518,12 @@ export type ListProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -17343,6 +18570,10 @@ export type ListProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -17357,6 +18588,12 @@ export type ListProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -17383,7 +18620,10 @@ export type ListProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -17437,6 +18677,11 @@ export type ListProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- The name assistive technology reads for it: "Messages".
 	label: Label?,
@@ -17756,6 +19001,11 @@ export type LayerProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -17763,6 +19013,9 @@ export type LayerProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -17826,6 +19079,12 @@ export type LayerProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -17872,6 +19131,10 @@ export type LayerProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -17886,6 +19149,12 @@ export type LayerProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -17912,7 +19181,10 @@ export type LayerProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -17966,6 +19238,11 @@ export type LayerProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -18205,6 +19482,11 @@ export type ModalProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -18212,6 +19494,9 @@ export type ModalProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -18275,6 +19560,12 @@ export type ModalProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -18321,6 +19612,10 @@ export type ModalProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -18335,6 +19630,12 @@ export type ModalProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -18361,7 +19662,10 @@ export type ModalProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -18415,6 +19719,11 @@ export type ModalProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -18672,6 +19981,11 @@ export type PopoverProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -18679,6 +19993,9 @@ export type PopoverProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -18742,6 +20059,12 @@ export type PopoverProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -18788,6 +20111,10 @@ export type PopoverProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -18802,6 +20129,12 @@ export type PopoverProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -18828,7 +20161,10 @@ export type PopoverProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -18882,6 +20218,11 @@ export type PopoverProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -19151,9 +20492,17 @@ export type MenuItemProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -19217,6 +20566,12 @@ export type MenuItemProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -19263,6 +20618,10 @@ export type MenuItemProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -19277,6 +20636,12 @@ export type MenuItemProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -19303,7 +20668,10 @@ export type MenuItemProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -19357,6 +20725,11 @@ export type MenuItemProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	label: Label?,
 	-- Chosen, it leaves the menu open (a toggle, a pin).
@@ -19585,6 +20958,11 @@ export type SubmenuProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -19592,6 +20970,9 @@ export type SubmenuProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -19655,6 +21036,12 @@ export type SubmenuProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -19701,6 +21088,10 @@ export type SubmenuProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -19715,6 +21106,12 @@ export type SubmenuProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -19741,7 +21138,10 @@ export type SubmenuProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -19795,6 +21195,11 @@ export type SubmenuProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: Child,
 	-- A button's look where its own styles don't say: "primary" (the
 	-- accent), "ghost" (no background until hovered), "danger", "default".
@@ -20040,6 +21445,11 @@ export type WebViewProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -20047,6 +21457,9 @@ export type WebViewProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -20110,6 +21523,12 @@ export type WebViewProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -20156,6 +21575,10 @@ export type WebViewProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -20167,6 +21590,12 @@ export type WebViewProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -20193,7 +21622,10 @@ export type WebViewProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -20247,6 +21679,11 @@ export type WebViewProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	transparent: boolean?,
 	-- "default" (shared cookies and storage), "ephemeral", or a name.
 	profile: string?,
@@ -20501,6 +21938,11 @@ export type TerminalProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -20508,6 +21950,9 @@ export type TerminalProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -20571,6 +22016,12 @@ export type TerminalProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -20617,6 +22068,10 @@ export type TerminalProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -20631,6 +22086,12 @@ export type TerminalProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -20657,7 +22118,10 @@ export type TerminalProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -20711,6 +22175,11 @@ export type TerminalProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	term: Term,
 }
@@ -20931,6 +22400,11 @@ export type GpuViewProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -20938,6 +22412,9 @@ export type GpuViewProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -21001,6 +22478,12 @@ export type GpuViewProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -21047,6 +22530,10 @@ export type GpuViewProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -21061,6 +22548,12 @@ export type GpuViewProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -21087,7 +22580,10 @@ export type GpuViewProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -21141,6 +22637,11 @@ export type GpuViewProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	view: string,
 	label: string?,
@@ -21362,6 +22863,11 @@ export type SlotProps = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -21369,6 +22875,9 @@ export type SlotProps = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -21432,6 +22941,12 @@ export type SlotProps = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -21478,6 +22993,10 @@ export type SlotProps = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -21492,6 +23011,12 @@ export type SlotProps = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -21518,7 +23043,10 @@ export type SlotProps = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -21572,6 +23100,11 @@ export type SlotProps = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	context: unknown?,
 	from: string?,
@@ -21841,6 +23374,11 @@ export type EachOptions = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -21848,6 +23386,9 @@ export type EachOptions = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -21911,6 +23452,12 @@ export type EachOptions = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -21957,6 +23504,10 @@ export type EachOptions = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -21971,6 +23522,12 @@ export type EachOptions = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -21997,7 +23554,10 @@ export type EachOptions = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -22051,6 +23611,11 @@ export type EachOptions = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	-- A row's identity: rows keep their state as the list reorders. The
 	-- item is `any`, as `build`'s is.
@@ -22286,6 +23851,11 @@ export type PresenceOptions = {
 	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
 	-- list headings and move between them.
 	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
 	-- Whether this option, tab or item is the chosen one (`aria-selected`).
 	selected: Props_selected,
 	-- Whether a switch, checkbox or radio of the app's own is on
@@ -22293,6 +23863,9 @@ export type PresenceOptions = {
 	-- (`aria-expanded`): a custom disclosure's.
 	checked: Props_checked,
 	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
 	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
 	-- note, a message arriving.
 	live: Props_live,
@@ -22356,6 +23929,12 @@ export type PresenceOptions = {
 	tooltip_delay: Props_tooltip_delay,
 	-- A condition (true disables), or the styles it shows while disabled.
 	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
 	hover: Props_hover,
 	active: Props_active,
 	focus: Props_focus,
@@ -22402,6 +23981,10 @@ export type PresenceOptions = {
 	layer_on: Props_layer_on,
 	-- Events.
 	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
 	-- Primary pointer down and up.
 	on_press: Props_on_press,
 	on_release: Props_on_release,
@@ -22416,6 +23999,12 @@ export type PresenceOptions = {
 	-- A two-finger swipe over it, step by step: tracked here, not by the
 	-- platform (with it, three fingers still reach `on_navigate`).
 	on_swipe: Props_on_swipe,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
 	-- Files dropped on it from outside the window (Finder, Explorer): the
 	-- innermost node with one takes them.
 	on_file_drop: Props_on_file_drop,
@@ -22442,7 +24031,10 @@ export type PresenceOptions = {
 	on_resize: Props_on_resize,
 	-- When any of it comes into view or all of it leaves (inside every
 	-- clip and scroll viewport above it), and at its first layout: for
-	-- building what only matters on screen.
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
 	on_visible: Props_on_visible,
 	-- With `on_visible`: in view once any of it comes within this many
 	-- points of showing (an IntersectionObserver's `rootMargin`), to build
@@ -22496,6 +24088,11 @@ export type PresenceOptions = {
 	-- Open the context menu under the node, from its left edge (a tab's),
 	-- rather than at the pointer.
 	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	enter: ElementParams?,
 	exit: ElementParams?,
@@ -22707,8 +24304,12 @@ declare ui: {
 	submenu: (props: SubmenuProps) -> Node,
 	list: (props: ListProps) -> Node,
 	-- `node` while `cond` is truthy, else `otherwise` (or nothing).
-	show: (cond: boolean | Readable<unknown> | (() -> unknown), node: Node, otherwise: Node?) -> Node,
-	switch: (value: string | Readable<unknown> | (() -> unknown), cases: { [CaseKey]: Node }, default: Node?) -> Node,
+	-- Internal, subject to change: a branch (`node`, `otherwise`, a case, the
+	-- default) may be a function returning the node, built only when it
+	-- shows, in a scope of its own: a row's branches that never show are
+	-- never built.
+	show: (cond: boolean | Readable<unknown> | (() -> unknown), node: Node | (() -> Node), otherwise: (Node | (() -> Node))?) -> Node,
+	switch: (value: string | Readable<unknown> | (() -> unknown), cases: { [CaseKey]: Node | (() -> Node) }, default: (Node | (() -> Node))?) -> Node,
 	-- A row per item of a list state; `build` gets the item and its index
 	-- (from 1). The item is `any`: annotate it to check it,
 	-- `function(tab: Tab, i)` (Luau infers a generic callback's parameter
@@ -22886,19 +24487,31 @@ declare ui: {
 		-- The byte, from 0, a click at `x`, `y` (the window's points, as a drop's)
 		-- would put the caret at.
 		offset_at: (el: Element, x: number, y: number) -> number?,
+		-- Internal, subject to change: an editor's atoms (see a textarea's
+		-- `atoms`). `label` made an atom at the caret, over the selection, or
+		-- over `replace`'s characters; one step of undo, the caret after it.
+		-- Its id, or nil for elements that are not editors.
+		insert_atom: (el: Element, label: string, options: InsertAtomOptions?) -> string?,
+		atoms: (el: Element) -> { AtomItem }?,
 		-- A textarea's line, from 1, at that place in its view; its caret stays.
 		scroll_to_line: (el: Element, line: number, options: { align: ("start" | "center" | "end" | "nearest")? }?) -> boolean,
 	},
+	-- Internal, subject to change: what has keyboard focus and a field's
+	-- selection, to put back later; nil if nothing has focus.
+	focus_snapshot: () -> FocusSnapshot?,
 	-- An HTTP request through the host's transport (`ScriptHost::fetcher`):
 	-- a promise of a `Response`. A plugin needs the host's grant.
 	fetch: (url: string, opts: FetchOptions?) -> Promise<Response>,
 	-- The clipboard's text (nil if it holds none), and putting text on it;
-	-- its image as a `Bitmap` (nil if it holds none), and putting one on
-	-- it: promises, as a large image is decoded and encoded off the main
-	-- thread.
+	-- its HTML (a browser's or word processor's copy; nil if it holds
+	-- none), and putting HTML on it with its text; its image as a `Bitmap`
+	-- (nil if it holds none), and putting one on it: promises, as a large
+	-- image is decoded and encoded off the main thread.
 	clipboard: {
 		read: () -> string?,
 		write: (text: string) -> boolean,
+		read_html: () -> string?,
+		write_html: (text: string, html: string) -> boolean,
 		read_image: () -> Promise<Bitmap?>,
 		write_image: (image: Bitmap) -> Promise<boolean>,
 	},
@@ -22924,10 +24537,23 @@ declare ui: {
 	-- A count on the app's icon (the Dock's, the taskbar's, a dock's);
 	-- 0 or nil takes it off. Whether the system shows one.
 	badge: (count: number | string | nil) -> boolean,
-	-- A file the user picked, read as text off the main thread: a promise.
-	read_file: (file: File | string) -> Promise<string>,
-	-- Write `text` to a file the user picked (beside it, then over it).
-	write_file: (file: File | string, text: string) -> Promise<nil>,
+	-- A file the user picked, read off the main thread: a promise of its
+	-- text, or with `base64 = true` of every byte in base64 (a picture).
+	read_file: (file: File | string, opts: { base64: boolean? }?) -> Promise<string>,
+	-- Write to a file the user picked (beside it, then over it): a string's
+	-- bytes as they are (any byte), or `{ base64 = … }`'s (a PNG).
+	-- `append = true` adds them at its end instead, to write a big file in
+	-- parts: await each part before the next.
+	write_file: (file: File | string, data: string | { base64: string }, opts: { append: boolean? }?) -> Promise<nil>,
+	-- A TrueType or OpenType font file (a path from the script's directory,
+	-- a plugin's inside it, or a File the user picked), or a font's bytes in
+	-- base64 (`{ base64 = … }`), added to every window's text: a promise of
+	-- the family names it holds, which `font` then names. Text in those
+	-- families lays out and draws again in it.
+	load_font: (src: File | string | { base64: string }) -> Promise<{ string }>,
+	-- A .zip into a file the user picked (`ui.save_file`), one entry at a
+	-- time, so the whole archive is never held: see `Zip`.
+	zip: (file: File | string) -> Zip,
 	-- What the app was launched with after its script (`zgx-run app/
 	-- notes.txt` gives `{ "notes.txt" }`).
 	args: { string },
@@ -22956,6 +24582,10 @@ declare ui: {
 	spring_to: (state: State<number>, target: number, opts: SpringToOptions?) -> () -> number,
 	-- White pixels with the alpha `alpha(x, y)` gives (0 to 1), for masks.
 	bitmap: (w: number, h: number, alpha: (x: number, y: number) -> number) -> Bitmap,
+	-- A picture's bytes in base64 (a PNG, JPEG or GIF a server or the host
+	-- handed over), decoded off the main thread: a promise of a `Bitmap` for
+	-- `ui.image`'s `src`.
+	decode_image: (base64: string) -> Promise<Bitmap>,
 	-- A WGSL fill: `fn fill(input: FillInput) -> vec4<f32>`, with input.p,
 	-- input.size, input.time, input.scale and input.params (four vec4s).
 	shader: (source: string, opts: { fps: number? }?) -> Shader,
@@ -22996,6 +24626,15 @@ declare ui: {
 	number: (n: number, opts: NumberOptions?) -> string,
 	path: () -> Path,
 	linear: (x1: number, y1: number, x2: number, y2: number, colors: { read [number]: Color }) -> Brush,
+	-- `draw` as a canvas would show it, as a PNG in base64, with no window:
+	-- `width * scale` by `height * scale` pixels, `x`, `y` at its top left.
+	-- (nil with `file`; a `RenderedFile` with `file` and `append`.)
+	render_canvas: (draw: (c: Canvas, w: number, h: number) -> (), opts: RenderCanvasOptions) -> Promise<any>,
+	-- Out from (`cx`, `cy`) to radius `r` (`ry` down, for an ellipse), the
+	-- last colour past it; `transform` ({ a, b, c, d, e, f }) maps it after.
+	radial: (cx: number, cy: number, r: number, colors: { read [number]: Color }, opts: GradientOptions?) -> Brush,
+	-- Round (`cx`, `cy`) clockwise, starting `angle` degrees clockwise from +x.
+	conic: (cx: number, cy: number, colors: { read [number]: Color }, opts: GradientOptions?) -> Brush,
 }
 
 ---------------------------------------------------------------------------
@@ -23704,6 +25343,215 @@ declare extern type Scope with
 end
 export type EaseMaker = (...number) -> AnimeEase
 
+--@if audio
+---------------------------------------------------------------------------
+-- Sound (`audio`, zgx-script's `audio` feature; docs/reference/audio.md).
+
+export type Curve = "linear" | "equal_power" | "exponential"
+-- Seconds, in straight steps, or along a curve.
+export type Fade = number | { seconds: number, curve: Curve? }
+
+-- `audio.sound`'s: decoded on a thread of its own.
+declare extern type Sound with
+	ready: ReadOnlyState<boolean>
+	-- Why it couldn't be loaded, or nil.
+	error: ReadOnlyState<string?>
+	-- Seconds, once ready (else 0).
+	duration: number
+	-- This sound for `sound =`, at its own level and pitch.
+	function with(self, opts: { gain: number?, pitch: number? }?): SoundWith
+end
+
+-- `sound:with { … }`'s: a sound for `sound =`, at a level and pitch.
+declare extern type SoundWith with
+end
+
+-- `audio.choose(f)`'s: for `sound =`, `f` called as its control is
+-- activated, answering the sound to play, or none.
+declare extern type SoundChoice with
+end
+
+export type SoundOptions = {
+	-- false: it loads at its first play.
+	preload: boolean?,
+}
+
+export type PlayOptions = {
+	-- A bus's name or the bus: `"world"` for `audio.play`, `"music"` for
+	-- `audio.music`.
+	bus: (string | Bus)?,
+	gain: Reactive<number>?,
+	-- -1 left to 1 right, as a balance.
+	pan: Reactive<number>?,
+	-- Speed and pitch together: 2 is an octave up.
+	pitch: Reactive<number>?,
+	-- A time on `audio.now()`'s clock: it starts on that exact frame.
+	at: number?,
+	loop: boolean?,
+	-- Seconds into the sound: an intro, then the loop between them.
+	loop_start: number?,
+	loop_end: number?,
+	-- Kept over lower priorities when 64 voices play.
+	priority: number?,
+	fade_in: Fade?,
+}
+
+declare extern type Voice with
+	-- True until it has ended or been stopped.
+	playing: ReadOnlyState<boolean>
+	-- Fades out and stops (5 ms if not given).
+	function stop(self, seconds: number?): ()
+	function fade(self, gain: number, seconds: number, curve: Curve?): ()
+	function gain(self, value: Reactive<number>): ()
+	function pan(self, value: Reactive<number>): ()
+	function pitch(self, value: Reactive<number>): ()
+	-- The same voice, for the next call to land on that frame.
+	function at(self, time: number): Voice
+	-- Fades this voice out (and stops it) and `to`, started silent, up to
+	-- `gain` (1), along equal-power curves over `seconds`.
+	function crossfade(self, to: Voice, seconds: number, gain: number?): ()
+end
+
+--@if audio-effects
+-- A stock effect described (`audio.low_pass { … }`), to put on a bus with
+-- `bus:add_effect`. Every parameter is a number, a state, a function or a
+-- binding, followed with no script per frame.
+declare extern type EffectSpec with
+end
+
+export type FilterOptions = {
+	-- Hz, 10 to 24000.
+	cutoff: Reactive<number>?,
+	-- Q, 0.1 to 20: 0.707 is flat.
+	resonance: Reactive<number>?,
+	-- dB an octave: 12 or 24.
+	slope: number?,
+}
+export type PeakingOptions = {
+	frequency: Reactive<number>?,
+	q: Reactive<number>?,
+	-- dB, -36 to 36.
+	gain: Reactive<number>?,
+}
+export type DelayOptions = {
+	-- Seconds, up to `longest`.
+	time: Reactive<number>?,
+	-- 0 to 0.98.
+	feedback: Reactive<number>?,
+	wet: Reactive<number>?,
+	dry: Reactive<number>?,
+	-- The longest time it will be given, in seconds (1, or `time` if
+	-- longer; 10 at most): what its line holds.
+	longest: number?,
+}
+export type ReverbOptions = {
+	-- 0.25 to 2.
+	size: Reactive<number>?,
+	-- Seconds to fall 60 dB, 0.1 to 20.
+	decay: Reactive<number>?,
+	-- 0 to 1: how much the highs fade first.
+	damping: Reactive<number>?,
+	-- Seconds, up to 0.25.
+	pre_delay: Reactive<number>?,
+	wet: Reactive<number>?,
+	dry: Reactive<number>?,
+}
+export type CompressorOptions = {
+	-- dB, -60 to 0.
+	threshold: Reactive<number>?,
+	ratio: Reactive<number>?,
+	-- Seconds.
+	attack: Reactive<number>?,
+	release: Reactive<number>?,
+	-- dB.
+	knee: Reactive<number>?,
+	makeup: Reactive<number>?,
+}
+export type DuckOptions = {
+	-- dB the bus goes down by, -60 to 0.
+	depth: Reactive<number>?,
+	-- dB the other bus's level must pass.
+	threshold: Reactive<number>?,
+	attack: Reactive<number>?,
+	release: Reactive<number>?,
+}
+
+-- An effect on a bus (`bus:add_effect`, `bus:duck`).
+declare extern type AudioEffect with
+	-- A parameter by its name: a number, or a state, function or binding
+	-- it follows.
+	function set(self, name: string, value: Reactive<number>): ()
+	function fade(self, name: string, value: number, seconds: number, curve: Curve?): ()
+	-- Takes it off its bus (its tail cut).
+	function remove(self): ()
+	function at(self, time: number): AudioEffect
+end
+
+--@end
+declare extern type Bus with
+	-- Read by the mixer each block, gliding over 10 ms: no message, even
+	-- for a binding.
+	function gain(self, value: Reactive<number>): ()
+	function fade(self, gain: number, seconds: number, curve: Curve?): ()
+	function mute(self, value: Reactive<boolean>): ()
+	function solo(self, value: Reactive<boolean>): ()
+	function at(self, time: number): Bus
+--@if audio-effects
+	-- After the bus's other effects, before its gain: 8 at most.
+	function add_effect(self, effect: EffectSpec): AudioEffect
+	-- Ducks this bus under `side` (music under dialogue).
+	function duck(self, side: Bus, opts: DuckOptions?): AudioEffect
+--@end
+end
+
+export type AudioStats = {
+	voices: number,
+	stolen: number,
+	dropped: number,
+	late: number,
+	dry: number,
+	streams: number,
+	underruns: number,
+	running: boolean,
+	starts: number,
+	stops: number,
+	peak: number,
+}
+
+-- `sound =` on a control: a sound, `sound:with`'s, `audio.choose`'s, or
+-- none. Extern types and false alone: a table or a function among them, in
+-- a property every element has, made props built a field at a time too
+-- complex for luau-lsp 1.70.1 to check.
+export type SoundProp = Sound | SoundWith | SoundChoice | false
+
+declare audio: {
+	sound: (src: string, opts: SoundOptions?) -> Sound,
+	music: (src: string, opts: PlayOptions?) -> Voice, --@audio-streams
+	play: (sound: Sound, opts: PlayOptions?) -> Voice,
+	-- For `sound =`: `f` chooses the sound as the control is activated.
+	choose: (f: () -> Sound | SoundWith | false | nil) -> SoundChoice,
+	-- A plugin's `audio.bus()` is its own bus, the only one it reaches.
+	bus: (name: string?) -> Bus?,
+	-- Under `master` unless `parent` says.
+	add_bus: (name: string, opts: { parent: string? }?) -> Bus,
+	-- The mixer's clock, in seconds: still while nothing plays.
+	now: () -> number,
+	prewarm: () -> (),
+	stats: () -> AudioStats,
+--@if audio-effects
+	low_pass: (opts: FilterOptions?) -> EffectSpec,
+	high_pass: (opts: FilterOptions?) -> EffectSpec,
+	-- A band of EQ.
+	peaking: (opts: PeakingOptions?) -> EffectSpec,
+	delay: (opts: DelayOptions?) -> EffectSpec,
+	reverb: (opts: ReverbOptions?) -> EffectSpec,
+	compressor: (opts: CompressorOptions?) -> EffectSpec,
+--@end
+	-- The user's interface-sound setting, which the `ui` bus follows.
+	ui_sounds_enabled: ReadOnlyState<boolean>,
+}
+
+--@end
 -- Besides elements, animations and utils target a state's or a plain
 -- table's fields: the script's own data, so `{ [string]: any }`.
 declare anime: {
