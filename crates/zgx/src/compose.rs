@@ -4515,8 +4515,13 @@ fn mount_portal_panel(
         .and_then(|r| r.portal.as_ref())
         .is_some_and(|p| p.layer || p.at_caret || p.keep_focus);
     if !anchored && !overlay_only {
-        // The theme's backdrop, following it.
-        let (scene, theme, overlay) = (ui.scene.clone(), ui.theme_scope(), portal.overlay);
+        // The theme's backdrop, following it. The panel mounts as it first
+        // opens, outside any mount scope: read the scope it was built in.
+        let (scene, theme, overlay) = (
+            ui.scene.clone(),
+            environment.theme.clone(),
+            portal.overlay,
+        );
         ui.bind(overlay, move || {
             let fill = theme.color(tok::BACKDROP);
             scene.borrow_mut().set_kind(

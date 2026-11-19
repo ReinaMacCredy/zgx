@@ -190,3 +190,37 @@ fn a_layer_paints_no_backdrop_and_lets_presses_through() {
     let (ui, _) = window(false);
     assert!(dims(&ui), "a modal dims the window");
 }
+
+/// A modal's backdrop is its scope's: under a scope that makes `backdrop`
+/// clear (a viewer that fades a dim of its own), it paints the clear fill,
+/// not the root theme's dim, which would stay up until the modal unmounts.
+#[test]
+fn a_modal_backdrop_follows_its_theme_scope() {
+    use zgx::scene::{Color, NodeKind};
+    use zgx::theme::{ThemeOverride, tok};
+    let clear = Color(0, 0, 0, 0);
+    let mut ui = Ui::new(400., 300.);
+    let open = ui.signal(false);
+    ui.mount(theme_scope(
+        ThemeOverride::new().with(tok::BACKDROP, clear),
+        modal("Viewer", open.clone()).child(div().size(80., 30.)),
+    ));
+    ui.prepare_frame();
+    open.set(true);
+    ui.prepare_frame();
+    let root_dim = ui.theme_scope().color(tok::BACKDROP);
+    assert_ne!(root_dim, clear);
+    let scene = ui.scene.borrow();
+    let mut stack = vec![scene.root()];
+    let mut fills = Vec::new();
+    while let Some(n) = stack.pop() {
+        if let NodeKind::Panel { quad, .. } = scene.kind(n) {
+            fills.push(quad.fill);
+        }
+        stack.extend(scene.children(n).iter().copied());
+    }
+    assert!(
+        !fills.contains(&root_dim),
+        "no root-theme dim over the window"
+    );
+}
