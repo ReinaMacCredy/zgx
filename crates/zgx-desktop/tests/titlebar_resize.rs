@@ -23,7 +23,7 @@ fn main() {
                 visible >= 500.,
                 "the screen's visible frame is {visible} tall: no room to grow a 400-point window"
             );
-            vec![(visible + 400.) / 2., visible, 300.]
+            vec![((visible + 400.) / 2.).round(), visible, 300.]
         });
         assert_eq!(readings.len(), 3, "no window (not the main thread?)");
         for resize in readings {
