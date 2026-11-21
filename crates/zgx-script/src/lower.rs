@@ -7561,15 +7561,7 @@ fn lerp(a: &Lit, b: &Lit, t: f32) -> Option<Lit> {
         (Lit::Num(x), Lit::Num(y)) => Lit::Num(mix(*x, *y)),
         (Lit::Len(Length::Px(x)), Lit::Len(Length::Px(y))) => Lit::Len(Length::Px(mix(*x, *y))),
         (Lit::Pair(x0, y0), Lit::Pair(x1, y1)) => Lit::Pair(mix(*x0, *x1), mix(*y0, *y1)),
-        (Lit::Color(c0), Lit::Color(c1)) => {
-            let ch = |x: u8, y: u8| mix(x as f32, y as f32).round().clamp(0., 255.) as u8;
-            Lit::Color(Color(
-                ch(c0.0, c1.0),
-                ch(c0.1, c1.1),
-                ch(c0.2, c1.2),
-                ch(c0.3, c1.3),
-            ))
-        }
+        (Lit::Color(c0), Lit::Color(c1)) => Lit::Color(zgx::theme::mix(*c0, *c1, t)),
         (_, other) if t >= 0.5 => other.clone(),
         (other, _) => other.clone(),
     })
@@ -10548,8 +10540,9 @@ fn region_copy(view: View, node: &Rc<Node>, vm: &Rc<Vm>, low: &Rc<Lowering>) -> 
 /// `on_copy` on a selectable region: handed `{ text, html, leaves }`, the
 /// selection's text and HTML and, for each text node it spans in order, the
 /// id of the element it is in (its own or the nearest around it, `false`
-/// for none), it returns `{ text, html }` for the clipboard (`text` the
-/// selection's where left out), or nil for the selection's own.
+/// for none), it returns `{ text, html, types }` for the clipboard (`text`
+/// the selection's where left out; `types` MIME types of the app's own and
+/// their text, `io::clipboard_types`), or nil for the selection's own.
 #[cold]
 #[inline(never)]
 fn on_selection_copy(
@@ -10595,9 +10588,16 @@ fn on_selection_copy(
             Ok(mlua::Value::Table(content)) => {
                 let text: Option<String> = content.get("text").unwrap_or(None);
                 let html: Option<String> = content.get("html").unwrap_or(None);
+                // Types of the app's own beside them; malformed, reported
+                // and left out.
+                let types = crate::io::clipboard_types(&content).unwrap_or_else(|error| {
+                    vm.report(error);
+                    Vec::new()
+                });
                 Some(zgx::widgets::ClipboardContent {
                     text: text.unwrap_or_else(|| request.text.to_owned()),
                     html,
+                    types,
                 })
             }
             Ok(_) => None,

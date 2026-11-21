@@ -185,8 +185,8 @@ fn ok(text: String, data: Value) -> String {
     ])
     .to_json()
 }
-/// `clipboard`: what the window's clipboard holds (its text, HTML, image
-/// and files), or with `action` `set`, put `text` and `html` there (either
+/// `clipboard`: what the window's clipboard holds (its text, HTML, image,
+/// files and types of an app's own: `Platform::clipboard_types`), or with `action` `set`, put `text` and `html` there (either
 /// alone; both as a rich copy), the picture at `image` (a file) or `files`
 /// (paths, as a file manager copies them; an app's own clipboard only). An
 /// off-screen session's is its own (`ZGX_CLIPBOARD=memory`), so a QA script
@@ -260,6 +260,9 @@ async fn clipboard(platform: Option<PlatformService>, request: &Value) -> String
     let files: Vec<String> = (platform.0.clipboard_files().iter())
         .map(|f| f.display().to_string())
         .collect();
+    let types: Vec<(String, String)> = (platform.0.clipboard_types().into_iter())
+        .filter_map(|kind| Some((kind.clone(), platform.0.clipboard_typed(&kind)?)))
+        .collect();
     let line = |name: &str, value: &Option<String>| match value {
         Some(value) => format!("{name}: {value:?}"),
         None => format!("{name}: none"),
@@ -273,6 +276,13 @@ async fn clipboard(platform: Option<PlatformService>, request: &Value) -> String
                 true => "files: none".to_string(),
                 false => format!("files: {files:?}"),
             },
+            match types.is_empty() {
+                true => "types: none".to_string(),
+                false => (types.iter())
+                    .map(|(kind, value)| format!("type {kind}: {value:?}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
         ]
         .join("\n"),
         Value::record([
@@ -282,6 +292,19 @@ async fn clipboard(platform: Option<PlatformService>, request: &Value) -> String
             (
                 "files",
                 Value::List(files.iter().map(|f| Value::from(f.as_str())).collect()),
+            ),
+            (
+                "types",
+                Value::List(
+                    (types.iter())
+                        .map(|(kind, value)| {
+                            Value::record([
+                                ("type", Value::from(kind.as_str())),
+                                ("value", Value::from(value.as_str())),
+                            ])
+                        })
+                        .collect(),
+                ),
             ),
         ]),
     )
@@ -795,7 +818,7 @@ const HELP: &str = "commands (one JSON object a line, `cmd` and its fields):
   type    target text                            click it, then type text
   key     keys                                   e.g. \"Enter\", \"cmd+k\", \"alt+ArrowDown\"; \"hold ctrl\"
                                                  and \"release\" hold modifiers until let go
-  scroll  target dy [dx]                         scroll the viewport under it
+  scroll  target|x,y dy [dx]                     scroll the viewport under it
   snapshot target [width=4096]                   its pixels as the window last drew them: a PNG, user-only
   record  [stop]                                 record the window's wheel input; stop answers the tape
   replay  target tape [repeat=1] [every]         play a tape back through the window's input path: its
@@ -805,9 +828,15 @@ const HELP: &str = "commands (one JSON object a line, `cmd` and its fields):
   contributions                                  each plugin's targets: where, live matches, error
   elements                                       named elements by the context they read (provide)
   lint                                           zgx lint over the app's scripts, file:line
-  frames  [n=10] [runs=5] [all] [since] [keep]   the last frames that did anything: their phases, GPU
-                                                 time, notes, what ran and why (since: a mark or frame)
+  frames  [n=10] [runs=5] [all] [since] [until] [summary] [keep]
+                                                 the last frames that did anything: their phases, GPU
+                                                 time, notes, what ran and why (since, until: a mark or
+                                                 frame; summary: what they cost together)
+  reloads                                        each hot reload: files, partial or full, and why
   mark    [name=mark]                            mark now: `frames since=name` reads what follows
+  clock   [freeze|thaw|advance <ms>]             freeze every animation, timer and caret at one time (also ZGX_FREEZE_TIME=1 at launch), move it by hand, or let it run
+  gc      [top] [retained] [sample=5] [mark] [since_mark] [lua_only]
+                                                 a full Luau collection in each VM: heap before and after, what is left by type, userdata and code chunk; retained=State: what holds those objects, from a root; mark, then since_mark: what survives after it
   switch  [name] [on]                            list fast paths, or switch one on or off, to compare
   search  [query] [next] [prev] [all] [n=5] [close]  find in page: the count, the current match, the first n
   zoom    [to: in|out|reset|1.5|150%]            the window's zoom (Cmd/Ctrl +, -, 0) and its viewport in points
@@ -965,6 +994,133 @@ impl Session {
                 );
                 Ok((driver::tree_lines_text(&shown, hidden), data))
             })(),
+            "gc" => {
+                let top = number("top").map_or(10, |n| n.max(1.) as usize);
+                let flag = |key: &str| field(key).is_some_and(|v| v.truthy());
+                let query = crate::GcQuery {
+                    top,
+                    retained: text("retained"),
+                    sample: number("sample").map_or(5, |n| n.max(1.) as usize),
+                    mark: flag("mark"),
+                    lua_only: flag("lua_only"),
+                    since_mark: flag("since_mark"),
+                };
+                let report = self.0.host.gc_report(&query);
+                let mb = |bytes: usize| format!("{:.2} MB", bytes as f64 / 1_048_576.);
+                let kb = |bytes: u64| format!("{:.1} KB", bytes as f64 / 1024.);
+                let mut lines = Vec::new();
+                let mut vms = Vec::new();
+                for vm in &report {
+                    lines.push(format!(
+                        "{}: {} before, {} after a full collection ({} of garbage)",
+                        vm.name,
+                        mb(vm.before),
+                        mb(vm.after),
+                        mb(vm.before.saturating_sub(vm.after))
+                    ));
+                    lines.push("  by type:".to_string());
+                    for (name, count, bytes) in vm.by_type.iter().take(top) {
+                        lines.push(format!("    {name}: {count} objects, {}", kb(*bytes)));
+                    }
+                    if !vm.userdata.is_empty() {
+                        lines.push("  userdata:".to_string());
+                        for (name, count, bytes) in vm.userdata.iter().take(top) {
+                            lines.push(format!("    {name}: {count}, {}", kb(*bytes)));
+                        }
+                    }
+                    lines.push("  code by chunk:".to_string());
+                    for (name, count, bytes) in vm.chunks.iter().take(top) {
+                        lines.push(format!("    {name}: {count} functions, {}", kb(*bytes)));
+                    }
+                    let found = &vm.found;
+                    if let Some(count) = found.marked {
+                        lines.push(format!("  marked {count} objects"));
+                    }
+                    if found.no_mark {
+                        lines.push("  no mark: run `gc --mark` first".to_string());
+                    }
+                    if !found.since.is_empty() {
+                        lines.push("  survived since the mark:".to_string());
+                        for (name, count, bytes) in found.since.iter().take(top) {
+                            lines.push(format!("    {name}: {count}, {}", kb(*bytes)));
+                        }
+                    }
+                    if query.retained.is_some() {
+                        lines.push(format!(
+                            "  {} objects match, {} reachable without Rust's handles; held by:",
+                            found.matched, found.lua_reachable
+                        ));
+                        for holder in &found.holders {
+                            lines.push(format!("    {} ×", holder.count));
+                            for step in &holder.path {
+                                lines.push(format!("      {step}"));
+                            }
+                        }
+                    }
+                    let list = |items: &[(String, usize, u64)]| {
+                        Value::List(
+                            items
+                                .iter()
+                                .take(top)
+                                .map(|(name, count, bytes)| {
+                                    Value::record([
+                                        ("name", Value::from(name.as_str())),
+                                        ("count", Value::Num(*count as f64)),
+                                        ("bytes", Value::Num(*bytes as f64)),
+                                    ])
+                                })
+                                .collect::<Vec<_>>()
+                                .into(),
+                        )
+                    };
+                    vms.push(Value::record([
+                        ("name", Value::from(vm.name.as_str())),
+                        ("before", Value::Num(vm.before as f64)),
+                        ("after", Value::Num(vm.after as f64)),
+                        ("by_type", list(&vm.by_type)),
+                        ("userdata", list(&vm.userdata)),
+                        ("chunks", list(&vm.chunks)),
+                        (
+                            "marked",
+                            vm.found.marked.map_or(Value::Nil, |n| Value::Num(n as f64)),
+                        ),
+                        ("since", list(&vm.found.since)),
+                        ("matched", Value::Num(vm.found.matched as f64)),
+                        (
+                            "holders",
+                            Value::List(
+                                vm.found
+                                    .holders
+                                    .iter()
+                                    .map(|h| {
+                                        Value::record([
+                                            ("count", Value::Num(h.count as f64)),
+                                            (
+                                                "path",
+                                                Value::List(
+                                                    h.path
+                                                        .iter()
+                                                        .map(|s| Value::from(s.as_str()))
+                                                        .collect::<Vec<_>>()
+                                                        .into(),
+                                                ),
+                                            ),
+                                        ])
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into(),
+                            ),
+                        ),
+                    ]));
+                }
+                if report.is_empty() {
+                    lines.push("no script is loaded".to_string());
+                }
+                Ok((
+                    lines.join("\n"),
+                    Value::record([("vms", Value::List(vms.into()))]),
+                ))
+            }
             "node" => target(&ui).map(|node| {
                 let fields = driver::node(&ui, self.0.inspector.as_ref(), node);
                 let text = fields
@@ -1287,16 +1443,18 @@ impl Session {
                     ]),
                 ))
             })(),
-            "scroll" => (|| {
-                let node = reachable(&ui)?;
-                driver::scroll_across(
-                    &mut ui,
-                    node,
-                    number("dx").unwrap_or(0.) as f32,
-                    number("dy").unwrap_or(100.) as f32,
-                );
-                Ok((format!("scrolled @{}", driver::number(node)), Value::Nil))
-            })(),
+            "scroll" => point_of(&ui, "target").map(|(x, y)| {
+                // Any target `click` and `hover` take, or a point; a trackpad's sideways motion with `dx`.
+                let delta_y = number("dy").unwrap_or(100.) as f32;
+                let delta_x = number("dx").unwrap_or(0.) as f32;
+                ui.dispatch(zgx::input::InputEvent::Scroll {
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                });
+                (format!("scrolled at {x:.0},{y:.0}"), Value::Nil)
+            }),
             "command" => (|| {
                 let id = text("id").ok_or("command takes an `id`")?;
                 if self.0.host.run_command(&id) {
@@ -1597,6 +1755,39 @@ impl Session {
                     ]),
                 ))
             }
+            "clock" => (|| {
+                let action = text("action").unwrap_or_default();
+                match action.as_str() {
+                    "" | "state" => {}
+                    "freeze" => zgx::clock::freeze(),
+                    "thaw" => zgx::clock::thaw(),
+                    "advance" => {
+                        let ms = number("ms").ok_or("`clock advance` takes `ms`")?;
+                        let by = std::time::Duration::from_secs_f64(ms.max(0.) / 1000.);
+                        if !zgx::clock::advance_frozen(by, || {}) {
+                            return Err("the clock isn't frozen (`clock freeze` first)".into());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "`clock` takes freeze, thaw, advance <ms> or nothing, not `{other}`"
+                        ));
+                    }
+                }
+                let elapsed = zgx::clock::frozen_elapsed();
+                let text = match elapsed {
+                    Some(elapsed) => format!("frozen, {} ms in", elapsed.as_millis()),
+                    None => "running".to_string(),
+                };
+                let data = Value::record([
+                    ("frozen", Value::Bool(elapsed.is_some())),
+                    (
+                        "elapsed_ms",
+                        elapsed.map_or(Value::Nil, |e| Value::Num(e.as_secs_f64() * 1000.)),
+                    ),
+                ]);
+                Ok((text, data))
+            })(),
             "switch" => (|| {
                 let set = match field("on") {
                     None => None,
@@ -1806,16 +1997,39 @@ impl Session {
         })
     }
 
-    /// This window's size, and its popups open (`windows`).
-    fn about(&self) -> Option<(zgx::scene::Rect, Vec<String>)> {
+    /// This window's size, and its popups wanted open (`windows`), each as
+    /// text and as a record: what it is, its role, whether it shows or is
+    /// held back (the app at the back), and its box.
+    fn about(&self) -> Option<(zgx::scene::Rect, Vec<Panel>)> {
         let ui = self.0.ui.upgrade()?;
         let scene = ui.scene.borrow();
         let size = scene.bounds(scene.root());
-        let popups = scene.popups().to_vec();
+        let roots = scene.wanted_popups().to_vec();
+        let panels: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                let role = scene.popup_role(*root).map_or("popup", |role| match role {
+                    zgx::scene::PopupRole::Menu => "menu",
+                    zgx::scene::PopupRole::Popover => "popover",
+                    zgx::scene::PopupRole::Tooltip => "tooltip",
+                });
+                (
+                    *root,
+                    role,
+                    scene.in_held_popup(*root),
+                    scene.popup_bounds(*root),
+                )
+            })
+            .collect();
         drop(scene);
-        let popups = popups
+        let popups = panels
             .into_iter()
-            .map(|popup| driver::describe(&ui, popup))
+            .map(|(root, role, held, bounds)| Panel {
+                what: driver::describe(&ui, root),
+                role,
+                held,
+                bounds,
+            })
             .collect();
         Some((size, popups))
     }
@@ -2416,6 +2630,15 @@ fn window_session(name: &str) -> Result<Session, String> {
         }
     })
 }
+/// A popup panel as `windows` lists it: its window shows it in a panel of its
+/// own where the host has them (macOS, Windows, X11), or in the window.
+struct Panel {
+    what: String,
+    role: &'static str,
+    /// Held back: wanted open, not shown nor hit, the app being at the back.
+    held: bool,
+    bounds: Option<zgx::scene::Rect>,
+}
 /// `windows`: the main window and the app's others, each with its size and
 /// its popups open (menus, popovers past the window: targets inside reach
 /// them, as the window's own nodes).
@@ -2433,9 +2656,32 @@ fn windows(main: &Session) -> (String, Value) {
             line.push_str(&format!("  \"{title}\""));
         }
         for popup in &popups {
-            line.push_str(&format!("\n  popup {popup}"));
+            line.push_str(&format!(
+                "\n  popup {}  {}  {}  owner {id}",
+                popup.what,
+                popup.role,
+                if popup.held { "held" } else { "shown" },
+            ));
         }
         lines.push(line);
+        let panels = popups.iter().map(|popup| {
+            let mut fields = vec![
+                ("what", Value::from(popup.what.as_str())),
+                ("role", Value::from(popup.role)),
+                ("owner", Value::from(id.as_str())),
+                ("shown", Value::Bool(!popup.held)),
+                ("held", Value::Bool(popup.held)),
+            ];
+            if let Some(b) = popup.bounds {
+                fields.extend([
+                    ("x", Value::Num(b.x.round() as f64)),
+                    ("y", Value::Num(b.y.round() as f64)),
+                    ("width", Value::Num(b.width.round() as f64)),
+                    ("height", Value::Num(b.height.round() as f64)),
+                ]);
+            }
+            Value::record(fields)
+        });
         data.push(Value::record([
             ("id", Value::from(id.as_str())),
             ("title", Value::from(title.as_str())),
@@ -2443,16 +2689,29 @@ fn windows(main: &Session) -> (String, Value) {
             ("height", Value::Num(size.height.round() as f64)),
             (
                 "popups",
-                Value::List(popups.iter().map(|p| Value::from(p.as_str())).collect()),
+                Value::List(
+                    popups
+                        .iter()
+                        .map(|p| Value::from(p.what.as_str()))
+                        .collect(),
+                ),
             ),
+            ("panels", Value::List(panels.collect::<Vec<_>>().into())),
         ]));
     }
     (lines.join("\n"), Value::List(data.into()))
 }
 
-/// A socket answering a session: it serves while this lives.
+/// A socket answering a session: it serves while this lives. Dropped, it
+/// stops listening and takes its files away together, so `zgx inspect
+/// list` names no app it can't reach.
 pub struct Server {
     path: PathBuf,
+    /// Its files (the socket and the file naming the app; on Windows the
+    /// one file naming its port and token) as it made them: it removes
+    /// each only while it still is, never another server's at the path.
+    files: Vec<(PathBuf, Mark)>,
+    listening: Option<Listening>,
 }
 impl Server {
     /// Where it listens (a socket, or on Windows the file naming its port
@@ -2463,8 +2722,81 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(listening) = self.listening.take() {
+            listening.stop();
+        }
+        for (path, mark) in &self.files {
+            if Mark::of(path).as_ref() == Some(mark) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
+}
+
+/// A file as a server made it: its device and inode (Unix), or its text
+/// (elsewhere: the port and token written in it).
+#[derive(PartialEq)]
+enum Mark {
+    #[cfg(unix)]
+    Node(u64, u64),
+    #[cfg(not(unix))]
+    Text(String),
+}
+impl Mark {
+    /// What the file at `path` is now.
+    fn of(path: &std::path::Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::symlink_metadata(path).ok()?;
+            Some(Mark::Node(meta.dev(), meta.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read_to_string(path).ok().map(Mark::Text)
+        }
+    }
+}
+
+/// A server's accepting thread, and what stops it.
+struct Listening {
+    thread: std::thread::JoinHandle<()>,
+    /// Unix: the end of a pair the thread polls beside the socket; closed,
+    /// it wakes and ends. Windows: the port it accepts on, connected to
+    /// once to wake it after `stopped` is set.
+    #[cfg(unix)]
+    wake: std::os::unix::net::UnixStream,
+    #[cfg(not(unix))]
+    port: u16,
+    #[cfg(not(unix))]
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Listening {
+    /// Stop accepting, the listener closed once this returns.
+    fn stop(self) {
+        #[cfg(unix)]
+        drop(self.wake);
+        #[cfg(not(unix))]
+        {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        }
+        let _ = self.thread.join();
+    }
+}
+
+/// Write `text` to `path` as a new file (a new inode, so the server that
+/// wrote it knows it as its own), readable only by this user.
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let fresh = path.with_extension("json.new");
+    std::fs::write(&fresh, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&fresh, path)
 }
 
 /// Before the view mounts, for a host about to serve devtools: what it
@@ -2491,7 +2823,7 @@ pub fn serve(
     make_private_dir(&dir)?;
     let pid = std::process::id();
     let queue = Queue::default();
-    let path = listen(&dir, pid, about, queue.clone())?;
+    let (path, files, listening) = listen(&dir, pid, about, queue.clone())?;
     spawn(Box::pin(async move {
         loop {
             let (request, reply) = queue.next().await;
@@ -2502,7 +2834,11 @@ pub fn serve(
             let _ = reply.send(answer);
         }
     }));
-    Ok(Server { path })
+    Ok(Server {
+        path,
+        files,
+        listening: Some(listening),
+    })
 }
 
 #[cfg(unix)]
@@ -2574,34 +2910,79 @@ fn connection(stream: impl std::io::Read + Write, queue: Queue, token: Option<St
     }
 }
 
+/// What `listen` made: where it listens, its files, and its thread.
+type Listen = (PathBuf, Vec<(PathBuf, Mark)>, Listening);
+
 #[cfg(unix)]
-fn listen(dir: &std::path::Path, pid: u32, about: &str, queue: Queue) -> std::io::Result<PathBuf> {
-    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+fn listen(dir: &std::path::Path, pid: u32, about: &str, queue: Queue) -> std::io::Result<Listen> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        },
+    };
     let path = crate::inspect_client::socket_path(dir, pid)?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let about_path = dir.join(format!("{pid}.json"));
-    std::fs::write(
+    write_private(
         &about_path,
-        Value::record([("pid", Value::Num(pid as f64)), ("app", Value::from(about))]).to_json(),
+        &Value::record([("pid", Value::Num(pid as f64)), ("app", Value::from(about))]).to_json(),
     )?;
-    std::fs::set_permissions(&about_path, std::fs::Permissions::from_mode(0o600))?;
-    std::thread::Builder::new()
+    let files = [path.clone(), about_path]
+        .into_iter()
+        .filter_map(|file| Mark::of(&file).map(|mark| (file, mark)))
+        .collect();
+    // The thread waits on the socket and on `woken`, which the server's
+    // other end closing (`Listening::stop`) makes readable.
+    let (wake, woken) = UnixStream::pair()?;
+    listener.set_nonblocking(true)?;
+    let thread = std::thread::Builder::new()
         .name("zgx-inspect".into())
         .spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let queue = queue.clone();
-                let _ = std::thread::Builder::new()
-                    .name("zgx-inspect-client".into())
-                    .spawn(move || connection(stream, queue, None));
+            let mut fds = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: woken.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            loop {
+                // SAFETY: two pollfds, both of descriptors this thread owns.
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                if fds[1].revents != 0 {
+                    return;
+                }
+                while let Ok((stream, _)) = listener.accept() {
+                    // Its requests block on their answers.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
+                    let queue = queue.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("zgx-inspect-client".into())
+                        .spawn(move || connection(stream, queue, None));
+                }
             }
         })?;
-    Ok(path)
+    Ok((path, files, Listening { thread, wake }))
 }
 
 #[cfg(not(unix))]
-fn listen(dir: &std::path::Path, pid: u32, about: &str, queue: Queue) -> std::io::Result<PathBuf> {
+fn listen(dir: &std::path::Path, pid: u32, about: &str, queue: Queue) -> std::io::Result<Listen> {
     use std::net::TcpListener;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -2618,9 +2999,9 @@ fn listen(dir: &std::path::Path, pid: u32, about: &str, queue: Queue) -> std::io
             )
     });
     let path = dir.join(format!("{pid}.json"));
-    std::fs::write(
+    write_private(
         &path,
-        Value::record([
+        &Value::record([
             ("pid", Value::Num(pid as f64)),
             ("app", Value::from(about)),
             ("port", Value::Num(port as f64)),
@@ -2628,15 +3009,33 @@ fn listen(dir: &std::path::Path, pid: u32, about: &str, queue: Queue) -> std::io
         ])
         .to_json(),
     )?;
-    std::thread::Builder::new()
+    let files = Mark::of(&path)
+        .map(|mark| (path.clone(), mark))
+        .into_iter()
+        .collect();
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = stopped.clone();
+    let thread = std::thread::Builder::new()
         .name("zgx-inspect".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
+                // Woken to stop (`Listening::stop`): the listener closes.
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 let (queue, token) = (queue.clone(), token.clone());
                 let _ = std::thread::Builder::new()
                     .name("zgx-inspect-client".into())
                     .spawn(move || connection(stream, queue, Some(token)));
             }
         })?;
-    Ok(path)
+    Ok((
+        path,
+        files,
+        Listening {
+            thread,
+            port,
+            stopped,
+        },
+    ))
 }

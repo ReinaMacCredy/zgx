@@ -506,7 +506,7 @@ impl Clip {
         let now = Instant::now();
         if now < from
             || OFFERED.get().is_some_and(|at| now < at + OFFER_APART)
-            || !zgx::switches::BAKED_LOOPS.on()
+            || !zgx::switches::baked_loops()
             || !self.can_bake()
         {
             return;
