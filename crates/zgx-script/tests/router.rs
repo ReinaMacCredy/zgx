@@ -376,7 +376,11 @@ fn a_history_set_goes_nowhere_and_says_how_it_last_moved() {
     h.click("drop-1");
     assert_eq!(h.text("result"), "forward /thread/2 true false");
     h.click("back");
-    assert_eq!(h.text("result"), "back / false true", "past the place left out");
+    assert_eq!(
+        h.text("result"),
+        "back / false true",
+        "past the place left out"
+    );
     h.click("forward");
     assert_eq!(h.text("result"), "forward /thread/2 true false");
     h.click("only");

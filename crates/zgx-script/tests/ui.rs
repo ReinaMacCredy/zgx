@@ -1409,8 +1409,9 @@ fn a_text_area_draws_its_chips_behind_the_text_and_follows_them() {
         let (mut fills, mut icons) = (Vec::new(), Vec::new());
         while let Some(n) = stack.pop() {
             match scene.kind(n) {
-                NodeKind::Quad(q) if q.fill == zgx::scene::Color(255, 0, 16, 255)
-                    || q.fill == zgx::scene::Color(0, 255, 16, 255) =>
+                NodeKind::Quad(q)
+                    if q.fill == zgx::scene::Color(255, 0, 16, 255)
+                        || q.fill == zgx::scene::Color(0, 255, 16, 255) =>
                 {
                     fills.push((q.radius, scene.bounds(n)));
                 }
@@ -1426,7 +1427,11 @@ fn a_text_area_draws_its_chips_behind_the_text_and_follows_them() {
     assert_eq!(icons.len(), 1, "its icon at its start");
     let (radius, fill) = fills[0];
     assert_eq!(radius, 5.);
-    assert_eq!((icons[0].x - fill.x, icons[0].width), (2., 10.), "the icon in from the start");
+    assert_eq!(
+        (icons[0].x - fill.x, icons[0].width),
+        (2., 10.),
+        "the icon in from the start"
+    );
     assert!(
         (icons[0].y + 5. - (fill.y + fill.height / 2.)).abs() < 0.01,
         "centred on the row"

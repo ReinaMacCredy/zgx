@@ -1623,28 +1623,31 @@ impl UserData for ElementUd {
         // showing it, replaced on each call; nil if it is not laid out, or
         // the host takes none. Native views in it show as what is under them.
         // `name`: keep several, each replaced only by its own.
-        methods.add_method("snapshot", |lua, e, (max_width, name): (Option<u32>, Option<String>)| {
-            let Some(handle) = e.0.handle.get() else {
-                return Ok(None);
-            };
-            let Some(image) = handle.snapshot(max_width.unwrap_or(480)) else {
-                return Ok(None);
-            };
-            let env = crate::node::env(lua)?;
-            let name = format!(
-                "zgx.element:{:x}:{}",
-                Rc::as_ptr(&e.0) as usize,
-                name.unwrap_or_default()
-            );
-            // Kept while its node is: a picture of what is gone goes too.
-            if !env.assets.is_hosted(&name) {
-                handle.retain(crate::lower::HostedPicture(
-                    Rc::downgrade(&env.assets),
-                    name.clone(),
-                ));
-            }
-            Ok(Some(env.host_image(&name, image)))
-        });
+        methods.add_method(
+            "snapshot",
+            |lua, e, (max_width, name): (Option<u32>, Option<String>)| {
+                let Some(handle) = e.0.handle.get() else {
+                    return Ok(None);
+                };
+                let Some(image) = handle.snapshot(max_width.unwrap_or(480)) else {
+                    return Ok(None);
+                };
+                let env = crate::node::env(lua)?;
+                let name = format!(
+                    "zgx.element:{:x}:{}",
+                    Rc::as_ptr(&e.0) as usize,
+                    name.unwrap_or_default()
+                );
+                // Kept while its node is: a picture of what is gone goes too.
+                if !env.assets.is_hosted(&name) {
+                    handle.retain(crate::lower::HostedPicture(
+                        Rc::downgrade(&env.assets),
+                        name.clone(),
+                    ));
+                }
+                Ok(Some(env.host_image(&name, image)))
+            },
+        );
         methods.add_method("covered", |_, e, ()| {
             Ok(e.0.handle.get().is_some_and(|handle| handle.covered()))
         });

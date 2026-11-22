@@ -847,7 +847,10 @@ fn editing_an_image_file_reloads_it() {
     );
     assert!(!h.host.reload_if_changed(), "and seen once");
     std::fs::remove_file(&icon).unwrap();
-    assert!(!h.host.reload_if_changed(), "a file gone leaves what was read");
+    assert!(
+        !h.host.reload_if_changed(),
+        "a file gone leaves what was read"
+    );
     assert!(std::sync::Arc::ptr_eq(&blue, &svg(&mut h)));
     rewrite(&icon, &square("green"));
     assert!(h.host.reload_if_changed(), "and one come back is seen");
