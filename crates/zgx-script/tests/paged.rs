@@ -159,9 +159,27 @@ fn a_list_asks_for_pages_until_it_fills_or_none_are_left() {
 fn a_debounced_state_follows_once_it_settles() {
     let mut h = Harness::new(|runtime| host(runtime, APP));
     h.click("type");
-    h.ui.prepare_frame();
+    h.frames(1);
     assert_eq!(h.text("settled"), "", "not yet: the wait is still on");
-    wait_for(&mut h, "settled", "hey");
+    h.frames(1);
+    assert_eq!(h.text("settled"), "hey", "30 ms on, two frames");
+}
+
+/// The wait is the test's time, as `ui.after`'s is: however long the machine
+/// takes over a step, it rests in the frame its time falls in.
+#[test]
+fn a_debounced_state_rests_on_the_tests_time() {
+    let mut h = Harness::new(|runtime| host(runtime, APP));
+    h.click("type");
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(60) {
+        h.settle();
+        h.ui.prepare_frame();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(h.text("settled"), "", "no frame came: no time has passed");
+    h.frames(2);
+    assert_eq!(h.text("settled"), "hey");
 }
 
 /// Two states following one that's changed and changed back before it
@@ -196,11 +214,13 @@ fn every_rest_is_told_even_of_the_value_it_held() {
     h.ui.prepare_frame();
     assert_eq!(h.text("told"), "1 1", "each read once, as it's made");
     h.click("away");
-    wait_for(&mut h, "told", "2 1");
+    h.frames(2);
+    assert_eq!(h.text("told"), "2 1");
     // Away and back again: told again; the plain one, back where it was,
     // never.
     h.click("away");
-    wait_for(&mut h, "told", "3 1");
+    h.frames(2);
+    assert_eq!(h.text("told"), "3 1");
     h.frames(5);
     assert_eq!(h.text("told"), "3 1");
 }
@@ -212,17 +232,13 @@ fn a_wait_runs_no_script_until_it_rests() {
     h.click("away");
     h.settle();
     h.ui.prepare_frame();
-    // Frames while it waits (well short of 30 ms): no script runs.
+    // A frame while it waits (short of 30 ms): no script runs.
     let calls = h.host.script_calls();
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(10) {
-        h.settle();
-        h.ui.prepare_frame();
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    h.frames(1);
     assert_eq!(h.host.script_calls(), calls, "nothing ran while it waited");
     assert_eq!(h.text("told"), "1 1");
-    wait_for(&mut h, "told", "2 1");
+    h.frames(1);
+    assert_eq!(h.text("told"), "2 1");
 }
 
 #[test]

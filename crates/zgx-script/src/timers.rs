@@ -77,6 +77,19 @@ impl Timers {
             None => self.pending.borrow_mut().push(Box::pin(task)),
         }
     }
+    /// `period` of the time timers keep: the test's under [`crate::testing`]
+    /// (`ui.debounced` rests as its frames pass, however late the machine's
+    /// own timers run), else zgx's clock.
+    pub(crate) fn sleep(&self, period: Duration) -> impl Future<Output = ()> + 'static {
+        let clocks = self.clocks.clone();
+        async move {
+            let test = clocks.test.borrow().clone();
+            match &test {
+                Some(test) => test.sleep(period).await,
+                None => zgx::timer::sleep(period).await,
+            }
+        }
+    }
     /// Call `fire` after `period`, then every `period` while `repeat`, until
     /// the returned guard drops or `fire` says stop (returns false).
     pub fn start(
