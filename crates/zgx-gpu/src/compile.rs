@@ -6,7 +6,7 @@
 //! with Metal's shader cache warm, 360 ms the first time after a build: a
 //! frame waiting for it froze the window that long.
 
-use std::sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicU64, atomic::Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// What a compile makes, once it has: `get` is `None` until then.
 pub(crate) type Slot<T> = Arc<OnceLock<T>>;
@@ -93,38 +93,48 @@ impl<T> Compiled<T> {
     }
 }
 
-/// Fill shaders a script declared (`ui.shader`), for each renderer to start
-/// compiling before anything draws them.
-static DECLARED: Mutex<Vec<Weak<zgx::decoration::FillShader>>> = Mutex::new(Vec::new());
-/// How many `DECLARED` has had: a renderer that has seen as many has
-/// nothing new to start.
-static DECLARED_COUNT: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Fill shaders a script on this thread declared (`ui.shader`), for each
+    /// of the thread's renderers to start compiling before anything draws
+    /// them. A thread's own, as the script's shaders are (its `ui.shader`
+    /// cache) and a renderer is: an app on another thread (each test of a
+    /// test binary) draws with renderers of its own, and a renderer that
+    /// compiled every thread's fills made hundreds of pipelines it never
+    /// drew, which a small GPU ran out of memory for.
+    static DECLARED: std::cell::RefCell<Vec<Weak<zgx::decoration::FillShader>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// How many `DECLARED` has had: a renderer that has seen as many has
+    /// nothing new to start.
+    static DECLARED_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
-/// Start compiling `shader`'s fill in every renderer, as it is declared,
-/// so the frame that first draws it finds it compiled: a status ring shown
-/// the moment work starts appears with it, not a frame that froze for its
-/// compile. Renderer plumbing for the script host.
+/// Start compiling `shader`'s fill in every renderer of this thread, as it
+/// is declared, so the frame that first draws it finds it compiled: a status
+/// ring shown the moment work starts appears with it, not a frame that froze
+/// for its compile. Renderer plumbing for the script host.
 pub fn warm_fill_shader(shader: &Arc<zgx::decoration::FillShader>) {
-    let mut declared = DECLARED.lock().unwrap_or_else(|p| p.into_inner());
-    declared.retain(|shader| shader.strong_count() > 0);
-    declared.push(Arc::downgrade(shader));
-    DECLARED_COUNT.fetch_add(1, Ordering::Release);
+    DECLARED.with_borrow_mut(|declared| {
+        declared.retain(|shader| shader.strong_count() > 0);
+        declared.push(Arc::downgrade(shader));
+    });
+    DECLARED_COUNT.set(DECLARED_COUNT.get() + 1);
 }
 
 /// Whether `shader` is one declared (`warm_fill_shader`) and still held.
 #[cfg(test)]
 pub(crate) fn is_declared(shader: &Arc<zgx::decoration::FillShader>) -> bool {
-    let declared = DECLARED.lock().unwrap_or_else(|p| p.into_inner());
-    declared.iter().any(|held| {
-        held.upgrade()
-            .is_some_and(|held| Arc::ptr_eq(&held, shader))
+    DECLARED.with_borrow(|declared| {
+        declared.iter().any(|held| {
+            held.upgrade()
+                .is_some_and(|held| Arc::ptr_eq(&held, shader))
+        })
     })
 }
 
 /// How many fill shaders scripts have declared (`declared_since`).
 #[inline]
 pub(crate) fn declared() -> u64 {
-    DECLARED_COUNT.load(Ordering::Acquire)
+    DECLARED_COUNT.get()
 }
 
 /// The fill shaders declared, if more were since `seen` (updated).
@@ -134,6 +144,5 @@ pub(crate) fn declared_since(seen: &mut u64) -> Option<Vec<Arc<zgx::decoration::
         return None;
     }
     *seen = count;
-    let declared = DECLARED.lock().unwrap_or_else(|p| p.into_inner());
-    Some(declared.iter().filter_map(Weak::upgrade).collect())
+    Some(DECLARED.with_borrow(|declared| declared.iter().filter_map(Weak::upgrade).collect()))
 }
