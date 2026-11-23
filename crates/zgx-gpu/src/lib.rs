@@ -23384,6 +23384,28 @@ mod shader_compile_tests {
         assert!(!gpu.fill_pipelines.contains_key(&shader.id()));
     }
 
+    /// Nor is a layer shader declared on another thread
+    /// (`declare_layer_shader`): each frame beside tests run in parallel
+    /// compiled theirs, over a thousand pipelines in one renderer.
+    #[test]
+    fn a_layer_shader_declared_on_another_thread_is_not_compiled_here() {
+        let (mut gpu, mut scene) = renderer();
+        let layer = || {
+            FillShader::new(
+                "fn layer(input: LayerInput) -> vec4<f32> { return input.color; }",
+                None,
+            )
+        };
+        let (here, there) = (layer(), layer());
+        zgx::decoration::declare_layer_shader(&here);
+        std::thread::scope(|scope| {
+            scope.spawn(|| zgx::decoration::declare_layer_shader(&there));
+        });
+        frame(&mut gpu, &mut scene);
+        assert!(gpu.filter_pipelines.contains_key(&here.id()));
+        assert!(!gpu.filter_pipelines.contains_key(&there.id()));
+    }
+
     /// Offscreen, where frames wait for their shaders anyway, a fill
     /// compiles on the renderer's own thread: compiled as it is started,
     /// with no second thread allocating beside the frame (which made the
