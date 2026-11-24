@@ -3874,11 +3874,15 @@ fn kind_view(
             label,
             open,
             trigger,
+            placement,
         } => {
-            let view = submenu(
+            let mut view = submenu(
                 label.clone(),
                 bridge(need(&mut cx), open, Value::truthy, Value::Bool),
             );
+            if let Some(at) = placement {
+                view = view.placement(*at);
+            }
             match trigger {
                 // A menu item is the row; anything else goes in one.
                 Some(node) if matches!(node.kind, Kind::MenuItem(..)) => {
@@ -7286,6 +7290,9 @@ fn atom_style_of(
             },
             size: icon.size,
             gap: icon.gap,
+            bg: icon.bg.as_ref().and_then(color),
+            radius: icon.radius,
+            pad: icon.pad,
         }
     });
     zgx::widgets::AtomStyle {
@@ -7308,6 +7315,8 @@ fn atom_style_of(
                 height: *height,
                 descent: *descent,
             }),
+        padding: look.padding,
+        radius: look.radius,
     }
 }
 /// An atom as a script reads it (`{ id, from, to, data?, style? }`,
