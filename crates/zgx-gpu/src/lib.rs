@@ -5164,7 +5164,8 @@ pub struct GpuRenderer {
     debug_scroll_copy: bool,
     /// Scroll moves applied as a copy of their pixels, ever.
     scroll_copied: std::cell::Cell<u64>,
-    /// A scroll this frame could have copied, had the pixels not been new.
+    /// A scroll this frame could have copied, had the pixels not been new,
+    /// or one whose content jumped past its view: its next move could copy.
     copy_next: std::cell::Cell<bool>,
     /// Frames presented to the drawable alone (`Deferred::direct`).
     direct_frames: u64,
@@ -13511,7 +13512,7 @@ impl GpuRenderer {
         // doesn't reach the work below, which is a call and a big frame.
         let serial = scene.flush_serial();
         self.copy_next.set(false);
-        if scene.scroll_moves().iter().all(|m| m.serial != serial) {
+        if !scene.scroll_jumped() && scene.scroll_moves().iter().all(|m| m.serial != serial) {
             return (Vec::new(), Vec::new());
         }
         self.scroll_copies_of(scene, damage, serial)
@@ -13539,6 +13540,12 @@ impl GpuRenderer {
         #[cfg(not(own_surfaces))]
         let copyable = true;
         let copyable = copyable || self.debug_scroll_copy;
+        self.copy_next.set(
+            scene.scroll_jumped()
+                && self.single_pass_format.is_some()
+                && copyable
+                && zgx::switches::SCROLL_COPY.on(),
+        );
         for scroll in scene.scroll_moves() {
             if scroll.serial != serial {
                 continue;

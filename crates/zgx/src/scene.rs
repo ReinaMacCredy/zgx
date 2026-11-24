@@ -3689,6 +3689,7 @@ pub struct Scene {
     off_grid_count: usize,
     /// The moves reported by the last flush, and that flush's serial.
     moves: Vec<ScrollMove>,
+    jumped: bool,
     flush_serial: u64,
     /// Nodes flushes repainted since a renderer last read them, with what
     /// changed (`repaints`).
@@ -3862,6 +3863,7 @@ impl Scene {
             pixel_scale: 0.,
             off_grid_count: 0,
             moves: Vec::new(),
+            jumped: false,
             flush_serial: 0,
             repaints: Vec::new(),
             asked: std::cell::OnceCell::new(),
@@ -16072,6 +16074,10 @@ impl Scene {
     pub fn scroll_moves(&self) -> &[ScrollMove] {
         &self.moves
     }
+    /// Whether the most recent flush repainted a scroll view its content jumped past.
+    pub fn scroll_jumped(&self) -> bool {
+        self.jumped
+    }
     /// Counts flushes that reported damage or moves.
     pub fn flush_serial(&self) -> u64 {
         self.flush_serial
@@ -16334,6 +16340,7 @@ impl Scene {
     /// overlapping moves, jumps past the viewport).
     fn resolve_moves(&mut self) {
         self.moves.clear();
+        self.jumped = false;
         let pending = std::mem::take(&mut self.pending_moves);
         let mut moves = Vec::new();
         for (id, from, again) in pending {
@@ -16350,6 +16357,7 @@ impl Scene {
             let jumped = self
                 .world_clip(id)
                 .is_some_and(|clip| dx.abs() >= clip.width || dy.abs() >= clip.height);
+            self.jumped |= jumped;
             let again = again || jumped;
             if again && self.transformed + self.filtered.get() > 0 {
                 // Its clip, wherever transformed or blurred ancestors show it.
