@@ -212,6 +212,13 @@ fn a_changed_drawing_shows_at_once_and_tiles_keep_to_their_budget() {
     let mut out = Vec::new();
     (cache.get_tiles(node, &changed, at, W, H, 2., false, 0, &mut out)).unwrap();
     // Each cell its new tile, or its old one until that lands: never none.
+    // (Drawn ones: a backdrop's pieces, made off the frame, may come
+    // along to upload, with nowhere to draw.)
+    let drawn = |out: &[(Raster, Placement)]| {
+        (out.iter())
+            .filter(|(_, p)| p.rect[2] > 0. && p.rect[3] > 0.)
+            .count()
+    };
     assert_eq!(drawn(&out), drawn(&before), "every cell shows at once");
     composed(&out, 2.);
     // All landed, more than a frame uploads: the rest show their old tiles.
@@ -269,12 +276,15 @@ fn parted(odd: Option<usize>) -> Arc<Canvas> {
     }
     Arc::new(canvas)
 }
-/// How many of `out` are drawn: a backdrop's pieces, made off the frame,
-/// may come along to upload, with nowhere to draw.
-fn drawn(out: &[(Raster, Placement)]) -> usize {
-    (out.iter())
+/// Each tile shown, by where it is: its image.
+/// What `out` draws, by where: not the backdrop's pieces it hands over to
+/// upload alone (an empty `rect`), which come as the backdrop, made off
+/// the frame, lands, so one frame has them and the next doesn't.
+fn by_place(out: &[(Raster, Placement)]) -> Vec<([i32; 4], u64)> {
+    out.iter()
         .filter(|(_, p)| p.rect[2] > 0. && p.rect[3] > 0.)
-        .count()
+        .map(|(r, p)| (p.rect.map(|v| (v * 4.).round() as i32), r.id))
+        .collect()
 }
 #[test]
 fn a_change_to_one_part_is_told_where_it_is_and_shows_once_made() {
@@ -320,7 +330,11 @@ fn a_change_to_one_part_is_told_where_it_is_and_shows_once_made() {
         .unwrap();
     let before = settled(&mut cache, node, &canvas, zoomed, 1.);
     let after = settled(&mut cache, node, &changed, zoomed, 1.);
-    assert_eq!(drawn(&before), drawn(&after));
+    // The same places drawn (the tiles themselves new where it changed).
+    let places = |out: &[(Raster, Placement)]| -> Vec<[i32; 4]> {
+        by_place(out).into_iter().map(|(at, _)| at).collect()
+    };
+    assert_eq!(places(&before), places(&after));
     assert!(same(
         &composed(&after, 1.),
         &raster(&changed, zoomed, [0, 0], 1.),
@@ -363,7 +377,7 @@ fn a_large_change_shows_the_old_tiles_while_its_own_are_made_off_the_frame() {
     cache
         .get_panned(node, &canvas, zoomed, W, H, 2., false)
         .unwrap();
-    let before = settled(&mut cache, node, &canvas, zoomed, 2.);
+    let before = by_place(&settled(&mut cache, node, &canvas, zoomed, 2.));
     // All of it another colour: every tile to make again, which takes far
     // longer than a frame waits.
     let changed = slow(240);
@@ -376,7 +390,11 @@ fn a_large_change_shows_the_old_tiles_while_its_own_are_made_off_the_frame() {
         "the frame waits little for a change ({took:?})"
     );
     assert!(awaiting, "drawn again as its tiles land");
-    assert_eq!(drawn(&out), drawn(&before), "the old tiles shown meanwhile");
+    assert_eq!(
+        by_place(&out).len(),
+        before.len(),
+        "the old tiles shown meanwhile"
+    );
     composed(&out, 2.);
     // Then the change's own tiles, as a cache that never saw the old one
     // makes them (blurs reach past a tile's margin: not the raster's).

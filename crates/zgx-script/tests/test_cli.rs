@@ -1179,6 +1179,29 @@ return ui.column { w = 200, h = 300,
 }
 
 #[test]
+fn a_test_reads_the_named_states_and_how_many_the_scripts_hold() {
+    let dir = app(
+        "states",
+        &[(
+            "states.test.luau",
+            r##"
+test("states lists names in order and retained_states counts States", function()
+    local app = mount()
+    local names = app:states()
+    expect(#names >= 3).to_be(true)
+    local sorted = table.clone(names)
+    table.sort(sorted)
+    expect(table.concat(names, ",")).to_be(table.concat(sorted, ","))
+    expect(app:retained_states() >= 1).to_be(true)
+end)
+"##,
+        )],
+    );
+    let (code, text) = run(&dir, &[]);
+    assert_eq!(code, Some(0), "{text}");
+}
+
+#[test]
 fn a_run_removes_the_storage_of_runs_that_were_killed() {
     let dir = app(
         "stale-storage",

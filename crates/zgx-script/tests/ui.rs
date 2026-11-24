@@ -1409,8 +1409,9 @@ fn a_text_area_draws_its_chips_behind_the_text_and_follows_them() {
         let (mut fills, mut icons) = (Vec::new(), Vec::new());
         while let Some(n) = stack.pop() {
             match scene.kind(n) {
-                NodeKind::Quad(q) if q.fill == zgx::scene::Color(255, 0, 16, 255)
-                    || q.fill == zgx::scene::Color(0, 255, 16, 255) =>
+                NodeKind::Quad(q)
+                    if q.fill == zgx::scene::Color(255, 0, 16, 255)
+                        || q.fill == zgx::scene::Color(0, 255, 16, 255) =>
                 {
                     fills.push((q.radius, scene.bounds(n)));
                 }
@@ -1426,7 +1427,11 @@ fn a_text_area_draws_its_chips_behind_the_text_and_follows_them() {
     assert_eq!(icons.len(), 1, "its icon at its start");
     let (radius, fill) = fills[0];
     assert_eq!(radius, 5.);
-    assert_eq!((icons[0].x - fill.x, icons[0].width), (2., 10.), "the icon in from the start");
+    assert_eq!(
+        (icons[0].x - fill.x, icons[0].width),
+        (2., 10.),
+        "the icon in from the start"
+    );
     assert!(
         (icons[0].y + 5. - (fill.y + fill.height / 2.)).abs() < 0.01,
         "centred on the row"
@@ -6862,4 +6867,23 @@ fn context_menu_open_says_whether_the_menu_shows() {
     h.key(zgx::input::Key::Escape);
     assert_eq!(read(&h), Some(false), "false as Escape closes it");
     assert_eq!(h.error(), None);
+}
+
+/// A component's props carry nodes anywhere, in named slots.
+#[test]
+fn a_component_takes_nodes_nested_in_its_props() {
+    let mut h = Harness::inline(
+        r##"local Card = ui.component(function(props)
+            local items = {}
+            for i, n in props.attachments do items[i] = n end
+            return ui.column { id = "card", props.editor.input, ui.column(items) }
+        end)
+        return Card { attachments = { ui.text { id = "a1", "one" }, ui.text { id = "a2", "two" } },
+            editor = { input = ui.text { id = "in", "typed" } } }"##,
+    );
+    h.frames(2);
+    assert_eq!(h.error(), None);
+    for id in ["in", "a1", "a2"] {
+        assert!(h.find(id).is_some(), "{id}");
+    }
 }

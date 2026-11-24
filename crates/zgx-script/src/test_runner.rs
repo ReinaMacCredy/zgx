@@ -179,6 +179,24 @@ fn remove_stale_storage() {
                 libc::kill(pid as i32, 0) != 0
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
             },
+            // No process has the id: OpenProcess refuses it as a bad
+            // parameter (one that exists but isn't ours answers access denied).
+            #[cfg(windows)]
+            Some(pid) => {
+                use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+                use windows::Win32::System::Threading::{
+                    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                };
+                // SAFETY: a handle opened only to ask, and closed at once.
+                match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+                    Ok(handle) => {
+                        // SAFETY: the handle just opened.
+                        let _ = unsafe { CloseHandle(handle) };
+                        false
+                    }
+                    Err(e) => e.code() == ERROR_INVALID_PARAMETER.to_hresult(),
+                }
+            }
             _ => false,
         };
         let old = entry
@@ -668,10 +686,17 @@ impl UserData for Mounted {
                 let mut app = m.app()?;
                 let (key, modifiers) =
                     crate::driver::parse_keys(&keys).map_err(mlua::Error::runtime)?;
-                let repeat = opts.as_ref().and_then(|o| o.get::<bool>("repeating").ok()).unwrap_or(false);
+                let repeat = opts
+                    .as_ref()
+                    .and_then(|o| o.get::<bool>("repeating").ok())
+                    .unwrap_or(false);
                 let code = opts.as_ref().and_then(|o| o.get::<String>("code").ok());
                 app.ui.input.set_key_code(code.map(Into::into));
-                app.ui.dispatch(zgx::input::InputEvent::KeyDown { key, modifiers, repeat });
+                app.ui.dispatch(zgx::input::InputEvent::KeyDown {
+                    key,
+                    modifiers,
+                    repeat,
+                });
                 app.ui.input.set_key_code(None);
                 app.settle();
                 Ok(())
@@ -685,7 +710,8 @@ impl UserData for Mounted {
                     crate::driver::parse_keys(&keys).map_err(mlua::Error::runtime)?;
                 let code = opts.as_ref().and_then(|o| o.get::<String>("code").ok());
                 app.ui.input.set_key_code(code.map(Into::into));
-                app.ui.dispatch(zgx::input::InputEvent::KeyUp { key, modifiers });
+                app.ui
+                    .dispatch(zgx::input::InputEvent::KeyUp { key, modifiers });
                 app.ui.input.set_key_code(None);
                 app.settle();
                 Ok(())
@@ -705,9 +731,8 @@ impl UserData for Mounted {
         // what a key's `app:key` alone never moves.
         methods.add_method("hold", |_, m, keys: String| {
             let mut app = m.app()?;
-            let modifiers = crate::driver::parse_modifiers(&keys).ok_or_else(|| {
-                mlua::Error::runtime(format!("`{keys}` isn't modifier keys"))
-            })?;
+            let modifiers = crate::driver::parse_modifiers(&keys)
+                .ok_or_else(|| mlua::Error::runtime(format!("`{keys}` isn't modifier keys")))?;
             crate::driver::hold_modifiers(&mut app.ui, modifiers);
             app.settle();
             Ok(())
@@ -722,27 +747,24 @@ impl UserData for Mounted {
         // "momentum_ended"), as a window reports it: `on`, whether a swipe
         // between pages can start, as the system's setting has it. `scroll`
         // gives the motion between.
-        methods.add_method(
-            "gesture",
-            |_, m, (phase, on): (String, Option<bool>)| {
-                use zgx::input::{InputEvent, ScrollGesture};
-                let mut app = m.app()?;
-                let phase = match phase.as_str() {
-                    "began" => ScrollGesture::Began,
-                    "ended" => ScrollGesture::Ended,
-                    "momentum_began" => ScrollGesture::MomentumBegan,
-                    "momentum_ended" => ScrollGesture::MomentumEnded,
-                    other => {
-                        return Err(mlua::Error::runtime(format!("no gesture phase `{other}`")));
-                    }
-                };
-                app.ui.set_elastic_scrolling(true);
-                app.ui.set_navigation_swipes(on.unwrap_or(true));
-                app.ui.dispatch(InputEvent::ScrollGesture(phase));
-                app.settle();
-                Ok(())
-            },
-        );
+        methods.add_method("gesture", |_, m, (phase, on): (String, Option<bool>)| {
+            use zgx::input::{InputEvent, ScrollGesture};
+            let mut app = m.app()?;
+            let phase = match phase.as_str() {
+                "began" => ScrollGesture::Began,
+                "ended" => ScrollGesture::Ended,
+                "momentum_began" => ScrollGesture::MomentumBegan,
+                "momentum_ended" => ScrollGesture::MomentumEnded,
+                other => {
+                    return Err(mlua::Error::runtime(format!("no gesture phase `{other}`")));
+                }
+            };
+            app.ui.set_elastic_scrolling(true);
+            app.ui.set_navigation_swipes(on.unwrap_or(true));
+            app.ui.dispatch(InputEvent::ScrollGesture(phase));
+            app.settle();
+            Ok(())
+        });
         // `{ dx, dy }` points as a trackpad moves; `mouse = true` as a mouse
         // wheel's notches, and `shift = true` with Shift held.
         methods.add_method("wheel", |_, m, (target, how): (String, mlua::Table)| {
@@ -937,6 +959,22 @@ impl UserData for Mounted {
                 }
             },
         );
+        methods.add_method("states", |_, m, ()| {
+            Ok(m.app()?
+                .host
+                .states()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>())
+        });
+        methods.add_method("retained_states", |_, m, ()| {
+            let query = crate::GcQuery {
+                retained: Some("State".into()),
+                ..Default::default()
+            };
+            let reports = m.app()?.host.gc_report(&query);
+            Ok(reports.iter().map(|vm| vm.found.matched).sum::<usize>())
+        });
         methods.add_method("state", |_, m, name: String| {
             let states = m.app()?.host.states();
             let suffix = format!("::{name}");

@@ -87,6 +87,7 @@ pub fn debug_compile_metal_libraries_at_start(on: bool) {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod phase_watch;
 mod planes;
+mod shelves;
 pub use planes::plane_size;
 pub mod present_log;
 mod surface;
@@ -4382,7 +4383,8 @@ fn request_device(
                     message
                 });
             }
-            // Every context on the device (WARP's, each with a cell of its own).
+            // Every context on the device (Direct3D 12's, each with a cell of
+            // its own).
             let contexts = contexts.lock().unwrap_or_else(|p| p.into_inner());
             for context in contexts.iter().filter_map(std::sync::Weak::upgrade) {
                 let mut lost = context.lock().unwrap_or_else(|p| p.into_inner());
@@ -4406,10 +4408,11 @@ fn request_device(
 }
 /// Why a device was lost, once it is (set from any thread).
 type LostCell = Arc<std::sync::Mutex<Option<String>>>;
-/// The cells of the contexts sharing WARP's device, for its loss to reach.
+/// The cells of the contexts sharing a device, for its loss to reach.
 type LostCells = Arc<std::sync::Mutex<Vec<std::sync::Weak<std::sync::Mutex<Option<String>>>>>>;
-/// What contexts on one device share: on WARP, every context in the process
-/// (`WARP_DEVICE`), and elsewhere the one context made with it.
+/// What contexts on one device share: on Direct3D 12, every context in the
+/// process (`WARP_DEVICE`, `D3D12_DEVICE`), and elsewhere the one context
+/// made with it.
 struct SharedDevice {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -4417,18 +4420,41 @@ struct SharedDevice {
     queue: wgpu::Queue,
     /// The device's loss.
     lost: LostCell,
-    /// On WARP, each context's own cell, so a test can lose one context
-    /// alone (`GpuContext::debug_lose_device`); elsewhere the context reads
-    /// `lost`.
+    /// On Direct3D 12, each context's own cell, so a test can lose one
+    /// context alone (`GpuContext::debug_lose_device`); elsewhere the context
+    /// reads `lost`.
     contexts: LostCells,
 }
-/// WARP's device while a context holds it (`GpuContext::prepare`): held
-/// weakly, so it goes with the last context on it.
-static WARP_DEVICE: std::sync::Mutex<std::sync::Weak<SharedDevice>> =
+/// WARP's device, once a context made it (`GpuContext::prepare`): kept for
+/// the process, not only while a context holds it. The last context to go
+/// let go of it before its renderer's buffers and textures, and its queue,
+/// which waits there for the frame still drawing: a context made then, on
+/// another thread, made a second device beside it, and two wgpu devices on
+/// WARP at once fault in `ExecuteCommandLists` (zgx-video's render tests
+/// on Windows, #2402). wgpu says nothing of when a device is gone.
+static WARP_DEVICE: std::sync::Mutex<Option<Arc<SharedDevice>>> = std::sync::Mutex::new(None);
+/// A Direct3D 12 GPU's device while a context holds it (`GpuContext::prepare`):
+/// held weakly, so it goes with the last context and nothing of it stays at
+/// rest. A device per context, made and released on many threads at once (as
+/// zgx-video's chunks and tests do), hung NVIDIA's driver in the kernel
+/// (docs/validation.md, "NVIDIA on Windows"). Vulkan and Metal, untested so,
+/// keep a device per context.
+static D3D12_DEVICE: std::sync::Mutex<std::sync::Weak<SharedDevice>> =
     std::sync::Mutex::new(std::sync::Weak::new());
+/// Whether a Direct3D 12 GPU's shared device is held (`D3D12_DEVICE`): none
+/// once the last context on it is gone.
+#[doc(hidden)]
+pub fn d3d12_device_held() -> bool {
+    D3D12_DEVICE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .strong_count()
+        > 0
+}
 /// What a `GpuContext` holds that another thread can make (`GpuContext::prepare`).
 struct Prepared {
-    /// Keeps WARP's process-wide device for `WARP_DEVICE` to find.
+    /// The device it draws with: on Direct3D 12, the one `WARP_DEVICE` or
+    /// `D3D12_DEVICE` hands every context.
     shared: Arc<SharedDevice>,
     lost: Arc<std::sync::Mutex<Option<String>>>,
     instance: wgpu::Instance,
@@ -4470,7 +4496,8 @@ pub struct GpuContext {
     inner: Rc<GpuContextInner>,
 }
 struct GpuContextInner {
-    /// Keeps WARP's process-wide device for `WARP_DEVICE` to find.
+    /// The device it draws with: on Direct3D 12, the one `WARP_DEVICE` or
+    /// `D3D12_DEVICE` hands every context.
     shared: Arc<SharedDevice>,
     /// Why the device was lost (driver reset, removal, `debug_lose_device`):
     /// set from wgpu's callback, from any thread.
@@ -4737,10 +4764,16 @@ impl GpuContext {
             && info.backend == wgpu::Backend::Dx12
             && info.device_type == wgpu::DeviceType::Cpu;
         let mut warp_slot = warp.then(|| WARP_DEVICE.lock().unwrap_or_else(|p| p.into_inner()));
+        // A Direct3D 12 GPU's device is shared too, while a context holds it
+        // (`D3D12_DEVICE`): one on the adapter this context chose.
+        let d3d12 = !noop && !warp && info.backend == wgpu::Backend::Dx12;
+        let mut d3d12_slot = d3d12.then(|| D3D12_DEVICE.lock().unwrap_or_else(|p| p.into_inner()));
         // (Not a lost one: a context made after a loss takes a new device.)
         let reusable = warp_slot
             .as_ref()
-            .and_then(|slot| slot.upgrade())
+            .and_then(|slot| (*slot).clone())
+            .or_else(|| d3d12_slot.as_ref().and_then(|slot| slot.upgrade()))
+            .filter(|shared| shared.adapter.get_info() == info)
             .filter(|shared| shared.lost.lock().is_ok_and(|lost| lost.is_none()));
         let shared = match reusable {
             Some(shared) => shared,
@@ -4757,12 +4790,16 @@ impl GpuContext {
                     contexts,
                 });
                 if let Some(slot) = &mut warp_slot {
+                    **slot = Some(shared.clone());
+                }
+                if let Some(slot) = &mut d3d12_slot {
                     **slot = Arc::downgrade(&shared);
                 }
                 shared
             }
         };
         drop(warp_slot);
+        drop(d3d12_slot);
         let SharedDevice {
             instance,
             adapter,
@@ -4771,7 +4808,7 @@ impl GpuContext {
             lost,
             contexts,
         } = &*shared;
-        let lost = match warp {
+        let lost = match warp || d3d12 {
             false => lost.clone(),
             true => {
                 let own = LostCell::default();
@@ -4896,8 +4933,9 @@ impl GpuContext {
             .clone()
     }
     /// Lose the device, as a driver reset would: for tests of recovery. On
-    /// WARP's process-wide device (`WARP_DEVICE`), while other contexts draw
-    /// on it, only this context fails from then on.
+    /// Direct3D 12's shared device (`WARP_DEVICE`, `D3D12_DEVICE`), which
+    /// other contexts may draw on, only this context fails from then on
+    /// (`debug_lose_shared_device` loses it for all of them).
     pub fn debug_lose_device(&self) {
         if Arc::strong_count(&self.inner.shared) == 1 {
             self.inner.device.destroy();
@@ -4909,6 +4947,39 @@ impl GpuContext {
     /// Whether `other` is this context (a clone of it), on the same device.
     pub fn shares_device(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner)
+    }
+    /// Whether `other`, this context or another, draws with the same wgpu
+    /// device: on Direct3D 12, every context does.
+    #[doc(hidden)]
+    pub fn same_device_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner.shared, &other.inner.shared)
+    }
+    /// Lose the device this context draws with, as a driver reset would, for
+    /// every context on it: for tests of recovery.
+    #[doc(hidden)]
+    pub fn debug_lose_shared_device(&self) {
+        self.inner.device.destroy();
+        let _ = self.inner.device.poll(wgpu::PollType::Poll);
+        let shared = &self.inner.shared;
+        let reason = || "destroyed for a test".to_owned();
+        shared
+            .lost
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(reason);
+        let contexts = shared.contexts.lock().unwrap_or_else(|p| p.into_inner());
+        for context in contexts.iter().filter_map(std::sync::Weak::upgrade) {
+            context
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_or_insert_with(reason);
+        }
+        drop(contexts);
+        self.inner
+            .lost
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(reason);
     }
     /// The font system its renderers shape and draw text with.
     pub fn text_system(&self) -> Rc<RefCell<FontSystem>> {
@@ -5093,7 +5164,8 @@ pub struct GpuRenderer {
     debug_scroll_copy: bool,
     /// Scroll moves applied as a copy of their pixels, ever.
     scroll_copied: std::cell::Cell<u64>,
-    /// A scroll this frame could have copied, had the pixels not been new.
+    /// A scroll this frame could have copied, had the pixels not been new,
+    /// or one whose content jumped past its view: its next move could copy.
     copy_next: std::cell::Cell<bool>,
     /// Frames presented to the drawable alone (`Deferred::direct`).
     direct_frames: u64,
@@ -5121,7 +5193,11 @@ pub struct GpuRenderer {
     warned: Vec<String>,
     issues: Vec<String>,
     entries: FxHashMap<AtlasKey, Option<AtlasEntry>>,
-    cursor: (u32, u32, u32),
+    /// The atlas's cells, taken and given back (`atlas_cell`, `evict_glyphs`).
+    shelves: shelves::Shelves,
+    /// This frame ran out of atlas at its largest and started it over:
+    /// what doesn't fit now isn't drawn (`raster_glyph`).
+    atlas_spent: bool,
     fonts: Rc<RefCell<FontSystem>>,
     text_cache: Rc<RefCell<prepared::TextCache>>,
     swash: SwashCache,
@@ -5990,7 +6066,8 @@ impl GpuRenderer {
             warned: Vec::new(),
             issues: Vec::new(),
             entries: FxHashMap::default(),
-            cursor: (0, 0, 0),
+            shelves: shelves::Shelves::new(1),
+            atlas_spent: false,
             fonts: context.text_system(),
             text_cache: context.text_cache(),
             swash: SwashCache::new(),
@@ -6331,7 +6408,7 @@ impl GpuRenderer {
         let Some(Packed {
             size,
             origins,
-            cursor,
+            shelves,
         }) = pack_cells(&sizes, self.atlas_size)
         else {
             return true;
@@ -6347,7 +6424,21 @@ impl GpuRenderer {
             .map(|(((x, y), (w, h)), (to_x, to_y))| {
                 (x - 1, y - 1, w + 2, h + 2, to_x - 1, to_y - 1)
             });
-        // Direct3D 11: its own atlas's cells copied into one the new size.
+        if !self.copy_atlas_cells(&atlas, size, cells) {
+            return false;
+        }
+        self.atlas_shrunk(atlas, size, shelves, live, glyphs, icons, origins)
+    }
+    /// `cells` (`x, y, width, height` and where they go) of the atlas copied
+    /// into `atlas`, `size` square, as the atlas is written: on the CPU
+    /// where the CPU writes it in place (macOS), by the GPU elsewhere, and
+    /// into Direct3D 11's own atlas made that size. False where it can't.
+    fn copy_atlas_cells(
+        &mut self,
+        atlas: &wgpu::Texture,
+        size: u32,
+        cells: impl Iterator<Item = (u32, u32, u32, u32, u32, u32)>,
+    ) -> bool {
         #[cfg(d3d11)]
         if let Some(state) = &mut self.d3d11 {
             let Some(old) = state.atlas.take() else {
@@ -6362,8 +6453,9 @@ impl GpuRenderer {
             };
             state.device.copy_cells(&old, &new, cells);
             state.atlas = Some(new);
-            return self.atlas_shrunk(atlas, size, cursor, live, glyphs, icons, origins);
+            return true;
         }
+        let _ = size;
         #[cfg(target_os = "macos")]
         let copied_on_cpu = self.unified;
         #[cfg(not(target_os = "macos"))]
@@ -6372,13 +6464,13 @@ impl GpuRenderer {
             // Shared textures the CPU writes: read and written in place.
             #[cfg(target_os = "macos")]
             for (x, y, w, h, to_x, to_y) in cells {
-                upload::copy_texels(&self.atlas, &atlas, (x, y, w, h), (to_x, to_y));
+                upload::copy_texels(&self.atlas, atlas, (x, y, w, h), (to_x, to_y));
             }
         } else {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("glyph atlas shrunk"),
+                    label: Some("glyph atlas cells"),
                 });
             for (x, y, w, h, to_x, to_y) in cells {
                 encoder.copy_texture_to_texture(
@@ -6389,7 +6481,7 @@ impl GpuRenderer {
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::TexelCopyTextureInfo {
-                        texture: &atlas,
+                        texture: atlas,
                         mip_level: 0,
                         origin: wgpu::Origin3d {
                             x: to_x,
@@ -6407,7 +6499,90 @@ impl GpuRenderer {
             }
             self.queue.submit([encoder.finish()]);
         }
-        self.atlas_shrunk(atlas, size, cursor, live, glyphs, icons, origins)
+        true
+    }
+    /// The atlas grown to `size`, its cells where they lie: copied into the
+    /// larger one's corner, and the quads placed from them (texts', their
+    /// blurred shadows') given UVs a power of two smaller, exactly what
+    /// placing them in the larger atlas gives (both sizes powers of two). So
+    /// growing rasterizes and places nothing again (the mail example's
+    /// growth did both for every glyph on screen). False where it can't copy
+    /// (uploads still queued for the old one): it starts over larger.
+    fn grow_atlas(&mut self, size: u32) -> bool {
+        let old = self.atlas_size;
+        if !self.texture_uploads.is_empty() || size <= old || old < INITIAL_ATLAS {
+            return false;
+        }
+        let atlas = sampled_texture(&self.device, self.unified, size, size, "glyph atlas");
+        if !self.copy_atlas_cells(&atlas, size, std::iter::once((0, 0, old, old, 0, 0))) {
+            return false;
+        }
+        self.atlas = atlas;
+        self.atlas_size = size;
+        self.bind = self.texture_bind(&self.atlas.create_view(&Default::default()), "glyph atlas");
+        self.shelves.grow(size);
+        let k = old as f32 / size as f32;
+        let scale = |quads: &mut [TextQuad]| {
+            for quad in quads.iter_mut().filter(|q| q.paint[1] > 0.5) {
+                for uv in &mut quad.uv {
+                    *uv *= k;
+                }
+            }
+        };
+        let epoch = self.atlas_epoch;
+        for shaped in self.shapes.values_mut() {
+            if shaped.atlas_epoch == epoch {
+                scale(&mut shaped.quads);
+            }
+        }
+        if let Some(blurred) = &mut self.blurred {
+            for text in blurred.texts.values_mut() {
+                if text.atlas_epoch == epoch {
+                    for (_, quads) in &mut text.sigmas {
+                        scale(quads);
+                    }
+                }
+            }
+        }
+        // Its quads recorded with the old UVs.
+        self.kept = None;
+        #[cfg(debug_assertions)]
+        self.check_grown_quads();
+        true
+    }
+    /// After `grow_atlas`: a text's first glyph quad placed fresh from its
+    /// entry in the grown atlas reads, bit for bit, as the scaled one.
+    #[cfg(debug_assertions)]
+    fn check_grown_quads(&self) {
+        let size = self.atlas_size as f32;
+        for shaped in self.shapes.values() {
+            if shaped.atlas_epoch != self.atlas_epoch {
+                continue;
+            }
+            let before = shaped.decorations.iter().filter(|d| d.background).count();
+            let Some(entry) = shaped
+                .glyphs
+                .iter()
+                .find_map(|g| self.entries.get(&AtlasKey::from(g.key)).copied().flatten())
+            else {
+                continue;
+            };
+            let Some(quad) = shaped.quads.get(before) else {
+                continue;
+            };
+            let fresh = [
+                entry.x as f32 / size,
+                entry.y as f32 / size,
+                entry.width as f32 / size,
+                entry.height as f32 / size,
+            ];
+            assert_eq!(
+                quad.uv.map(f32::to_bits),
+                fresh.map(f32::to_bits),
+                "a grown atlas's quad as placed fresh"
+            );
+            return;
+        }
     }
     /// The atlas `shrink_atlas` copied into, `size` square, taken: the live
     /// glyphs and icons at their `origins` there.
@@ -6416,7 +6591,7 @@ impl GpuRenderer {
         &mut self,
         atlas: wgpu::Texture,
         size: u32,
-        cursor: (u32, u32, u32),
+        shelves: shelves::Shelves,
         live: FxHashMap<AtlasKey, Option<AtlasEntry>>,
         glyphs: Vec<(AtlasKey, AtlasEntry)>,
         icons: Vec<(u64, (u32, u32, u32, u32))>,
@@ -6441,7 +6616,7 @@ impl GpuRenderer {
         self.atlas = atlas;
         self.atlas_size = size;
         self.bind = self.texture_bind(&self.atlas.create_view(&Default::default()), "glyph atlas");
-        self.cursor = cursor;
+        self.shelves = shelves;
         // Every placed quad's cell moved: placed again from `entries`.
         self.atlas_epoch = self.atlas_epoch.wrapping_add(1);
         self.kept = None;
@@ -6964,17 +7139,37 @@ impl GpuRenderer {
         if let Some(reason) = self.context.lost() {
             return Err(GpuError::device_lost(&reason));
         }
+        // A frame that runs out of atlas is drawn again: after the cells of
+        // glyphs no text holds are given back (the frame's own text holds
+        // what it drew, so those it moved on from go), then in a larger
+        // atlas, and at the largest after starting it over.
+        let mut freed = false;
+        self.atlas_spent = false;
         loop {
             match self.render_once(scene, damage) {
-                Err(error)
-                    if error.0 == "glyph atlas capacity exceeded in one frame"
-                        && self.atlas_size < MAX_ATLAS =>
-                {
-                    // Back to the size it had reached, not a doubling at a
-                    // time, each of which rasterizes the frame's glyphs.
-                    let size = (self.atlas_size * 2).max(self.atlas_grew_to);
-                    self.reset_atlas(size.min(MAX_ATLAS))
+                Err(error) if error.0 == "glyph atlas capacity exceeded in one frame" => {
+                    let gave_back = !std::mem::replace(&mut freed, true) && self.free_glyphs();
+                    if gave_back {
+                        continue;
+                    }
+                    if self.atlas_size < MAX_ATLAS {
+                        // Back to the size it had reached, not a doubling
+                        // at a time, each of which rasterizes the frame's
+                        // glyphs.
+                        let size = (self.atlas_size * 2).max(self.atlas_grew_to).min(MAX_ATLAS);
+                        if !self.grow_atlas(size) {
+                            self.reset_atlas(size);
+                        }
+                    } else if !self.atlas_spent {
+                        self.atlas_spent = true;
+                        self.recycle_atlas();
+                        self.atlas_recycled_at = self.frame;
+                    } else {
+                        return Err(error);
+                    }
                 }
+                // (One arm takes a frame's stats as main's did: each arm
+                // more copied them once more a frame.)
                 result => {
                     #[cfg(target_os = "macos")]
                     if result.is_ok() {
@@ -7266,7 +7461,7 @@ impl GpuRenderer {
                 cache.watched = None;
             }
         }
-        self.prepare_effects(scene, &items)?;
+        self.prepare_effects(scene, &items, self.plane_offset().unwrap_or_default())?;
         // Kept only if every item draws flat (no layer, no effect) from
         // what the scene marks when it changes.
         let keep = keep
@@ -8063,7 +8258,7 @@ impl GpuRenderer {
                 && !(moving && cache.factor != factor.to_bits())
         });
         self.layer_shifted = shifted;
-        self.prepare_effects(scene, &items)?;
+        self.prepare_effects(scene, &items, (0., 0.))?;
         if let Some(damage) = partial {
             let mut cache = self.layers.remove(&id).expect("kept above");
             cache.placement_mut().seen = seen;
@@ -8883,7 +9078,12 @@ impl GpuRenderer {
     /// recycles it.
     #[inline(always)]
     fn atlas_filling(&self) -> bool {
-        self.cursor.1 + self.cursor.2 > self.atlas_size * 3 / 4 || self.entries.len() >= 8192
+        // Its cells' area past half and some (what a frame adds fits the
+        // rest), or its shelves in use near its every row (a tall glyph
+        // needs rows).
+        self.shelves.area() > u64::from(self.atlas_size).pow(2) * 9 / 16
+            || self.shelves.rows() > self.atlas_size * 7 / 8
+            || self.entries.len() >= 8192
     }
     /// Draw `items`, the window's whole paint as the walk found them with
     /// what they `inherited`, and keep it to patch: their quads and draws
@@ -9070,7 +9270,10 @@ impl GpuRenderer {
                 && let Some(boxed) = kept.items[first].boxed
                 && kept.items.get(first + 1).is_none_or(|next| next.id != id)
             {
-                let (bounds, kind) = scene.box_in(id, &kept.items[first].inherited);
+                let (mut bounds, kind) = scene.box_in(id, &kept.items[first].inherited);
+                if scene.pixel_scale() > 0. {
+                    scene.snap_kept_box(id, &mut bounds, &kept.items[first].inherited);
+                }
                 if plain_quad(kind) {
                     boxes += 1;
                     if self.patch_box_moved(&mut kept, first, bounds, boxed.clip, viewport) {
@@ -9108,10 +9311,13 @@ impl GpuRenderer {
                 continue;
             }
             for place in first..first + count {
-                let Some(item) = scene.item_in(id, &kept.items[place].inherited) else {
+                let Some(mut item) = scene.item_in(id, &kept.items[place].inherited) else {
                     splices.push((first, kept.items[first].end as usize, id));
                     break;
                 };
+                if scene.pixel_scale() > 0. {
+                    scene.snap_kept_item(&mut item);
+                }
                 let plain = plain_box(&item);
                 kept.items[place].boxed = KeptBox::of(&item, plain);
                 if plain {
@@ -9856,16 +10062,7 @@ impl GpuRenderer {
         // (A kept frame's glyphs stay where they are: patching it gave way
         // before the atlas filled, `render_kept`.)
         if MODE != PATCH && !made && self.atlas_filling() {
-            // Filling again soon after the last recycle means the visible
-            // working set does not fit: grow rather than re-rasterize every
-            // glyph and icon each time it fills.
-            let thrashing = self.frame.wrapping_sub(self.atlas_recycled_at) < ATLAS_THRASH_FRAMES;
-            if thrashing && self.atlas_size < MAX_ATLAS && self.entries.len() < 8192 {
-                self.reset_atlas((self.atlas_size * 2).min(MAX_ATLAS));
-            } else {
-                self.recycle_atlas();
-            }
-            self.atlas_recycled_at = self.frame;
+            self.atlas_filled();
         }
         let mut quads = std::mem::take(&mut self.frame_quads);
         if !made {
@@ -10383,7 +10580,10 @@ impl GpuRenderer {
                                 32
                             };
                             for shadow in style.shadows().iter().take(shown) {
-                                let core = bounds.expand(shadow.spread.max(0.));
+                                // A negative spread shrinks the box, as CSS's does.
+                                let spread =
+                                    shadow.spread.max(-bounds.width.min(bounds.height) * 0.5);
+                                let core = bounds.expand(spread);
                                 let core = Rect::new(
                                     core.x + shadow.offset.x,
                                     core.y + shadow.offset.y,
@@ -10399,7 +10599,7 @@ impl GpuRenderer {
                                     fade: [core.x, core.y, core.width, core.height],
                                     options: [0., 0., 0., 1.],
                                     shape: [
-                                        style.radius + shadow.spread.max(0.),
+                                        (style.radius + spread).max(0.),
                                         0.,
                                         shadow.blur_radius.max(0.001),
                                         0.,
@@ -10408,7 +10608,7 @@ impl GpuRenderer {
                                         style,
                                         core.width,
                                         core.height,
-                                        shadow.spread.max(0.),
+                                        spread,
                                     ),
                                     mask: NO_MASK,
                                 });
@@ -13312,7 +13512,7 @@ impl GpuRenderer {
         // doesn't reach the work below, which is a call and a big frame.
         let serial = scene.flush_serial();
         self.copy_next.set(false);
-        if scene.scroll_moves().iter().all(|m| m.serial != serial) {
+        if !scene.scroll_jumped() && scene.scroll_moves().iter().all(|m| m.serial != serial) {
             return (Vec::new(), Vec::new());
         }
         self.scroll_copies_of(scene, damage, serial)
@@ -13340,6 +13540,12 @@ impl GpuRenderer {
         #[cfg(not(own_surfaces))]
         let copyable = true;
         let copyable = copyable || self.debug_scroll_copy;
+        self.copy_next.set(
+            scene.scroll_jumped()
+                && self.single_pass_format.is_some()
+                && copyable
+                && zgx::switches::SCROLL_COPY.on(),
+        );
         for scroll in scene.scroll_moves() {
             if scroll.serial != serial {
                 continue;
@@ -15544,6 +15750,90 @@ impl GpuRenderer {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         }
     }
+    /// The atlas filling: the cells of glyphs no text the renderer holds
+    /// (`shapes`) draws given back where they lie, for glyphs to come. The
+    /// rest stay where they are, so the quads placed from them still hold
+    /// (no new `atlas_epoch`): a fill moves nothing and rasterizes nothing
+    /// again. (Starting over, as it did, placed every text's quads again,
+    /// three quarters of what a fill cost a mail window.) Whether that left
+    /// it filling no more.
+    fn evict_glyphs(&mut self) -> bool {
+        self.free_glyphs();
+        !self.atlas_filling()
+    }
+    /// The atlas filling as a frame starts: grown, given back or started
+    /// over. Cold and out of line: a frame's own body stays as it was
+    /// (inlined, this branch's growth cost every frame's render instructions).
+    #[cold]
+    #[inline(never)]
+    fn atlas_filled(&mut self) {
+        // Filling again soon after the last time with what its text
+        // holds means the visible working set does not fit: grow rather
+        // than give back or re-rasterize glyphs each time it fills. Not
+        // where what its text holds takes under 3/8 of it (a colour
+        // animating through font smoothing's levels leaves each level's
+        // glyphs behind, beside a page of text that stays): given back,
+        // the rest leaves room, and nothing grows to stay grown.
+        // Else the cells no text holds are given back where they lie,
+        // and only where that leaves it filling does it start over.
+        let thrashing = self.frame.wrapping_sub(self.atlas_recycled_at) < ATLAS_THRASH_FRAMES;
+        if thrashing
+            && self.atlas_size < MAX_ATLAS
+            && self.entries.len() < 8192
+            && (self.shelves.area() - self.unheld_area()) * 8
+                > u64::from(self.atlas_size).pow(2) * 3
+        {
+            let size = (self.atlas_size * 2).min(MAX_ATLAS);
+            if !self.grow_atlas(size) {
+                self.reset_atlas(size);
+            }
+        } else if !self.evict_glyphs() {
+            self.recycle_atlas();
+        }
+        self.atlas_recycled_at = self.frame;
+    }
+    /// The texels of the atlas's glyph cells no text the renderer holds.
+    fn unheld_area(&self) -> u64 {
+        let held = self.held_glyphs();
+        self.entries
+            .iter()
+            .filter(|(key, _)| !held.contains(*key))
+            .filter_map(|(_, entry)| *entry)
+            .map(|e| u64::from(e.width + 2) * u64::from(e.height + 2))
+            .sum()
+    }
+    /// The glyphs of the text the renderer holds (`shapes`).
+    fn held_glyphs(&self) -> FxHashSet<AtlasKey> {
+        let mut held: FxHashSet<AtlasKey> = FxHashSet::default();
+        for shaped in self.shapes.values() {
+            held.extend(shaped.glyphs.iter().map(|glyph| AtlasKey::from(glyph.key)));
+        }
+        held
+    }
+    /// `evict_glyphs`' giving back: whether any cell was.
+    fn free_glyphs(&mut self) -> bool {
+        let held = self.held_glyphs();
+        let mut freed = false;
+        let shelves = &mut self.shelves;
+        self.entries.retain(|key, entry| {
+            if held.contains(key) {
+                return true;
+            }
+            if let Some(e) = entry {
+                shelves.free((e.x - 1, e.y - 1), e.width + 2, e.height + 2);
+                freed = true;
+            }
+            false
+        });
+        if freed {
+            // A frame still on the GPU may sample a cell given back: none
+            // is written over before it is done (as `recycle_atlas`).
+            self.release_atlas_cells();
+            // A kept frame's quads may lie in them.
+            self.kept = None;
+        }
+        freed
+    }
     /// Start the glyph atlas over in place: every glyph and icon cell
     /// (`entries`, `image_cells`) given up together, so the next to take a
     /// cell never draws over one still listed. (A scale change once kept
@@ -15557,7 +15847,7 @@ impl GpuRenderer {
             blurred.glyphs.clear();
         }
         self.atlas_epoch = self.atlas_epoch.wrapping_add(1);
-        self.cursor = (0, 0, 0);
+        self.shelves = shelves::Shelves::new(self.atlas_size);
     }
     fn reset_atlas(&mut self, size: u32) {
         self.atlas = sampled_texture(&self.device, self.unified, size, size, "glyph atlas");
@@ -15568,7 +15858,7 @@ impl GpuRenderer {
         if let Some(blurred) = &mut self.blurred {
             blurred.glyphs.clear();
         }
-        self.cursor = (0, 0, 0);
+        self.shelves = shelves::Shelves::new(self.atlas_size);
         self.atlas_epoch = self.atlas_epoch.wrapping_add(1);
     }
     /// The quads of a run's underline or strikethrough, as its `LineStyle`
@@ -15817,7 +16107,8 @@ impl GpuRenderer {
             return Ok(None);
         }
         let cell_width = p.width + 2;
-        let atlas_full = self.atlas_size >= MAX_ATLAS;
+        // At its largest, and given back and started over this frame.
+        let atlas_full = self.atlas_size >= MAX_ATLAS && self.atlas_spent;
         let cell = self.atlas_cell(p.width, p.height, |rgba| {
             let row_start = |row: u32| ((row + 1) * cell_width + 1) as usize * 4;
             match image.content {
@@ -16146,28 +16437,16 @@ impl GpuRenderer {
             self.reset_atlas(INITIAL_ATLAS);
         }
         let (cell_width, cell_height) = (width + 2, height + 2);
-        if self.cursor.0 + cell_width > self.atlas_size {
-            self.cursor.0 = 0;
-            self.cursor.1 += self.cursor.2;
-            self.cursor.2 = 0;
-        }
-        if self.cursor.1 + cell_height > self.atlas_size || cell_width > self.atlas_size {
+        let Some((x, y)) = self.shelves.alloc(cell_width, cell_height) else {
             return Err(GpuError(
                 "glyph atlas capacity exceeded in one frame".into(),
             ));
-        }
+        };
         let mut rgba = vec![0; (cell_width * cell_height * 4) as usize];
         fill(&mut rgba);
         let atlas = self.atlas.clone();
-        self.write_texels(
-            &atlas,
-            (self.cursor.0, self.cursor.1, cell_width, cell_height),
-            &mut rgba,
-        );
-        let origin = (self.cursor.0 + 1, self.cursor.1 + 1);
-        self.cursor.0 += cell_width;
-        self.cursor.2 = self.cursor.2.max(cell_height);
-        Ok(origin)
+        self.write_texels(&atlas, (x, y, cell_width, cell_height), &mut rgba);
+        Ok((x + 1, y + 1))
     }
     /// Present the retained target. Use `present_with_status` when scheduling retries.
     pub fn present(&mut self) -> Result<(), GpuError> {
@@ -17574,6 +17853,8 @@ impl GpuRenderer {
     /// its last frame; the next frame recreates whatever it uses. Call when a
     /// window has stopped presenting for a while.
     pub fn trim(&mut self) {
+        // Glyphs no text holds any more: given up, their cells free.
+        self.free_glyphs();
         self.backdrop = None;
         #[cfg(d3d11)]
         if let Some(state) = &mut self.d3d11 {
@@ -18595,42 +18876,36 @@ fn keep_room<T>(vec: &mut Vec<T>, peak: &mut usize) {
         vec.shrink_to(*peak);
     }
 }
-/// `pack_cells`' atlas: its size, each cell's origin, and the packer's
-/// cursor after them (`GpuRenderer::cursor`).
+/// `pack_cells`' atlas: its size, each cell's origin, and its cells
+/// (`GpuRenderer::shelves`).
 struct Packed {
     size: u32,
     origins: Vec<(u32, u32)>,
-    cursor: (u32, u32, u32),
+    shelves: shelves::Shelves,
 }
 /// Cells `(width, height)` packed as `atlas_cell` packs them (in shelves,
 /// each a texel of gutter round it), tallest first, into the smallest square
 /// atlas of a power of two from `INITIAL_ATLAS` and below `below`: its size,
-/// each cell's origin in the order given, and the packer's cursor after
-/// them. `None` when only `below` or more holds them.
+/// each cell's origin in the order given, and its cells. `None` when only
+/// `below` or more holds them.
 fn pack_cells(cells: &[(u32, u32)], below: u32) -> Option<Packed> {
     let mut order: Vec<usize> = (0..cells.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse((cells[i].1, cells[i].0)));
     let mut size = INITIAL_ATLAS;
     'sizes: while size < below {
         let mut origins = vec![(0, 0); cells.len()];
-        let mut cursor = (0, 0, 0);
+        let mut shelves = shelves::Shelves::new(size);
         for &i in &order {
-            let (cell_width, cell_height) = (cells[i].0 + 2, cells[i].1 + 2);
-            if cursor.0 + cell_width > size {
-                cursor = (0, cursor.1 + cursor.2, 0);
-            }
-            if cursor.1 + cell_height > size || cell_width > size {
+            let Some((x, y)) = shelves.alloc(cells[i].0 + 2, cells[i].1 + 2) else {
                 size *= 2;
                 continue 'sizes;
-            }
-            origins[i] = (cursor.0 + 1, cursor.1 + 1);
-            cursor.0 += cell_width;
-            cursor.2 = cursor.2.max(cell_height);
+            };
+            origins[i] = (x + 1, y + 1);
         }
         return Some(Packed {
             size,
             origins,
-            cursor,
+            shelves,
         });
     }
     None
@@ -20120,11 +20395,43 @@ fn push_insets(
         .as_deref()
         .and_then(|d| d.inset_shadows.as_deref())
         .unwrap_or(&[]);
+    // (Most boxes have none: they pay for no padding box.)
+    if shadows.is_empty() {
+        return false;
+    }
     let mut blurred = false;
+    // CSS draws an inset shadow from the padding edge, inside the border.
+    let sides = style.border_sides();
+    let side = |value: f32| if value.is_finite() { value.max(0.) } else { 0. };
+    let (top, right, bottom, left) = (
+        side(sides.top),
+        side(sides.right),
+        side(sides.bottom),
+        side(sides.left),
+    );
+    let bounds = Rect::new(
+        bounds.x + left,
+        bounds.y + top,
+        (bounds.width - left - right).max(0.),
+        (bounds.height - top - bottom).max(0.),
+    );
+    let mut corners = decoration::shadow_corners(
+        style,
+        bounds.width + left + right,
+        bounds.height + top + bottom,
+        0.,
+    );
+    for (corner, inset) in corners.iter_mut().zip([
+        left.max(top),
+        top.max(right),
+        right.max(bottom),
+        bottom.max(left),
+    ]) {
+        *corner = (*corner - inset).max(0.);
+    }
     for s in shadows.iter().filter(|s| s.color.3 > 0) {
         let spread = s.spread.max(0.);
         let fade = [bounds.x, bounds.y, bounds.width, bounds.height];
-        let corners = decoration::shadow_corners(style, bounds.width, bounds.height, 0.);
         if s.blur_radius > 0. && s.blur_radius.is_finite() {
             let first = points.len();
             points.push([s.offset.x, s.offset.y]);
@@ -23946,11 +24253,7 @@ mod rest_tests {
     #[test]
     fn shrunk_atlas_cells_fit_and_never_overlap() {
         let cells: Vec<(u32, u32)> = (0..300).map(|i| (8 + i % 23, 10 + i % 17)).collect();
-        let Packed {
-            size,
-            origins,
-            cursor,
-        } = pack_cells(&cells, MAX_ATLAS).unwrap();
+        let Packed { size, origins, .. } = pack_cells(&cells, MAX_ATLAS).unwrap();
         assert_eq!(size, INITIAL_ATLAS);
         let boxes: Vec<(u32, u32, u32, u32)> = origins
             .iter()
@@ -23959,10 +24262,6 @@ mod rest_tests {
             .collect();
         for (i, a) in boxes.iter().enumerate() {
             assert!(a.2 <= size && a.3 <= size, "inside: {a:?}");
-            assert!(
-                a.3 <= cursor.1 + cursor.2,
-                "under the cursor's shelf: {a:?}"
-            );
             for b in &boxes[i + 1..] {
                 assert!(
                     a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1,

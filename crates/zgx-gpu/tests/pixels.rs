@@ -4694,6 +4694,208 @@ fn recycled_glyph_atlas_does_not_bleed_stale_texels_into_fractional_glyphs() {
     );
 }
 
+/// An atlas that fills gives back the cells of glyphs no text draws any
+/// more and leaves the rest where they lie: the text it still shows keeps
+/// its glyphs and its quads (none rasterized or placed again), and draws
+/// the pixels a fresh renderer draws.
+#[test]
+fn a_filling_atlas_keeps_the_glyphs_its_text_draws_in_place() {
+    let _gpu_fixture = gpu_fixture();
+    fn scene_with(block: f32) -> (Scene, NodeId) {
+        let mut scene = Scene::new(160., 160.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Column));
+        scene.append(
+            scene.root(),
+            NodeKind::Text {
+                text: "Kept glyphs, 0123".into(),
+                font_size: 13.,
+                color: Color(255, 255, 255, 255),
+            },
+            fixed(160., 20.),
+        );
+        let probe = scene.append(
+            scene.root(),
+            NodeKind::Text {
+                text: "█".into(),
+                font_size: block,
+                color: Color(255, 255, 255, 255),
+            },
+            fixed(150., 140.),
+        );
+        (scene, probe)
+    }
+    let all = [Rect::new(0., 0., 160., 160.)];
+    let mut gpu = GpuRenderer::new(160, 160).unwrap();
+    let (mut scene, probe) = scene_with(60.);
+    scene.flush();
+    gpu.render(&scene, &all).unwrap();
+    // Blocks of distinct sizes until the atlas fills.
+    let mut previous = gpu.debug_cache_stats().atlas_entries;
+    let mut filled = None;
+    for size in 61..200 {
+        let block = NodeKind::Text {
+            text: "█".into(),
+            font_size: size as f32,
+            color: Color(255, 255, 255, 255),
+        };
+        scene.set_kind(probe, block);
+        scene.flush();
+        let stats = gpu.render(&scene, &all).unwrap();
+        let entries = gpu.debug_cache_stats().atlas_entries;
+        if entries < previous {
+            filled = Some((size, stats));
+            break;
+        }
+        previous = entries;
+    }
+    let (size, stats) = filled.expect("the atlas filled");
+    assert_eq!(gpu.debug_cache_stats().atlas_bytes, 512 * 512 * 4);
+    // Only the new block rasterized and placed: the line's glyphs and
+    // quads kept.
+    assert_eq!(stats.glyph_uploads, 1, "glyphs rasterized again");
+    assert_eq!(stats.geometry_rebuilds, 1, "texts placed again");
+    let kept = gpu.readback().unwrap();
+    let mut fresh_gpu = GpuRenderer::new(160, 160).unwrap();
+    let (mut fresh, _) = scene_with(size as f32);
+    fresh.flush();
+    fresh_gpu.render(&fresh, &all).unwrap();
+    assert_eq!(
+        kept,
+        fresh_gpu.readback().unwrap(),
+        "kept glyphs draw as fresh"
+    );
+}
+
+/// An atlas that grows keeps its glyphs where they lie, in the larger one's
+/// corner: the text it shows keeps its glyphs and quads (none rasterized or
+/// placed again), and draws the pixels a fresh renderer draws.
+#[test]
+fn a_growing_atlas_keeps_its_glyphs_and_quads() {
+    let _gpu_fixture = gpu_fixture();
+    // A line, and blocks of growing sizes stacked over it, every one still
+    // shown: what the atlas holds only grows.
+    fn scene_with(blocks: std::ops::Range<u32>) -> Scene {
+        let mut scene = Scene::new(160., 160.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        scene.append(
+            scene.root(),
+            NodeKind::Text {
+                text: "Kept glyphs, 0123".into(),
+                font_size: 13.,
+                color: Color(255, 255, 255, 255),
+            },
+            fixed(160., 20.),
+        );
+        for size in blocks {
+            add_block(&mut scene, size);
+        }
+        scene
+    }
+    fn add_block(scene: &mut Scene, size: u32) {
+        scene.append(
+            scene.root(),
+            NodeKind::Text {
+                text: "█".into(),
+                font_size: size as f32,
+                color: Color(255, 255, 255, 255),
+            },
+            fixed(150., 150.),
+        );
+    }
+    let all = [Rect::new(0., 0., 160., 160.)];
+    let mut gpu = GpuRenderer::new(160, 160).unwrap();
+    let mut scene = scene_with(60..61);
+    scene.flush();
+    gpu.render(&scene, &all).unwrap();
+    let first = gpu.debug_cache_stats().atlas_bytes;
+    let mut grown = None;
+    for size in 61..400 {
+        add_block(&mut scene, size);
+        scene.flush();
+        let stats = gpu.render(&scene, &all).unwrap();
+        if gpu.debug_cache_stats().atlas_bytes > first {
+            grown = Some((size, stats));
+            break;
+        }
+    }
+    let (size, stats) = grown.expect("the atlas grew");
+    // Only the new block rasterized and placed: the others' glyphs and
+    // quads kept through the growth.
+    assert_eq!(stats.glyph_uploads, 1, "glyphs rasterized again");
+    assert_eq!(stats.geometry_rebuilds, 1, "texts placed again");
+    let kept = gpu.readback().unwrap();
+    let mut fresh_gpu = GpuRenderer::new(160, 160).unwrap();
+    let mut fresh = scene_with(60..size + 1);
+    fresh.flush();
+    fresh_gpu.render(&fresh, &all).unwrap();
+    assert_eq!(
+        kept,
+        fresh_gpu.readback().unwrap(),
+        "kept glyphs draw as fresh"
+    );
+}
+
+/// An atlas that keeps filling with glyphs no text holds any more (a line
+/// stepping through sizes again and again, as a colour animating through
+/// font smoothing's levels steps through those) gives them back rather
+/// than growing: grown, it would stay grown, its memory with it.
+#[test]
+fn an_atlas_filling_with_glyphs_no_text_holds_does_not_grow() {
+    let _gpu_fixture = gpu_fixture();
+    let all = [Rect::new(0., 0., 1600., 100.)];
+    let mut gpu = GpuRenderer::new(1600, 100).unwrap();
+    let mut scene = Scene::new(1600., 100.);
+    scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+    let line = |size: u32| NodeKind::Text {
+        text: "The quick brown fox jumps over the lazy dog 0123456789 ABCDEFG".into(),
+        font_size: size as f32,
+        color: Color(255, 255, 255, 255),
+    };
+    let text = scene.append(scene.root(), line(16), fixed(1600., 100.));
+    scene.flush();
+    gpu.render(&scene, &all).unwrap();
+    let first = gpu.debug_cache_stats().atlas_bytes;
+    let mut previous = gpu.debug_cache_stats().atlas_entries;
+    let mut fills = 0;
+    for size in (0..4).flat_map(|_| (16..42).step_by(2)) {
+        scene.set_kind(text, line(size));
+        scene.flush();
+        gpu.render(&scene, &all).unwrap();
+        let entries = gpu.debug_cache_stats().atlas_entries;
+        fills += usize::from(entries < previous);
+        previous = entries;
+    }
+    assert!(fills > 2, "the atlas filled again and again: {fills}");
+    assert_eq!(gpu.debug_cache_stats().atlas_bytes, first, "grew");
+}
+
+/// The other side of that: an atlas filling soon after the last time with
+/// what its text still holds (one text, ever larger, past 3/8 of it) grows,
+/// rather than giving back the little it doesn't hold each time.
+#[test]
+fn an_atlas_filling_with_glyphs_its_text_holds_grows() {
+    let _gpu_fixture = gpu_fixture();
+    let all = [Rect::new(0., 0., 160., 160.)];
+    let mut gpu = GpuRenderer::new(160, 160).unwrap();
+    let mut scene = Scene::new(160., 160.);
+    scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+    let block = |size: u32| NodeKind::Text {
+        text: "█".into(),
+        font_size: size as f32,
+        color: Color(255, 255, 255, 255),
+    };
+    let probe = scene.append(scene.root(), block(60), fixed(150., 150.));
+    scene.flush();
+    gpu.render(&scene, &all).unwrap();
+    let first = gpu.debug_cache_stats().atlas_bytes;
+    for size in 61..440 {
+        scene.set_kind(probe, block(size));
+        scene.flush();
+        gpu.render(&scene, &all).unwrap();
+    }
+    assert!(gpu.debug_cache_stats().atlas_bytes > first, "grew");
+}
+
 #[test]
 fn damaged_blur_batches_surrounding_draws_instead_of_one_pass_each() {
     let _gpu_fixture = gpu_fixture();
