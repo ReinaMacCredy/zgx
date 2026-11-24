@@ -23669,6 +23669,43 @@ mod shader_compile_tests {
         assert!(!awaited);
     }
 
+    /// A fill declared on another thread (another app's script: in a test
+    /// binary, every other test's) is not this renderer's to compile: it
+    /// draws that thread's scenes never, and compiling each one made a
+    /// renderer hold hundreds of pipelines beside tests run in parallel.
+    #[test]
+    fn a_fill_declared_on_another_thread_is_not_compiled_here() {
+        let (mut gpu, mut scene) = renderer();
+        let shader = green();
+        std::thread::scope(|scope| {
+            scope.spawn(|| warm_fill_shader(&shader));
+        });
+        frame(&mut gpu, &mut scene);
+        assert!(!gpu.fill_pipelines.contains_key(&shader.id()));
+    }
+
+    /// Nor is a layer shader declared on another thread
+    /// (`declare_layer_shader`): each frame beside tests run in parallel
+    /// compiled theirs, over a thousand pipelines in one renderer.
+    #[test]
+    fn a_layer_shader_declared_on_another_thread_is_not_compiled_here() {
+        let (mut gpu, mut scene) = renderer();
+        let layer = || {
+            FillShader::new(
+                "fn layer(input: LayerInput) -> vec4<f32> { return input.color; }",
+                None,
+            )
+        };
+        let (here, there) = (layer(), layer());
+        zgx::decoration::declare_layer_shader(&here);
+        std::thread::scope(|scope| {
+            scope.spawn(|| zgx::decoration::declare_layer_shader(&there));
+        });
+        frame(&mut gpu, &mut scene);
+        assert!(gpu.filter_pipelines.contains_key(&here.id()));
+        assert!(!gpu.filter_pipelines.contains_key(&there.id()));
+    }
+
     /// Offscreen, where frames wait for their shaders anyway, a fill
     /// compiles on the renderer's own thread: compiled as it is started,
     /// with no second thread allocating beside the frame (which made the
@@ -24077,8 +24114,8 @@ mod rest_tests {
         scene
     }
     /// Its caches at rest. Its shader pipelines count only those whose
-    /// shader the renderer alone holds: a fill another test declares
-    /// meanwhile (`compile::warm_fill_shader`, process-wide) every renderer
+    /// shader the renderer alone holds: a fill declared on its thread
+    /// meanwhile (`compile::warm_fill_shader`) every renderer there
     /// starts, and keeps while that test holds it.
     fn rest(gpu: &mut GpuRenderer) -> DebugCacheStats {
         let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
@@ -24109,9 +24146,9 @@ mod rest_tests {
         draw(&mut gpu, &mut small);
         let baseline = rest(&mut gpu);
         let mut big = big_page(600);
-        // A fill declared elsewhere in the process meanwhile (a script's,
-        // or another test's): every renderer starts it, and keeps it while
-        // its declarer holds it, which isn't this renderer's to give back.
+        // A fill declared on this thread meanwhile (a script's): every
+        // renderer here starts it, and keeps it while its declarer holds
+        // it, which isn't this renderer's to give back.
         let declared = zgx::decoration::FillShader::new(
             "fn fill(input: FillInput) -> vec4<f32> { return vec4<f32>(0.2, 0.4, 0.6, 1.0); }",
             None,

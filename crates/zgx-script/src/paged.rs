@@ -285,8 +285,9 @@ fn debounced(
             let mine = generation.get().wrapping_add(1);
             generation.set(mine);
             let (generation, write, read) = (generation.clone(), write.clone(), read.clone());
+            let rest = timers.sleep(period);
             timers.spawn(async move {
-                zgx::timer::sleep(period).await;
+                rest.await;
                 if generation.get() == mine {
                     let now = read.with_untracked(Clone::clone);
                     if every {

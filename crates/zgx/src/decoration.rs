@@ -256,35 +256,41 @@ impl PartialEq for FillShader {
         self.id == other.id
     }
 }
-static DECLARED_LAYERS: std::sync::Mutex<Vec<std::sync::Weak<FillShader>>> =
-    std::sync::Mutex::new(Vec::new());
-static LAYERS_DECLARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Have every renderer start compiling layer shader `shader` ahead of its
-/// first draw: for what must show at once when it does (a one-shot), where it
-/// holds no layer until then.
-pub fn declare_layer_shader(shader: &Arc<FillShader>) {
-    let mut declared = DECLARED_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
-    declared.retain(|shader| shader.strong_count() > 0);
-    declared.push(Arc::downgrade(shader));
-    LAYERS_DECLARED.fetch_add(1, std::sync::atomic::Ordering::Release);
+thread_local! {
+    static DECLARED_LAYERS: std::cell::RefCell<Vec<std::sync::Weak<FillShader>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static LAYERS_DECLARED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-/// How many layer shaders were declared (`declare_layer_shader`).
+/// Have every renderer of this thread start compiling layer shader `shader`
+/// ahead of its first draw: for what must show at once when it does (a
+/// one-shot), where it holds no layer until then. Of this thread, as an
+/// interface and the renderer drawing it are: another thread's renderer
+/// never draws it, and compiling it there only spends the GPU's memory.
+pub fn declare_layer_shader(shader: &Arc<FillShader>) {
+    DECLARED_LAYERS.with_borrow_mut(|declared| {
+        declared.retain(|shader| shader.strong_count() > 0);
+        declared.push(Arc::downgrade(shader));
+    });
+    LAYERS_DECLARED.set(LAYERS_DECLARED.get() + 1);
+}
+/// How many layer shaders this thread declared (`declare_layer_shader`).
 #[inline]
 pub fn layer_shaders_declared() -> u64 {
-    LAYERS_DECLARED.load(std::sync::atomic::Ordering::Acquire)
+    LAYERS_DECLARED.get()
 }
-/// Those declared, if any were since `seen` (updated).
+/// Those declared on this thread, if any were since `seen` (updated).
 pub fn declared_layer_shaders(seen: &mut u64) -> Vec<Arc<FillShader>> {
     let count = layer_shaders_declared();
     if count == *seen {
         return Vec::new();
     }
     *seen = count;
-    let declared = DECLARED_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
-    declared
-        .iter()
-        .filter_map(std::sync::Weak::upgrade)
-        .collect()
+    DECLARED_LAYERS.with_borrow(|declared| {
+        declared
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect()
+    })
 }
 /// A shader fill's per-node uniforms (`Scene::set_shader_uniforms`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
