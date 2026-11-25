@@ -485,10 +485,11 @@ const STEPS: &[f32] = &[
 ];
 /// Scroll `view`'s offset through `steps` through a window's own surfaces, each
 /// frame compared with the same scene drawn whole by a renderer of its own;
-/// returns how many scrolls copied.
+/// returns how many scrolls copied. Then again at the display's full rate,
+/// where each frame draws into the surface from two frames back.
 #[cfg(target_os = "macos")]
 fn scrolled_matches_drawing_whole(view: fn(Signal<f32>) -> View, steps: &[f32]) -> usize {
-    scrolled_matches_drawing_whole_at(view, steps, 2.)
+    scrolled_matches_drawing_whole_at(view, steps, 2.) + scrolled_at_rate(view, steps, 2., true)
 }
 /// `scrolled_matches_drawing_whole` at a device `scale`.
 #[cfg(target_os = "macos")]
@@ -496,6 +497,15 @@ fn scrolled_matches_drawing_whole_at(
     view: fn(Signal<f32>) -> View,
     steps: &[f32],
     scale: f32,
+) -> usize {
+    scrolled_at_rate(view, steps, scale, false)
+}
+#[cfg(target_os = "macos")]
+fn scrolled_at_rate(
+    view: fn(Signal<f32>) -> View,
+    steps: &[f32],
+    scale: f32,
+    full_rate: bool,
 ) -> usize {
     let renderer = |host: &objc2::rc::Retained<objc2_quartz_core::CALayer>| {
         let mut gpu = GpuRenderer::debug_for_layer(
@@ -509,6 +519,7 @@ fn scrolled_matches_drawing_whole_at(
     };
     let host = objc2_quartz_core::CALayer::new();
     let mut gpu = renderer(&host);
+    gpu.set_full_rate(full_rate);
     let mut ui = Ui::new(SIZE.0, SIZE.1);
     ui.scene.borrow_mut().set_pixel_scale(scale);
     gpu.install_text(&mut ui.scene.borrow_mut());
@@ -818,14 +829,19 @@ fn area_snapshots_are_the_whole_windows_pixels_there() {
 
 /// At the display's full rate frames are tiles too: no video layer (its
 /// CoreMedia thread never starts), one tile shown at a time, and at rest one
-/// tile left.
+/// tile left. Each frame draws into a surface neither of the last two showed:
+/// the one the last frame replaced can still be on screen.
 #[cfg(target_os = "macos")]
 fn full_rate_frames_show_as_tiles_without_a_video_layer() {
     let mut window = Window::new(1);
     window.gpu.set_full_rate(true);
+    let mut shown: Vec<usize> = Vec::new();
     for live in 2..12 {
         window.live.set(live);
-        window.show();
+        assert!(
+            window.show() == Window::new(live).show(),
+            "frame {live}: the surface shown differs from the scene drawn whole"
+        );
         // SAFETY: the host's live sublayer array, read on the main thread.
         let classes: Vec<String> = unsafe { window.host.sublayers() }
             .map(|subs| {
@@ -847,6 +863,12 @@ fn full_rate_frames_show_as_tiles_without_a_video_layer() {
             "frame {live}: one tile shows ({tiles:?})"
         );
         assert!(tiles.len() <= 3, "frame {live}: {} tiles", tiles.len());
+        let now = tiles.iter().find(|(_, hidden)| !hidden).expect("shown").0;
+        assert!(
+            !shown.iter().rev().take(2).any(|&before| before == now),
+            "frame {live}: drawn into a surface one of the last two frames showed"
+        );
+        shown.push(now);
     }
     window.gpu.set_full_rate(false);
     window.gpu.trim();

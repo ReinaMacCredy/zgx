@@ -16792,12 +16792,17 @@ impl GpuRenderer {
             None => {
                 // Certainly free: not the latest, and no use beyond the layer's own
                 // record of it (one on screen or queued has more). The most recent of
-                // them holds the frame nearest this one.
+                // them holds the frame nearest this one. At full rate the latest two
+                // are busy (`busy`) whatever their use count says: the surface the
+                // last frame replaced shows until the window server's next
+                // composite, and a frame drawn into it at once showed half drawn.
                 let idle = |present: &LayerPresent| -> Vec<usize> {
+                    let busy = present.full_rate.then(|| present.busy());
                     let mut idle: Vec<usize> = (0..present.buffers.len())
                         .filter(|&i| {
                             Some(i) != present.shown
                                 && present.buffers[i].0.surface.use_count() <= 1
+                                && busy.as_ref().is_none_or(|busy| !busy[i])
                         })
                         .collect();
                     idle.sort_by_key(|&i| std::cmp::Reverse(present.buffers[i].1));
