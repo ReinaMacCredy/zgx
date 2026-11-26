@@ -224,6 +224,32 @@ fn without_animate_rows_jump_and_nothing_runs() {
 }
 
 #[test]
+fn animate_as_a_function_is_asked_at_each_change() {
+    let mut h = Harness::inline(&list(
+        ABC,
+        r#"animate = function() return if still:get() then nil else { duration = 100, ease = "linear" } end"#,
+        "column",
+        "",
+    )
+    .replace("return ui.column {", r#"local still = ui.state("still", true)
+        return ui.column {"#)
+    .replace(
+        r#"ui.button { id = "flip""#,
+        r#"ui.button { id = "move", w = 4, h = 4, on_click = function() still:set(false) end },
+            ui.button { id = "flip""#,
+    ));
+    h.change("flip");
+    assert_eq!((h.y("a"), h.y("b"), h.y("c")), (40., 20., 0.), "nil: the rows jump");
+    assert!(!h.clock.wants_frame(), "nil: nothing runs");
+    h.click("move");
+    h.frame();
+    h.change("flip");
+    close(h.y("a"), 40., "a starts where it was");
+    h.run_ms(50.);
+    close(h.y("a"), 20., "a half way");
+}
+
+#[test]
 fn layout_position_slides_a_node_layout_moves() {
     let mut h = Harness::inline(
         r##"local wide = ui.state("wide", false)
@@ -510,4 +536,45 @@ fn a_reorder_damages_in_the_same_order_every_run() {
         frames
     };
     assert_eq!(run(), run());
+}
+
+
+#[test]
+fn a_rows_own_y_stays_under_its_slide_and_follows_its_state_after() {
+    for (what, row) in [
+        ("literal, with an id", r#"ui.div { id = r, w = 40, h = 20, shrink = 0, y = 7 }"#),
+        ("function, with an id", r#"ui.div { id = r, w = 40, h = 20, shrink = 0, y = function() return shift:get() end }"#),
+        ("literal, no id", r#"ui.column { ui.div { id = r, w = 40, h = 20, shrink = 0 }, y = 7 }"#),
+        ("function, no id", r#"ui.column { ui.div { id = r, w = 40, h = 20, shrink = 0 }, y = function() return shift:get() end }"#),
+    ] {
+        let mut h = Harness::inline(&format!(
+            r##"local rows = ui.state("rows", {{ "a", "b", "c" }})
+            local shift = ui.state("shift", 7)
+            return ui.column {{
+                ui.column {{
+                    ui.each(rows, function(r)
+                        return {row}
+                    end, {{ key = function(r) return r end, {LINEAR} }}),
+                }},
+                ui.button {{ id = "flip", w = 4, h = 4, on_click = function()
+                    local out = {{}}
+                    for _, r in rows:get() do table.insert(out, 1, r) end
+                    rows:set(out)
+                end }},
+                ui.button {{ id = "shift", w = 4, h = 4, on_click = function() shift:set(12) end }},
+            }}"##
+        ));
+        h.change("flip");
+        close(h.y("a"), 7., &format!("{what}: a starts where it was"));
+        close(h.y("c"), 47., &format!("{what}: c starts where it was"));
+        h.run_ms(50.);
+        close(h.y("a"), 27., &format!("{what}: a half way"));
+        h.run_ms(70.);
+        assert_eq!((h.y("a"), h.y("b"), h.y("c")), (47., 27., 7.), "{what}: settled");
+        if what.starts_with("function") {
+            h.click("shift");
+            h.frame();
+            assert_eq!((h.y("a"), h.y("b"), h.y("c")), (52., 32., 12.), "{what}: follows its state");
+        }
+    }
 }

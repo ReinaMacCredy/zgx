@@ -4892,7 +4892,9 @@ pub(crate) fn with_animated(element: &Element, mut lits: Vec<(Prop, Lit)>) -> St
         lits.push((*prop, lit.clone()));
     }
     let mut styles = apply_all(Styles::new(), &lits);
-    if let Some((x, y)) = element.shown_translate(literal_transform(&lits).0) {
+    let own = literal_transform(&lits).0;
+    element.note_own(own);
+    if let Some((x, y)) = element.shown_translate(own) {
         styles = styles.translate(x, y);
     }
     if let Some(opacity) = animated.opacity {

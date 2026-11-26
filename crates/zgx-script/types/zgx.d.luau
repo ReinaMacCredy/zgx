@@ -23177,7 +23177,8 @@ export type HookFilter = {
 }
 -- How `ui.each` rows slide when the list moves them: `true` (a spring,
 -- bounce .1 over 400 ms), an ease, `{ duration, ease }`, `{ bounce,
--- duration }` or `{ spring = anime.spring {...} }`.
+-- duration }` or `{ spring = anime.spring {...} }`. `animate` may also be
+-- a function returning one, asked at each change (nil: the rows jump).
 export type Motion = boolean | Easing | { duration: number?, ease: Easing?, bounce: number?, spring: AnimeEase? }
 -- `ui.each`'s options; the rest style the box the rows lay out in.
 export type EachOptions = {
@@ -23642,7 +23643,7 @@ export type EachOptions = {
 	-- A row's identity: rows keep their state as the list reorders. The
 	-- item is `any`, as `build`'s is.
 	key: ((item: any) -> string | number)?,
-	animate: Motion?,
+	animate: (Motion | () -> Motion?)?,
 	-- anime.js parameters played on rows that come and go.
 	enter: ElementParams?,
 	exit: ElementParams?,

@@ -335,7 +335,7 @@ Query a box whose size does not depend on what the query changes, such as the wi
 
 Three things animate what layout does, all the same way: after the layout pass that moves a node, it is held where it showed by a translation, which eases to nothing. The frames that follow only move it on the compositor: no layout, no script, and frames only while something moves. Positions come from layout, so scrolling and other animations are not moves, and a move in flight that is interrupted continues from where the node shows. The default ease is the layout boxes' spring (0.4 s, bounce 0.1).
 
-- `ui.each(list, build, { key = fn, animate = true })`: when the list changes, rows that stay but move slide from where they were, whatever their sizes, in a column, a row, a wrap or a grid (the list's own `grid = true, cols = 2`). `animate` takes `true`, an ease name, `{ duration, ease }` (ms, a name or `anime.spring`), `{ bounce, duration }` (a spring) or `{ spring = anime.spring { … } }`. New rows play `enter` and leaving rows `exit`, with the parameters `presence` takes (`initial = true` plays `enter` on the first rows too); a leaving row leaves the flow where it was, so the rows after it close up while it goes. Rows need a `key` to be the same rows after a change.
+- `ui.each(list, build, { key = fn, animate = true })`: when the list changes, rows that stay but move slide from where they were, whatever their sizes, in a column, a row, a wrap or a grid (the list's own `grid = true, cols = 2`). `animate` takes `true`, an ease name, `{ duration, ease }` (ms, a name or `anime.spring`), `{ bounce, duration }` (a spring) or `{ spring = anime.spring { … } }`, or a function returning one of them, asked at each change (nil: that change's rows jump), for a list whose rows slide only some of the time. New rows play `enter` and leaving rows `exit`, with the parameters `presence` takes (`initial = true` plays `enter` on the first rows too); a leaving row leaves the flow where it was, so the rows after it close up while it goes. Rows need a `key` to be the same rows after a change.
 - `layout = "position"` on any node: when layout moves it within its parent (a sibling grows, one before it closes), it slides there. `layout_ease` and `layout_duration` time it.
 - `layout_id = "selection"`: a node mounting while another with the same id is mounted, or as it unmounts in the same frame, starts at that one's box (translated and scaled) and moves to its own: a tab's selection highlight sliding to the tab that takes it. Ids are scoped to the script. The node also slides when layout moves it, as with `"position"`; `layout_ease` and `layout_duration` time both.
 
@@ -361,7 +361,7 @@ end, {
 })
 ```
 
-The moves go on the node's translation over its own: a row's `x` and `y` (literal or animated) compose with them. A shared element's scale is the node's own scale, so animating its `scale` while it hands over fights the handover.
+The moves go on the node's translation over its own: a row's `x` and `y` (literal, a function's or animated, with an id or without) compose with them, and once a move ends a function's `x` and `y` place the row again as what they read changes. A shared element's scale is the node's own scale, so animating its `scale` while it hands over fights the handover.
 
 ### Events
 

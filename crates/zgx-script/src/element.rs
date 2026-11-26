@@ -127,6 +127,9 @@ pub(crate) struct Element {
     /// What the node's literals set: where an animation starts from before
     /// the scene has them.
     base: Cell<BaseTransform>,
+    /// The node's own translation as its style last placed it (a literal or
+    /// a function's `x` and `y`), which a layout animation's goes over.
+    own: Cell<Option<(f32, f32)>>,
     /// The literal opacity and content blur.
     base_effects: Cell<(f32, f32)>,
     /// The literal color filters.
@@ -172,6 +175,7 @@ impl Element {
             forwards: Cell::new(false),
             scroll: OnceCell::new(),
             base: Cell::new((None, None)),
+            own: Cell::new(None),
             base_effects: Cell::new((1., 0.)),
             base_color: Cell::new([1.; 3]),
             base_corners: Cell::new(None),
@@ -583,20 +587,53 @@ impl Element {
     pub fn set_offset(&self, o: (f32, f32)) {
         let mut animated = self.animated.borrow_mut();
         if animated.offset != Some(o) {
+            // A move that ends hands the node back to its own style.
+            if o == (0., 0.) {
+                self.styles_changed.set(true);
+            }
             animated.offset = Some(o);
             self.compositor_changed.set(true);
         }
     }
-    /// The translation the node shows at: its own and a layout animation's.
+    /// Notes the translation the node's style resolved, for a layout
+    /// animation to go over.
+    pub fn note_own(&self, own: Option<(f32, f32)>) {
+        if own.is_some() {
+            self.own.set(own);
+        }
+    }
+    /// Notes the node's own translation from the scene, for a layout
+    /// animation about to go over it: a node whose style this element does
+    /// not run (a list's row without an id) is placed by that style alone.
+    pub fn hold_own(&self) {
+        let (ox, oy) = self.offset();
+        if let Some(own) = self.read(|scene, id| {
+            let t = scene.transform(id);
+            (t.x - ox, t.y - oy)
+        }) {
+            self.own.set(Some(own));
+        }
+    }
+    /// The translation the node's style shows it at: its own and a layout
+    /// animation's while one moves it. A move that has ended leaves the node
+    /// to its own style, so its `x` and `y` follow what they read again.
     pub fn shown_translate(&self, own: Option<(f32, f32)>) -> Option<(f32, f32)> {
-        self.shown(&self.animated.borrow(), own)
+        let animated = self.animated.borrow();
+        if animated.offset == Some((0., 0.)) {
+            return animated.translate;
+        }
+        self.shown(&animated, own)
     }
     /// `shown_translate` from values already borrowed.
     fn shown(&self, animated: &Animated, own: Option<(f32, f32)>) -> Option<(f32, f32)> {
         match (animated.translate, animated.offset) {
             (t, None) => t,
             (t, Some((ox, oy))) => {
-                let (x, y) = t.or(own).or(self.base.get().0).unwrap_or_default();
+                let (x, y) = t
+                    .or(own)
+                    .or(self.own.get())
+                    .or(self.base.get().0)
+                    .unwrap_or_default();
                 Some((x + ox, y + oy))
             }
         }

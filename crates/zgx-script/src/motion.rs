@@ -111,14 +111,37 @@ fn timing_of(value: mlua::Value) -> mlua::Result<Option<Timing>> {
 /// `ui.each`'s motion: rows that move animate (`animate`), new rows play
 /// `enter` and leaving ones `exit`, with `ui.presence`'s parameters.
 pub(crate) struct EachMotion {
-    pub moves: Option<Timing>,
+    pub moves: Option<Moves>,
     pub enter: Option<Table>,
     pub exit: Option<Table>,
     /// The first rows enter too.
     pub initial: bool,
 }
+/// How rows move: always the same way, or as a function says at each
+/// change (nil: rows jump), so a list can move its rows only some of the time.
+pub(crate) enum Moves {
+    Always(Timing),
+    Asked(Function),
+}
+impl Moves {
+    fn now(&self, vm: &Vm) -> Option<Timing> {
+        match self {
+            Moves::Always(timing) => Some(timing.clone()),
+            Moves::Asked(f) => match vm.call::<mlua::Value>(f, ()).and_then(timing_of) {
+                Ok(timing) => timing,
+                Err(e) => {
+                    vm.report(e);
+                    None
+                }
+            },
+        }
+    }
+}
 pub(crate) fn each_motion(t: &Table) -> mlua::Result<Option<Rc<EachMotion>>> {
-    let moves = timing_of(t.get("animate")?)?;
+    let moves = match t.get::<mlua::Value>("animate")? {
+        mlua::Value::Function(f) => Some(Moves::Asked(f)),
+        other => timing_of(other)?.map(Moves::Always),
+    };
     let enter = t.get::<Option<Table>>("enter")?;
     let exit = t.get::<Option<Table>>("exit")?;
     if moves.is_none() && enter.is_none() && exit.is_none() {
@@ -162,6 +185,7 @@ fn start(engine: &Rc<Engine>, vm: Weak<Vm>, writes: Vec<(Target, Key, f64, f64)>
 /// nothing. The offset goes over the node's own translation, so a script's
 /// `x` and `y` animations compose with it.
 fn hold(element: &Rc<Element>, dx: f32, dy: f32) -> [(Target, Key, f64, f64); 2] {
+    element.hold_own();
     let (ox, oy) = element.offset();
     let target = Target::Element(element.clone());
     [
@@ -254,9 +278,9 @@ struct Rows {
     first_end: Option<u64>,
     elements: KeyMap<RowKey, Rc<Element>>,
     region: Option<NodeHandle>,
-    /// Where each row was (from the region's corner) before a change whose
-    /// layout pass has not run yet.
-    before: Option<KeyMap<RowKey, (f32, f32)>>,
+    /// How the rows move and where each was (from the region's corner)
+    /// before a change whose layout pass has not run yet.
+    before: Option<(Timing, KeyMap<RowKey, (f32, f32)>)>,
 }
 
 /// Where layout put `node`, from `origin`'s corner.
@@ -335,10 +359,12 @@ pub(crate) fn each(
                 let st = &mut *st;
                 let first = st.first_end.is_none();
                 // Where every row is now, for the layout pass the change brings.
-                flip = (!first && motion.moves.is_some() && st.before.is_none())
-                    .then(|| st.region.clone())
-                    .flatten()
-                    .and_then(|region| {
+                let timing = (!first && st.before.is_none())
+                    .then(|| motion.moves.as_ref()?.now(&vm))
+                    .flatten();
+                flip = timing
+                    .zip(st.region.clone())
+                    .and_then(|(timing, region)| {
                         let scene = region.scene()?;
                         let scene = scene.borrow();
                         if !scene.contains(region.node()) {
@@ -357,7 +383,7 @@ pub(crate) fn each(
                                     Some((k.clone(), placed(&scene, node, origin)?))
                                 }),
                         );
-                        st.before = Some(before);
+                        st.before = Some((timing, before));
                         Some(region)
                     });
                 let mut live = KeyMap::with_capacity_and_hasher(ids.len(), Keyed::default());
@@ -445,10 +471,10 @@ pub(crate) fn each(
                 list
             };
             if let Some(region) = flip {
-                let (rows, motion, vm) = (Rc::downgrade(&rows), motion.clone(), vm.clone());
+                let (rows, vm) = (Rc::downgrade(&rows), vm.clone());
                 region.clone().after_layout(move || {
                     if let Some(rows) = rows.upgrade() {
-                        slide_rows(&rows, &region, &motion, &vm);
+                        slide_rows(&rows, &region, &vm);
                     }
                 });
             }
@@ -524,16 +550,15 @@ pub(crate) fn each(
 /// After the layout pass a list change brought: every row that moved holds
 /// where it was and slides to its new place. One pass over the rows, reading
 /// bounds layout already computed.
-fn slide_rows(rows: &RefCell<Rows>, region: &NodeHandle, motion: &EachMotion, vm: &Rc<Vm>) {
-    let (Some(timing), Some(engine), Some(scene)) = (&motion.moves, engine_of(vm), region.scene())
-    else {
+fn slide_rows(rows: &RefCell<Rows>, region: &NodeHandle, vm: &Rc<Vm>) {
+    let (Some(engine), Some(scene)) = (engine_of(vm), region.scene()) else {
         rows.borrow_mut().before = None;
         return;
     };
     let mut writes = Vec::new();
-    {
+    let timing = {
         let mut st = rows.borrow_mut();
-        let Some(before) = st.before.take() else {
+        let Some((timing, before)) = st.before.take() else {
             return;
         };
         let scene = scene.borrow();
@@ -562,8 +587,9 @@ fn slide_rows(rows: &RefCell<Rows>, region: &NodeHandle, motion: &EachMotion, vm
             }
             writes.extend(hold(element, dx, dy));
         }
-    }
-    start(&engine, Rc::downgrade(vm), writes, timing);
+        timing
+    };
+    start(&engine, Rc::downgrade(vm), writes, &timing);
 }
 
 // `layout = "position"` and `layout_id` --------------------------------------
