@@ -10867,8 +10867,12 @@ impl Scene {
             } else {
                 self.tree_node_mut(current)
             };
-            let boundary = !first && Self::is_layout_boundary(node);
-            // A boundary is laid out as one (`layout_roots`).
+            // The node it starts from as well, where that is the stop: its
+            // children changed, its own size did not
+            // (`invalidate_children_layout`).
+            let boundary = (!first || alone) && Self::is_layout_boundary(node);
+            // A boundary is laid out as one (`layout_roots`): `layout_alone`
+            // leaves those to it.
             let alone = alone && !boundary;
             let parent = node.parent;
             let ink = node.bounds_valid.replace(0);
@@ -16091,6 +16095,16 @@ impl Scene {
     pub fn repaints(&self) -> (std::ops::RangeInclusive<u64>, &[(NodeId, u8)]) {
         self.repaints_read.set(true);
         (self.repaints_from..=self.repaint_flushes, &self.repaints)
+    }
+    /// Whether nodes were added or removed, or composite otherwise, since the
+    /// last flush: what [`repaint::CHILDREN`] and [`repaint::COMPOSITE`]
+    /// will say at the next. What knows the tree by its flushes
+    /// (`repaints`) and looks between two asks this first.
+    #[doc(hidden)]
+    pub fn restructured_since_flush(&self) -> bool {
+        self.dirty.iter().any(|id| {
+            !self.contains(*id) || self.tree_node(*id).dirty & (CHILDREN | COMPOSITE) != 0
+        })
     }
     /// The nodes removed in the flushes given (every flush counted, as
     /// [`Scene::repaints`]), and since: each node of a subtree removed, so a
